@@ -1,4 +1,4 @@
-# app.py — Smart MTD vs Cohort Analyzer (Pro UI)
+# app.py — Smart MTD vs Cohort Analyzer (Pro UI, nested f-strings fixed)
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -154,7 +154,7 @@ cohort = topc3.toggle("Enable Cohort", value=True, help="Measure-Date window; Cr
 # MTD range (Create Date)
 if mtd:
     st.markdown("### 🗓️ MTD window (Create Date)")
-    p1, p2, p3, p4 = st.columns([2,3,3,1])
+    p1, p2, p3 = st.columns([2,3,3])
     preset = p1.selectbox("Preset", ["This month", "All time", "Custom"], index=0, key="mtd_preset")
     cmin, cmax = safe_minmax_date(base["Create Date"])
     if preset == "This month":  mtd_from, mtd_to = this_month_bounds()
@@ -162,14 +162,13 @@ if mtd:
     else:                       mtd_from, mtd_to = cmin, cmax
     mtd_from = p2.date_input("From (Create)", mtd_from, key="mtd_from")
     mtd_to   = p3.date_input("To (Create)",   mtd_to,   key="mtd_to")
-    if p4.button("Apply MTD", use_container_width=True): pass
     if mtd_from > mtd_to:
         st.error("MTD: 'From' is after 'To'. Adjust the Create-Date range."); mtd = False
 
 # Cohort range (Measure Date)
 if cohort:
     st.markdown("### 🗓️ Cohort window (Measure Date)")
-    q1, q2, q3, q4 = st.columns([2,3,3,1])
+    q1, q2, q3 = st.columns([2,3,3])
     preset2 = q1.selectbox("Preset", ["This month", "All time", "Custom"], index=1, key="coh_preset")
     mmin, mmax = safe_minmax_date(base[measure_col])
     if preset2 == "This month": coh_from, coh_to = this_month_bounds()
@@ -177,7 +176,6 @@ if cohort:
     else:                       coh_from, coh_to = mmin, mmax
     coh_from = q2.date_input("From (Measure)", coh_from, key="coh_from")
     coh_to   = q3.date_input("To (Measure)",   coh_to,   key="coh_to")
-    if q4.button("Apply Cohort", use_container_width=True): pass
     if coh_from > coh_to:
         st.error("Cohort: 'From' is after 'To'. Adjust the Measure-Date range."); cohort = False
 
@@ -191,7 +189,7 @@ show_top_countries = bc2.checkbox("Top 5 Countries", value=True)
 show_top_sources   = bc3.checkbox("Top 3 Deal Sources", value=True)
 show_combo_pairs   = bc4.checkbox("Country × Deal Source (Top 10)", value=False)
 
-st.caption("Tip: use the tabs below to view KPIs, tables, trends, comparisons, and exports.")
+st.caption("Tip: use the tabs below to view KPIs, tables, trends, and exports.")
 
 # ---------------- Compute ----------------
 metrics_rows = []
@@ -262,7 +260,7 @@ with st.spinner("Crunching numbers..."):
             }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — MTD"] = both
 
-        # Trend (MTD): monthly counts where measure-month == create-month (restricted to MTD window)
+        # Trend (MTD)
         trend_mtd = sub_mtd.assign(flag=mtd_flag.astype(int)).groupby("Create_Month", dropna=False)["flag"].sum().reset_index()
         trend_mtd = trend_mtd.rename(columns={"Create_Month":"Month","flag":"MTD Count"})
         trend_mtd["Month"] = trend_mtd["Month"].astype(str)
@@ -308,7 +306,6 @@ with st.spinner("Crunching numbers..."):
                     tooltip=split_dims + [f"Cohort Count on '{measure_col}'","Create Count in Cohort window"]
                 ).properties(height=360)
 
-        # Leaderboards (Cohort)
         if show_top_countries and "Country" in base.columns:
             g2 = base.copy()
             g2["_Cohort Count"] = in_measure_window.astype(int)
@@ -345,7 +342,7 @@ with st.spinner("Crunching numbers..."):
             }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — Cohort"] = both2
 
-        # Trend (Cohort): monthly counts by measure month (restricted to Cohort window)
+        # Trend (Cohort): monthly counts by measure month
         trend_coh = base.loc[in_measure_window].copy()
         trend_coh["Measure_Month"] = trend_coh[measure_col].dt.to_period("M")
         trend_coh = trend_coh.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Cohort Count")
@@ -355,28 +352,39 @@ with st.spinner("Crunching numbers..."):
         ).properties(height=280)
         tables["Trend — Cohort (by Measure Month)"] = trend_coh
 
-# ---------------- Narrative insights ----------------
+# ---------------- Narrative insights (fixed: no nested f-strings) ----------------
 st.markdown("### 🔎 Insights")
 if not metrics_rows:
     st.info("Turn on MTD and/or Cohort to see insights.")
 else:
-    kdf = pd.DataFrame(metrics_rows)
     bullets = []
     try:
+        # MTD country leader
         if "Top 5 Countries — MTD" in tables and not tables["Top 5 Countries — MTD"].empty:
             r = tables["Top 5 Countries — MTD"].iloc[0]
-            bullets.append(f"**MTD:** Country leader is **{r['Country']}** with **{int(r[f\"MTD Count on '{measure_col}'\"]):,}**.")
+            mtd_col = f"MTD Count on '{measure_col}'"
+            mtd_cnt = int(r[mtd_col]) if mtd_col in r and pd.notna(r[mtd_col]) else 0
+            bullets.append(f"**MTD:** Country leader is **{r['Country']}** with **{mtd_cnt:,}**.")
+
+        # Cohort country leader
         if "Top 5 Countries — Cohort" in tables and not tables["Top 5 Countries — Cohort"].empty:
             r = tables["Top 5 Countries — Cohort"].iloc[0]
-            bullets.append(f"**Cohort:** Country leader is **{r['Country']}** with **{int(r[f\"Cohort Count on '{measure_col}'\"]):,}**.")
+            coh_col = f"Cohort Count on '{measure_col}'"
+            coh_cnt = int(r[coh_col]) if coh_col in r and pd.notna(r[coh_col]) else 0
+            bullets.append(f"**Cohort:** Country leader is **{r['Country']}** with **{coh_cnt:,}**.")
+
+        # MTD source leader (name only)
         if "Top 3 Deal Sources — MTD" in tables and not tables["Top 3 Deal Sources — MTD"].empty:
             r = tables["Top 3 Deal Sources — MTD"].iloc[0]
             bullets.append(f"**MTD:** Top deal source is **{r['JetLearn Deal Source']}**.")
+
+        # Cohort source leader (name only)
         if "Top 3 Deal Sources — Cohort" in tables and not tables["Top 3 Deal Sources — Cohort"].empty:
             r = tables["Top 3 Deal Sources — Cohort"].iloc[0]
             bullets.append(f"**Cohort:** Top deal source is **{r['JetLearn Deal Source']}**.")
     except Exception:
         pass
+
     if bullets:
         st.markdown("- " + "\n- ".join(bullets))
     else:
@@ -384,12 +392,12 @@ else:
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
-# ---------------- Tabs: KPIs | Tables | Trends | Compare | Export ----------------
-tab_kpi, tab_tbl, tab_tr, tab_cmp, tab_dl = st.tabs(["📌 KPIs","📋 Tables","📈 Trends","🆚 Compare","⬇️ Export"])
+# ---------------- Tabs: KPIs | Tables | Trends | Export ----------------
+tab_kpi, tab_tbl, tab_tr, tab_dl = st.tabs(["📌 KPIs","📋 Tables","📈 Trends","⬇️ Export"])
 
 with tab_kpi:
-    if not metrics_rows:
-        st.info("No KPIs yet."); 
+    if 'metrics_rows' not in locals() or not metrics_rows:
+        st.info("No KPIs yet.")
     else:
         dfk = pd.DataFrame(metrics_rows)
         cols = st.columns(4)
@@ -423,37 +431,6 @@ with tab_tr:
         shown=True
     if not shown:
         st.info("Turn on MTD and/or Cohort to see trends.")
-
-with tab_cmp:
-    # Compare side-by-side bars if one split dimension is selected
-    if len(split_dims)==1:
-        dim = split_dims[0]
-        left_df  = tables.get(f"MTD split by {dim}")
-        right_df = tables.get(f"Cohort split by {dim}")
-        if left_df is not None or right_df is not None:
-            st.subheader(f"Comparison by {dim}")
-            # Build a unified long dataframe for Altair
-            frames = []
-            if left_df is not None:
-                frames.append(left_df[[dim, f"MTD Count on '{measure_col}'"]].rename(
-                    columns={f"MTD Count on '{measure_col}'":"Count"}).assign(Scope="MTD"))
-            if right_df is not None:
-                frames.append(right_df[[dim, f"Cohort Count on '{measure_col}'"]].rename(
-                    columns={f"Cohort Count on '{measure_col}'":"Count"}).assign(Scope="Cohort"))
-            if frames:
-                cmp = pd.concat(frames, ignore_index=True)
-                chart = alt.Chart(cmp).mark_bar().encode(
-                    x=alt.X(dim, sort='-y'),
-                    y=alt.Y("Count:Q"),
-                    color=alt.Color("Scope:N"),
-                    column=alt.Column("Scope:N", header=alt.Header(labelAngle=0, title=None)),
-                    tooltip=[dim,"Scope","Count"]
-                ).properties(height=320)
-                st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("Enable a split and compute MTD/Cohort to compare.")
-    else:
-        st.info("Choose exactly **one** split to enable side-by-side comparison.")
 
 with tab_dl:
     if not tables:
