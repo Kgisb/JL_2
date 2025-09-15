@@ -1,4 +1,4 @@
-# app_compare_pro_clean.py — Blue, minimal A/B analyzer (granularity for Custom ranges) — FIXED rename bug
+# app_compare_pro_clean.py — Blue, minimal A/B analyzer with search-in-filters
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -190,7 +190,7 @@ date_like_cols = detect_measure_date_columns(df)
 if not date_like_cols:
     st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
 
-# ------------------------ Global Filters (Popover + summary) ------------------------
+# ------------------------ Global Filters (Popover + summary + SEARCH) ------------------------
 def summarize_values(values, all_flag, max_items=3):
     if all_flag: return "All"
     if not values: return "None"
@@ -199,24 +199,65 @@ def summarize_values(values, all_flag, max_items=3):
     return ", ".join(vals[:max_items]) + f" +{len(vals) - max_items} more"
 
 def filter_pop(label, df, colname, key_prefix):
+    """Popover filter with All toggle + smart search helper that adds/removes filtered matches."""
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
-    all_key, sel_key = f"{key_prefix}_all", f"{key_prefix}_sel"
+    all_key, sel_key, q_key = f"{key_prefix}_all", f"{key_prefix}_sel", f"{key_prefix}_q"
+    add_key, rm_key = f"{key_prefix}_addf", f"{key_prefix}_rmf"
+
+    # initialize state
     if all_key not in st.session_state: st.session_state[all_key] = True
-    if sel_key not in st.session_state: st.session_state[sel_key] = options
+    if sel_key not in st.session_state: st.session_state[sel_key] = options.copy()
+    if q_key   not in st.session_state: st.session_state[q_key]   = ""
+
     all_flag = st.session_state[all_key]
     cur_selected = st.session_state[sel_key]
+    q = st.session_state[q_key]
+
     summary = summarize_values(cur_selected, all_flag)
 
+    def apply_all(flag: bool):
+        st.session_state[all_key] = flag
+        st.session_state[sel_key] = options.copy() if flag else st.session_state[sel_key]
+
     if hasattr(st, "popover"):
-        with st.popover(f"{label}: {summary}"):
-            st.checkbox("All", value=all_flag, key=all_key)
-            st.multiselect(f"Select {label}", options, default=options,
-                           disabled=st.session_state[all_key], key=sel_key)
+        ctx = st.popover(f"{label}: {summary}")
     else:
-        with st.expander(f"{label}: {summary}", expanded=False):
-            st.checkbox("All", value=all_flag, key=all_key)
-            st.multiselect(f"Select {label}", options, default=options,
-                           disabled=st.session_state[all_key], key=sel_key)
+        ctx = st.expander(f"{label}: {summary}", expanded=False)
+
+    with ctx:
+        top = st.columns([1,3])
+        with top[0]:
+            if st.checkbox("All", value=all_flag, key=all_key):
+                # if toggled to True
+                st.session_state[sel_key] = options.copy()
+            else:
+                # if toggled to False and selection was full, keep current selection
+                pass
+        with top[1]:
+            st.text_input("Search", value=q, key=q_key, placeholder="Type to filter…")
+
+        # compute filtered list (non-destructive)
+        q = st.session_state[q_key].strip().lower()
+        filtered = [o for o in options if q in o.lower()] if q else options
+        st.caption(f"{len(filtered)}/{len(options)} match")
+
+        cact = st.columns([1,1,3])
+        with cact[0]:
+            if st.button("Select filtered", key=add_key, use_container_width=True):
+                new_sel = sorted(set(st.session_state[sel_key]) | set(filtered))
+                st.session_state[sel_key] = new_sel
+                st.session_state[all_key] = (len(new_sel) == len(options))
+                st.rerun()
+        with cact[1]:
+            if st.button("Remove filtered", key=rm_key, use_container_width=True):
+                new_sel = [x for x in st.session_state[sel_key] if x not in set(filtered)]
+                st.session_state[sel_key] = new_sel
+                st.session_state[all_key] = False
+                st.rerun()
+
+        st.multiselect(f"Select {label}", options, default=st.session_state[sel_key],
+                       disabled=st.session_state[all_key], key=sel_key)
+
     return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summary}"
 
 def filters_toolbar(name, df):
@@ -230,8 +271,10 @@ def filters_toolbar(name, df):
         if st.button("Clear", key=f"{name}_clear"):
             for prefix, col in [(f"{name}_pipe","Pipeline"), (f"{name}_src","JetLearn Deal Source"),
                                 (f"{name}_ctry","Country"), (f"{name}_cslr","Student/Academic Counsellor")]:
+                opts = sorted([v for v in df[col].dropna().astype(str).unique()])
                 st.session_state[f"{prefix}_all"] = True
-                st.session_state[f"{prefix}_sel"] = sorted([v for v in df[col].dropna().astype(str).unique()])
+                st.session_state[f"{prefix}_sel"] = opts
+                st.session_state[f"{prefix}_q"] = ""
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
@@ -314,7 +357,6 @@ def group_label_from_series(s: pd.Series, grain: str, is_create=False):
     if grain == "Week":
         iso = pd.to_datetime(s).dt.isocalendar()
         return (iso['year'].astype(str) + "-W" + iso['week'].astype(str).str.zfill(2))
-    # Month default
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
 def compute_outputs(meta):
@@ -365,7 +407,7 @@ def compute_outputs(meta):
             g3 = g3.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = g3
 
-        # Trend with custom granularity (FIXED rename mapping)
+        # Trend with custom granularity
         x_label = group_label_from_series(sub_mtd["Create Date"], mtd_grain)
         trend = sub_mtd.copy()
         trend["__X__"] = x_label
@@ -573,6 +615,15 @@ if show_compare:
         st.info("Turn on KPIs for both scenarios to enable compare.")
 
 # ------------------------ Foot captions ------------------------
+def mk_caption(meta):
+    return (
+        f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
+        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
+        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
+        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
+    )
+
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 st.caption("**Scenario A** — " + mk_caption(metaA))
 st.caption("**Scenario B** — " + mk_caption(metaB))
