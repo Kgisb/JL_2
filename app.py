@@ -1,5 +1,5 @@
-# app_compare_pro_minimal_search.py
-# Minimal A/B analyzer with SMART live-search filters (popover), multi-measure MTD/Cohort, splits & trends
+# app_compare_pro_minimal_search_v3.py
+# Minimal A/B analyzer with streamlined "All → type to filter" multiselect UX
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +24,7 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
-@media (max-width:820px){ .block-container{padding-left:.5rem; padding-right:.5rem;} }
+.compact-label .stSelectbox label, .compact-label .stMultiSelect label { display:none; } /* collapse labels inside popovers */
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,7 +39,6 @@ def robust_read_csv(file_or_path):
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
 def detect_measure_date_columns(df: pd.DataFrame):
-    """Return all date-like columns except Create Date (e.g., Payment Received Date, First Calibration Scheduled Date, etc.)."""
     date_like = []
     for col in df.columns:
         if col == "Create Date": continue
@@ -48,7 +47,6 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum() > 0:
                 df[col] = parsed
                 date_like.append(col)
-    # Put Payment Received Date first if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
@@ -82,7 +80,6 @@ def last_quarter_bounds():
 def this_year_so_far_bounds(): t = pd.Timestamp.today().date(); return date(t.year,1,1), t
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
-    """Presets + Custom with granularity (Day/Week/Month)."""
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
     choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
     if choice == "Today": f,t = today_bounds(); return f,t,choice,"Day"
@@ -110,7 +107,7 @@ with st.container():
     c1,c2,c3 = st.columns([6,3,3])
     with c1:
         st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Minimal+Smart)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub">Live-search filters • multi-measure • presets • splits • trends • compare</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub">All → untick → type to search • multi-measure • presets • splits • trends</div>', unsafe_allow_html=True)
     with c2:
         if st.button("Clone A → B", key="clone_ab"):
             for k in list(st.session_state.keys()):
@@ -141,7 +138,6 @@ if missing:
     st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
     st.stop()
 
-# Exclude invalid deals, parse dates, detect date-like measures
 df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
 df["Create_Month"] = df["Create Date"].dt.to_period("M")
@@ -150,7 +146,7 @@ if not date_like_cols:
     st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
 
-# ---------- SMART minimal filter UI ----------
+# ---------- Minimal, “All → type to filter” filter UI ----------
 def summarize(values, all_flag, max_items=2):
     if all_flag: return "All"
     if not values: return "None"
@@ -159,79 +155,53 @@ def summarize(values, all_flag, max_items=2):
 
 def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
     """
-    Minimal popover with:
-      - All toggle
-      - Live search box
-      - Contains / Starts-with modes
-      - 'Select all matches' / 'Clear matches'
-      - ONE multiselect (native type-ahead)
+    UX: When 'All' is unticked, show ONE native multiselect (built-in type-ahead).
+    Type letters → list filters → click the name. Clean & fast.
     """
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     all_key  = f"{key_prefix}_all"
     sel_key  = f"{key_prefix}_sel"
-    q_key    = f"{key_prefix}_q"
-    mode_key = f"{key_prefix}_mode"
+    ms_key   = f"{key_prefix}_ms"
 
-    # init
     if all_key not in st.session_state: st.session_state[all_key] = True
     if sel_key not in st.session_state: st.session_state[sel_key] = options.copy()
-    if q_key   not in st.session_state: st.session_state[q_key]   = ""
-    if mode_key not in st.session_state: st.session_state[mode_key] = "Contains"
 
-    all_flag  = st.session_state[all_key]
-    selected  = st.session_state[sel_key]
-    query     = st.session_state[q_key]
-    mode      = st.session_state[mode_key]
-    summary   = summarize(selected, all_flag)
+    all_flag = st.session_state[all_key]
+    selected = st.session_state[sel_key]
+    summary  = summarize(selected, all_flag)
 
     ctx = st.popover(f"{label}: {summary}") if hasattr(st, "popover") else st.expander(f"{label}: {summary}", expanded=False)
     with ctx:
-        top = st.columns([1, 2, 2])
-        with top[0]:
+        colA, colB = st.columns([1,3])
+        with colA:
             chk = st.checkbox("All", value=all_flag, key=all_key)
-            if chk: st.session_state[sel_key] = options.copy()
-        with top[1]:
-            st.text_input("Search", value=query, key=q_key, placeholder=f"Type to search {label.lower()}…")
-        with top[2]:
-            st.radio("Match", ["Contains", "Starts with"], key=mode_key, horizontal=True)
-
-        q = st.session_state[q_key].strip()
-        mode = st.session_state[mode_key]
-        if q:
-            qlow = q.lower()
-            if mode == "Contains":
-                filtered = [o for o in options if qlow in o.lower()]
+            if chk:
+                st.session_state[sel_key] = options.copy()
+        with colB:
+            if not st.session_state[all_key]:
+                st.multiselect(
+                    " ", options=options, default=st.session_state[sel_key],
+                    key=ms_key, placeholder=f"Type to search {label.lower()}…",
+                    label_visibility="collapsed"
+                )
+                act1, act2 = st.columns([1,1])
+                with act1:
+                    if st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True):
+                        st.session_state[sel_key] = options.copy()
+                        st.rerun()
+                with act2:
+                    if st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True):
+                        st.session_state[sel_key] = []
+                        st.rerun()
             else:
-                filtered = [o for o in options if o.lower().startswith(qlow)]
-        else:
-            filtered = options
+                st.caption("All values selected")
 
-        st.caption(f"{len(filtered)}/{len(options)} match")
+    # Sync back from multiselect
+    if ms_key in st.session_state and not st.session_state[all_key]:
+        st.session_state[sel_key] = st.session_state[ms_key]
+        st.session_state[all_key] = (len(st.session_state[sel_key]) == len(options))
 
-        act1, act2 = st.columns([1, 1])
-        with act1:
-            if st.button("Select all matches", key=f"{key_prefix}_select_all", use_container_width=True):
-                new_sel = sorted(set(st.session_state[sel_key]) | set(filtered))
-                st.session_state[sel_key] = new_sel
-                st.session_state[all_key] = (len(new_sel) == len(options))
-                st.rerun()
-        with act2:
-            if st.button("Clear matches", key=f"{key_prefix}_clear_matches", use_container_width=True):
-                new_sel = [x for x in st.session_state[sel_key] if x not in set(filtered)]
-                st.session_state[sel_key] = new_sel
-                st.session_state[all_key] = False
-                st.rerun()
-
-        # native multiselect on filtered list (has built-in type-ahead too)
-        current_in_view = [x for x in st.session_state[sel_key] if x in filtered]
-        picks = st.multiselect("Selected", options=filtered, default=current_in_view, key=f"{key_prefix}_ms",
-                               placeholder=f"Pick {label.lower()}…", disabled=st.session_state[all_key])
-        if f"{key_prefix}_ms" in st.session_state:
-            outside = [x for x in st.session_state[sel_key] if x not in filtered]
-            st.session_state[sel_key] = sorted(set(outside) | set(picks))
-            st.session_state[all_key] = (len(st.session_state[sel_key]) == len(options))
-
-    return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summary}"
+    return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summarize(st.session_state[sel_key], st.session_state[all_key])}"
 
 def filters_toolbar(name: str, df: pd.DataFrame):
     st.markdown('<div class="filters-bar">', unsafe_allow_html=True)
@@ -247,8 +217,7 @@ def filters_toolbar(name: str, df: pd.DataFrame):
                 opts = sorted([v for v in df[col].dropna().astype(str).unique()])
                 st.session_state[f"{prefix}_all"]  = True
                 st.session_state[f"{prefix}_sel"]  = opts
-                st.session_state[f"{prefix}_q"]    = ""
-                st.session_state[f"{prefix}_mode"] = "Contains"
+                st.session_state.pop(f"{prefix}_ms", None)
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
@@ -342,9 +311,7 @@ def compute_outputs(meta):
             flg = f"__MTD__{m}"
             sub[flg] = ((sub[m].notna()) & (sub[f"{m}_Month"] == sub["Create_Month"])).astype(int)
             flags.append(flg)
-            metrics_rows.append({
-                "Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub[flg].sum())
-            })
+            metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub[flg].sum())})
         metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub))})
 
         if split_dims:
@@ -356,13 +323,11 @@ def compute_outputs(meta):
             tables[f"MTD split by {', '.join(split_dims)}"] = grp
 
         if show_top_countries and "Country" in sub.columns:
-            g = sub.groupby("Country", dropna=False)[flags].sum().reset_index()
-            g = g.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
+            g = sub.groupby("Country", dropna=False)[flags].sum().reset_index().rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             tables["Top 5 Countries — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
 
         if show_top_sources and "JetLearn Deal Source" in sub.columns:
-            g = sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index()
-            g = g.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
+            g = sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index().rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             tables["Top 3 Deal Sources — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
 
         trend = sub.copy(); trend["Bucket"] = group_label_from_series(trend["Create Date"], mtd_grain)
@@ -377,9 +342,7 @@ def compute_outputs(meta):
             flg = f"__COH__{m}"
             tmp[flg] = tmp[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both").astype(int)
             ch_flags.append(flg)
-            metrics_rows.append({
-                "Scope":"Cohort","Metric":f"Count on '{m}'","Window":f"{coh_from} → {coh_to}","Value":int(tmp[flg].sum())
-            })
+            metrics_rows.append({"Scope":"Cohort","Metric":f"Count on '{m}'","Window":f"{coh_from} → {coh_to}","Value":int(tmp[flg].sum())})
         in_cre_coh = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
         metrics_rows.append({"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_cre_coh.sum())})
 
@@ -392,13 +355,11 @@ def compute_outputs(meta):
             tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
 
         if show_top_countries and "Country" in base.columns:
-            g = tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index()
-            g = g.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
+            g = tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index().rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             tables["Top 5 Countries — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
 
         if show_top_sources and "JetLearn Deal Source" in base.columns:
-            g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index()
-            g = g.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
+            g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index().rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             tables["Top 3 Deal Sources — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
 
         frames=[]
