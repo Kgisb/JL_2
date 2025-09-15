@@ -140,4 +140,436 @@ def alt_line(df, x, y, color=None, tooltip=None, height=260):
     if color: enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
     return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
 
-# ------------------------ Top Nav -------
+# ------------------------ Top Nav ------------------------
+with st.container():
+    st.markdown('<div class="nav">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([6,3,3])
+    with c1:
+        st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Clean)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub">Blue, minimal UI • popover filters • multi-measure • date presets • smart compare</div>', unsafe_allow_html=True)
+    with c2:
+        if st.button("Clone A → B", key="clone_ab"):
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("A_"):
+                    st.session_state[str(k).replace("A_","B_",1)] = st.session_state[k]
+            st.rerun()
+    with c3:
+        col_ba, col_reset = st.columns(2)
+        with col_ba:
+            if st.button("Clone B → A", key="clone_ba"):
+                for k in list(st.session_state.keys()):
+                    if str(k).startswith("B_"):
+                        st.session_state[str(k).replace("B_","A_",1)] = st.session_state[k]
+                st.rerun()
+        with col_reset:
+            if st.button("Reset", key="reset_all"):
+                st.session_state.clear()
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ------------------------ Data source ------------------------
+with st.expander("📦 Data source", expanded=True):
+    col_u, col_p = st.columns([3,2])
+    with col_u: uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    with col_p: default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
+    if uploaded: df = robust_read_csv(BytesIO(uploaded.getvalue()))
+    else:        df = robust_read_csv(default_path)
+
+df.columns = [c.strip() for c in df.columns]
+missing = [c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}"); st.stop()
+
+# Exclude invalid deals, parse
+df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
+df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
+df["Create_Month"] = df["Create Date"].dt.to_period("M")
+date_like_cols = detect_measure_date_columns(df)
+if not date_like_cols:
+    st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
+
+# ------------------------ Global Filters (Popover + summary) ------------------------
+def summarize_values(values, all_flag, max_items=3):
+    if all_flag: return "All"
+    if not values: return "None"
+    vals = [str(v) for v in values]
+    if len(vals) <= max_items: return ", ".join(vals)
+    return ", ".join(vals[:max_items]) + f" +{len(vals) - max_items} more"
+
+def filter_pop(label, df, colname, key_prefix):
+    options = sorted([v for v in df[colname].dropna().astype(str).unique()])
+    all_key, sel_key = f"{key_prefix}_all", f"{key_prefix}_sel"
+    if all_key not in st.session_state: st.session_state[all_key] = True
+    if sel_key not in st.session_state: st.session_state[sel_key] = options
+    all_flag = st.session_state[all_key]
+    cur_selected = st.session_state[sel_key]
+    summary = summarize_values(cur_selected, all_flag)
+
+    if hasattr(st, "popover"):
+        with st.popover(f"{label}: {summary}"):
+            st.checkbox("All", value=all_flag, key=all_key)
+            st.multiselect(f"Select {label}", options, default=options,
+                           disabled=st.session_state[all_key], key=sel_key)
+    else:
+        with st.expander(f"{label}: {summary}", expanded=False):
+            st.checkbox("All", value=all_flag, key=all_key)
+            st.multiselect(f"Select {label}", options, default=options,
+                           disabled=st.session_state[all_key], key=sel_key)
+    return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summary}"
+
+def filters_toolbar(name, df):
+    st.markdown("<div class='filters-bar'>", unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns([2,2,2,2,1])
+    with c1: pipe_all, pipe_sel, s1 = filter_pop("Pipeline", df, "Pipeline", f"{name}_pipe")
+    with c2: src_all,  src_sel,  s2 = filter_pop("Deal Source", df, "JetLearn Deal Source", f"{name}_src")
+    with c3: ctry_all, ctry_sel, s3 = filter_pop("Country", df, "Country", f"{name}_ctry")
+    with c4: cslr_all, cslr_sel, s4 = filter_pop("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
+    with c5:
+        if st.button("Clear", key=f"{name}_clear"):
+            for prefix, col in [(f"{name}_pipe","Pipeline"), (f"{name}_src","JetLearn Deal Source"),
+                                (f"{name}_ctry","Country"), (f"{name}_cslr","Student/Academic Counsellor")]:
+                st.session_state[f"{prefix}_all"] = True
+                st.session_state[f"{prefix}_sel"] = sorted([v for v in df[col].dropna().astype(str).unique()])
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
+
+    mask_cat = (
+        in_filter(df["Pipeline"], pipe_all, pipe_sel) &
+        in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
+        in_filter(df["Country"], ctry_all, ctry_sel) &
+        in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
+    )
+    base = df[mask_cat].copy()
+    return base, dict(pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
+                      ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel)
+
+def ensure_month_cols(base: pd.DataFrame, measures):
+    for m in measures:
+        col = f"{m}_Month"
+        if col not in base.columns:
+            base[col] = base[m].dt.to_period("M")
+    return base
+
+# ------------------------ Panel Controls ------------------------
+def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
+    st.markdown(f"<div class='section-title'>Scenario {name} <span class='badge'>independent</span></div>", unsafe_allow_html=True)
+
+    base, gstate = filters_toolbar(name, df)
+
+    # Measures & windows row
+    mrow1 = st.columns([4,2,2])
+    measures = mrow1[0].multiselect(f"[{name}] Measure date(s)", options=date_like_cols,
+                                    default=[date_like_cols[0]] if date_like_cols else [],
+                                    key=f"{name}_measures")
+    window_mode = mrow1[1].radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
+    # no compact mode here
+
+    mtd = window_mode in ("MTD","Both")
+    cohort = window_mode in ("Cohort","Both")
+
+    if not measures:
+        st.warning("Pick at least one Measure date.")
+        measures = []
+    base = ensure_month_cols(base, measures)
+
+    # Date presets (Create-Date for MTD; Measure-Date for Cohort)
+    mtd_from = mtd_to = coh_from = coh_to = None
+    c1, c2 = st.columns(2)
+    if mtd:
+        with c1:
+            st.caption("Create-Date window (MTD)")
+            mtd_from, mtd_to = date_range_from_preset(f"[{name}] MTD Range", base["Create Date"], f"{name}_mtd")
+    if cohort:
+        with c2:
+            st.caption("Measure-Date window (Cohort)")
+            first_series = base[measures[0]] if measures else base["Create Date"]
+            coh_from, coh_to = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
+
+    # Splits & leaderboards (optional)
+    with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
+        srow = st.columns([3,2,2])
+        split_dims = srow[0].multiselect(f"[{name}] Split by", ["JetLearn Deal Source", "Country"], default=[], key=f"{name}_split")
+        show_top_countries = srow[1].toggle("Top 5 Countries", value=True, key=f"{name}_top_ctry")
+        show_top_sources   = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+        show_combo_pairs   = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
+
+    return dict(
+        name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
+        mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
+        split_dims=split_dims, show_top_countries=show_top_countries,
+        show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
+        **gstate
+    )
+
+# ------------------------ Engine ------------------------
+def compute_outputs(meta):
+    base = meta["base"]; measures = meta["measures"]
+    mtd = meta["mtd"]; cohort = meta["cohort"]
+    mtd_from, mtd_to = meta["mtd_from"], meta["mtd_to"]
+    coh_from, coh_to = meta["coh_from"], meta["coh_to"]
+    split_dims = meta["split_dims"]
+    show_top_countries = meta["show_top_countries"]
+    show_top_sources   = meta["show_top_sources"]
+    show_combo_pairs   = meta["show_combo_pairs"]
+
+    metrics_rows, tables, charts = [], {}, {}
+
+    # ----- MTD -----
+    if mtd and mtd_from and mtd_to and len(measures)>0:
+        in_create_window = base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
+        sub_mtd = base[in_create_window].copy()
+        mtd_flag_cols = []
+        for m in measures:
+            col_flag = f"__MTD__{m}"
+            sub_mtd[col_flag] = ((sub_mtd[m].notna()) & (sub_mtd[f"{m}_Month"] == sub_mtd["Create_Month"])).astype(int)
+            mtd_flag_cols.append(col_flag)
+            metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub_mtd[col_flag].sum())})
+        metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub_mtd))})
+
+        if split_dims:
+            agg_dict = {flag:"sum" for flag in mtd_flag_cols}
+            sub_mtd["_CreateCount"] = 1
+            agg_dict["_CreateCount"] = "sum"
+            grp = sub_mtd.groupby(split_dims, dropna=False).agg(agg_dict).reset_index()
+            rename_map = {"_CreateCount": "Create Count in window"}
+            rename_map.update({f"__MTD__{m}": f"MTD: {m}" for m in measures})
+            grp = grp.rename(columns=rename_map)
+            grp = grp.sort_values(by=f"MTD: {measures[0]}", ascending=False)
+            tables[f"MTD split by {', '.join(split_dims)}"] = grp
+
+        if show_top_countries and "Country" in sub_mtd.columns:
+            g2 = sub_mtd.groupby("Country", dropna=False)[mtd_flag_cols].sum().reset_index()
+            rename_map_ctry = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
+            g2 = g2.rename(columns=rename_map_ctry)
+            g2 = g2.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
+            tables["Top 5 Countries — MTD"] = g2
+
+        if show_top_sources and "JetLearn Deal Source" in sub_mtd.columns:
+            g3 = sub_mtd.groupby("JetLearn Deal Source", dropna=False)[mtd_flag_cols].sum().reset_index()
+            rename_map_src = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
+            g3 = g3.rename(columns=rename_map_src)
+            g3 = g3.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
+            tables["Top 3 Deal Sources — MTD"] = g3
+
+        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub_mtd.columns):
+            g4 = sub_mtd.groupby(["Country","JetLearn Deal Source"], dropna=False)[mtd_flag_cols].sum().reset_index()
+            rename_map_pair = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
+            g4 = g4.rename(columns=rename_map_pair)
+            g4 = g4.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
+            tables["Top Country × Deal Source — MTD"] = g4
+
+        trend = sub_mtd.groupby("Create_Month")[mtd_flag_cols].sum().reset_index()
+        trend = trend.rename(columns={f"__MTD__{m}": m for m in measures})
+        trend["Create_Month"] = trend["Create_Month"].astype(str)
+        long = trend.melt(id_vars="Create_Month", var_name="Measure", value_name="Count")
+        charts["MTD Trend"] = alt_line(long, "Create_Month:O", "Count:Q", color="Measure:N",
+                                       tooltip=["Create_Month","Measure","Count"])
+
+    # ----- Cohort -----
+    if cohort and coh_from and coh_to and len(measures)>0:
+        tmp = base.copy()
+        coh_flag_cols = []
+        for m in measures:
+            col_flag = f"__COH__{m}"
+            tmp[col_flag] = tmp[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both").astype(int)
+            coh_flag_cols.append(col_flag)
+            metrics_rows.append({"Scope":"Cohort","Metric":f"Count on '{m}'","Window":f"{coh_from} → {coh_to}","Value":int(tmp[col_flag].sum())})
+        in_create_cohort = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
+        metrics_rows.append({"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_create_cohort.sum())})
+
+        if split_dims:
+            agg_dict2 = {flag:"sum" for flag in coh_flag_cols}
+            tmp["_CreateInCohort"] = in_create_cohort.astype(int)
+            agg_dict2["_CreateInCohort"] = "sum"
+            grp2 = tmp.groupby(split_dims, dropna=False).agg(agg_dict2).reset_index()
+            rename_map2 = {"_CreateInCohort": "Create Count in Cohort window"}
+            rename_map2.update({f"__COH__{m}": f"Cohort: {m}" for m in measures})
+            grp2 = grp2.rename(columns=rename_map2)
+            grp2 = grp2.sort_values(by=f"Cohort: {measures[0]}", ascending=False)
+            tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
+
+        if show_top_countries and "Country" in base.columns:
+            g2 = tmp.groupby("Country", dropna=False)[coh_flag_cols].sum().reset_index()
+            rename_map_ctry2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
+            g2 = g2.rename(columns=rename_map_ctry2)
+            g2 = g2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
+            tables["Top 5 Countries — Cohort"] = g2
+
+        if show_top_sources and "JetLearn Deal Source" in base.columns:
+            g3 = tmp.groupby("JetLearn Deal Source", dropna=False)[coh_flag_cols].sum().reset_index()
+            rename_map_src2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
+            g3 = g3.rename(columns=rename_map_src2)
+            g3 = g3.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
+            tables["Top 3 Deal Sources — Cohort"] = g3
+
+        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
+            g4 = tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[coh_flag_cols].sum().reset_index()
+            rename_map_pair2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
+            g4 = g4.rename(columns=rename_map_pair2)
+            g4 = g4.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
+            tables["Top Country × Deal Source — Cohort"] = g4
+
+        trend_frames = []
+        for m in measures:
+            mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
+            loc = base.loc[mask, [m]].copy()
+            loc["Measure_Month"] = loc[m].dt.to_period("M").astype(str)
+            t = loc.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Count")
+            t["Measure"] = m
+            trend_frames.append(t)
+        if trend_frames:
+            trend_coh = pd.concat(trend_frames, ignore_index=True)
+            charts["Cohort Trend"] = alt_line(trend_coh, "Measure_Month:O", "Count:Q", color="Measure:N",
+                                              tooltip=["Measure_Month","Measure","Count"])
+
+    return metrics_rows, tables, charts
+
+def kpi_grid(dfk, label_prefix=""):
+    if dfk.empty:
+        st.info("No KPIs yet.")
+        return
+    cols = st.columns(4)
+    for i, row in dfk.iterrows():
+        with cols[i % 4]:
+            st.markdown(f"""
+<div class="kpi">
+  <div class="label">{label_prefix}{row['Scope']} — {row['Metric']}</div>
+  <div class="value">{row['Value']:,}</div>
+  <div class="delta">{row['Window']}</div>
+</div>
+""", unsafe_allow_html=True)
+
+def build_compare_delta(dfA, dfB):
+    if dfA.empty or dfB.empty: return pd.DataFrame()
+    key = ["Scope","Metric"]
+    a = dfA[key + ["Value"]].copy().rename(columns={"Value":"A"})
+    b = dfB[key + ["Value"]].copy().rename(columns={"Value":"B"})
+    a["A"] = pd.to_numeric(a["A"], errors="coerce")
+    b["B"] = pd.to_numeric(b["B"], errors="coerce")
+    out = pd.merge(a, b, on=key, how="inner")
+    out["A"] = pd.to_numeric(out["A"], errors="coerce")
+    out["B"] = pd.to_numeric(out["B"], errors="coerce")
+    out["Δ"] = pd.to_numeric(out["B"] - out["A"], errors="coerce")
+    denom = out["A"].astype("float")
+    zero_or_nan = denom.isna() | (denom == 0)
+    denom = denom.where(~zero_or_nan)
+    out["Δ%"] = ((out["Δ"].astype("float") / denom) * 100).round(1)
+    return out
+
+def mk_caption(meta):
+    return (
+        f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
+        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
+        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
+        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
+    )
+
+# ------------------------ Panels (A/B) ------------------------
+left, right = st.columns(2, gap="large")
+with left:
+    metaA = panel_controls("A", df, date_like_cols)
+with right:
+    metaB = panel_controls("B", df, date_like_cols)
+
+# ------------------------ Reveal toggles ------------------------
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+st.markdown("<div class='section-title'>Results</div>", unsafe_allow_html=True)
+r1, r2, r3, r4 = st.columns([2,2,2,2])
+show_kpis     = r1.toggle("Show KPIs", value=True)
+show_splits   = r2.toggle("Show Splits & Leaderboards", value=False)
+show_trends   = r3.toggle("Show Trends", value=False)
+show_compare  = r4.toggle("Show Smart Compare", value=True)
+
+# ------------------------ Compute ------------------------
+with st.spinner("Crunching numbers…"):
+    metricsA, tablesA, chartsA = compute_outputs(metaA)
+    metricsB, tablesB, chartsB = compute_outputs(metaB)
+
+# ------------------------ KPIs ------------------------
+if show_kpis:
+    st.markdown("### 📌 KPI Overview")
+    kc1, kc2 = st.columns(2)
+    with kc1:
+        st.markdown("**Scenario A**")
+        dfA = pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
+    with kc2:
+        st.markdown("**Scenario B**")
+        dfB = pd.DataFrame(metricsB); kpi_grid(dfB, "B · ")
+
+# ------------------------ Splits & Leaderboards ------------------------
+if show_splits:
+    st.markdown("### 🧩 Splits & Leaderboards")
+    tabA, tabB = st.tabs(["Scenario A", "Scenario B"])
+    with tabA:
+        if not tablesA: st.info("No tables — enable splits/leaderboards in Scenario A.")
+        else:
+            for name, frame in tablesA.items():
+                st.subheader("A · " + name)
+                st.dataframe(frame, use_container_width=True)
+                st.download_button("Download CSV (A · " + name + ")", to_csv_bytes(frame),
+                                   file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
+    with tabB:
+        if not tablesB: st.info("No tables — enable splits/leaderboards in Scenario B.")
+        else:
+            for name, frame in tablesB.items():
+                st.subheader("B · " + name)
+                st.dataframe(frame, use_container_width=True)
+                st.download_button("Download CSV (B · " + name + ")", to_csv_bytes(frame),
+                                   file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
+
+# ------------------------ Trends ------------------------
+if show_trends:
+    st.markdown("### 📈 Trends")
+    t1, t2 = st.columns(2)
+    with t1:
+        if "MTD Trend" in chartsA or "Cohort Trend" in chartsA:
+            st.markdown("**Scenario A**")
+            if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
+            if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
+        else: st.info("Enable MTD/Cohort in A and set ranges.")
+    with t2:
+        if "MTD Trend" in chartsB or "Cohort Trend" in chartsB:
+            st.markdown("**Scenario B**")
+            if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
+            if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
+        else: st.info("Enable MTD/Cohort in B and set ranges.")
+
+# ------------------------ Smart Compare ------------------------
+if show_compare:
+    st.markdown("### 🧠 Smart Compare (A vs B)")
+    dA, dB = pd.DataFrame(metricsA), pd.DataFrame(metricsB)
+    if not dA.empty and not dB.empty:
+        cmp = build_compare_delta(dA, dB)
+        if cmp.empty:
+            st.info("Adjust scenarios to produce comparable KPIs.")
+        else:
+            st.dataframe(cmp, use_container_width=True)
+            try:
+                if set(metaA["measures"]) == set(metaB["measures"]):
+                    sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
+                    if not sub.empty:
+                        sub["Measure"] = sub["Metric"].str.extract(r"Count on '(.+)'")
+                        a_long = sub.rename(columns={"A":"Value"})[["Measure","Scope","Value"]]; a_long["Scenario"] = "A"
+                        b_long = sub.rename(columns={"B":"Value"})[["Measure","Scope","Value"]]; b_long["Scenario"] = "B"
+                        long = pd.concat([a_long, b_long], ignore_index=True)
+                        ch = alt.Chart(long).mark_bar().encode(
+                            x=alt.X("Scope:N", title=None),
+                            y=alt.Y("Value:Q"),
+                            color=alt.Color("Scenario:N", scale=alt.Scale(range=PALETTE[:2])),
+                            column=alt.Column("Measure:N", header=alt.Header(title=None, labelAngle=0)),
+                            tooltip=["Measure","Scenario","Scope","Value"]
+                        ).properties(height=260)
+                        st.altair_chart(ch, use_container_width=True)
+            except Exception:
+                pass
+    else:
+        st.info("Turn on KPIs for both scenarios to enable compare.")
+
+# ------------------------ Foot captions ------------------------
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+st.caption("**Scenario A** — " + mk_caption(metaA))
+st.caption("**Scenario B** — " + mk_caption(metaB))
+st.caption("Excluded globally: 1.2 Invalid Deal")
