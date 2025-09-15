@@ -1,4 +1,4 @@
-# app.py — Smart MTD vs Cohort Analyzer (Pro UI, nested f-strings fixed)
+# app_compare.py — MTD vs Cohort Analyzer with A/B filter sets
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -6,10 +6,10 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ---------------- Page config & styling ----------------
-st.set_page_config(page_title="MTD vs Cohort Analyzer", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort Analyzer — A/B Compare", layout="wide", page_icon="🧪")
 st.markdown("""
 <style>
-.block-container {padding-top: 0.8rem; padding-bottom: 1rem;}
+.block-container {padding-top: 0.7rem; padding-bottom: 1rem;}
 .kpi-card {
   padding: 14px 16px; border:1px solid rgba(49,51,63,.2);
   border-radius: 12px; background:linear-gradient(180deg,#fff 0%,#fafafa 100%);
@@ -19,6 +19,8 @@ st.markdown("""
 .kpi-value { font-size:1.6rem; font-weight:700; margin:2px 0; }
 .kpi-sub   { color:#6b7280; font-size:.85rem; margin-top:-6px;}
 hr.soft { border:0; height:1px; background:rgba(49,51,63,.1); margin:0.6rem 0 1rem;}
+.badge {display:inline-block; padding:2px 8px; font-size:.75rem; border-radius:999px; background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe;}
+.panel {border:1px solid rgba(49,51,63,.15); border-radius:12px; padding:10px 12px; background:#fff;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -91,7 +93,7 @@ def load_and_prepare(data_bytes, path_text):
     date_like_cols = detect_measure_date_columns(df)
     return df, date_like_cols
 
-# ---------------- Sidebar: data + global filters ----------------
+# ---------------- Controls: Data ----------------
 st.sidebar.title("⚙️ Controls")
 
 with st.sidebar.expander("Data source", expanded=True):
@@ -104,108 +106,125 @@ with st.sidebar.expander("Data source", expanded=True):
     except Exception as e:
         st.error(str(e)); st.stop()
 
-def filter_block(label, colname, key_prefix):
+if not date_like_cols:
+    st.error("No other date-like columns found (e.g., 'Payment Received Date').")
+    st.stop()
+
+# ---------------- Panel builder (Scenario A / B) ----------------
+def filter_block(df, label, colname, key_prefix):
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
-    c1, c2 = st.sidebar.columns([1, 3])
+    c1, c2 = st.columns([1, 3])
     all_flag = c1.checkbox("All", value=True, key=f"{key_prefix}_all")
     selected = c2.multiselect(label, options, default=options, disabled=all_flag,
                               key=f"{key_prefix}_sel", help=f"Filter by {label.lower()}")
     return all_flag, selected
 
-st.sidebar.markdown("### Global Filters")
-pipe_all,  pipe_sel  = filter_block("Pipeline", "Pipeline", "pipe")
-src_all,   src_sel   = filter_block("Deal Source", "JetLearn Deal Source", "src")
-ctry_all,  ctry_sel  = filter_block("Country", "Country", "ctry")
-cslr_all,  cslr_sel  = filter_block("Counsellor", "Student/Academic Counsellor", "cslr")
+def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
+    st.markdown(f"### Scenario {name} <span class='badge'>independent filters</span>", unsafe_allow_html=True)
+    with st.container():
+        # Global filters
+        st.markdown("#### Global Filters")
+        f1c1, f1c2 = st.columns(2)
+        with f1c1:
+            pipe_all, pipe_sel = filter_block(df, "Pipeline", "Pipeline", f"{name}_pipe")
+            src_all,  src_sel  = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
+        with f1c2:
+            ctry_all, ctry_sel = filter_block(df, "Country", "Country", f"{name}_ctry")
+            cslr_all, cslr_sel = filter_block(df, "Counsellor", "Student/Academic Counsellor", f"{name}_cslr")
 
-mask_cat = (
-    in_filter(df["Pipeline"], pipe_all,  pipe_sel) &
-    in_filter(df["JetLearn Deal Source"], src_all,   src_sel) &
-    in_filter(df["Country"], ctry_all,  ctry_sel) &
-    in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
-)
-base = df[mask_cat].copy()
+        mask_cat = (
+            in_filter(df["Pipeline"], pipe_all, pipe_sel) &
+            in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
+            in_filter(df["Country"], ctry_all, ctry_sel) &
+            in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
+        )
+        base = df[mask_cat].copy()
 
-# ---------------- Header ----------------
-h1c1, h1c2 = st.columns([6,1])
-with h1c1:
-    st.markdown("## 📊 MTD vs Cohort Analyzer")
-    st.caption("Smart analysis comparing **MTD** (Create-date window; measure-month == create-month) vs **Cohort** (Measure-date window).")
-with h1c2:
-    if st.button("Reset filters", help="Reselect 'All' for every global filter"):
-        for k in list(st.session_state.keys()):
-            if k.endswith("_all"): st.session_state[k] = True
-        st.experimental_rerun()
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+        # Measure & toggles
+        st.markdown("#### Measure & Windows")
+        mc1, mc2, mc3 = st.columns([3,2,2])
+        measure_col = mc1.selectbox(f"[{name}] Measure date", date_like_cols, index=0, key=f"{name}_measure")
+        if f"{measure_col}_Month" not in base.columns:
+            base[f"{measure_col}_Month"] = base[measure_col].dt.to_period("M")
+        mtd    = mc2.toggle(f"[{name}] Enable MTD", value=True, key=f"{name}_mtd")
+        cohort = mc3.toggle(f"[{name}] Enable Cohort", value=True, key=f"{name}_coh")
 
-# ---------------- Measure + toggles + date presets ----------------
-if not date_like_cols:
-    st.error("No other date-like columns found (e.g., 'Payment Received Date').")
-    st.stop()
+        # MTD window (Create)
+        if mtd:
+            st.markdown("##### 🗓️ MTD window (Create Date)")
+            p1, p2, p3 = st.columns([2,3,3])
+            preset = p1.selectbox(f"[{name}] Preset", ["This month","All time","Custom"], index=0, key=f"{name}_mtd_preset")
+            cmin, cmax = safe_minmax_date(base["Create Date"])
+            if preset == "This month":  mtd_from, mtd_to = this_month_bounds()
+            elif preset == "All time":  mtd_from, mtd_to = cmin, cmax
+            else:                       mtd_from, mtd_to = cmin, cmax
+            mtd_from = p2.date_input(f"[{name}] From (Create)", mtd_from, key=f"{name}_mtd_from")
+            mtd_to   = p3.date_input(f"[{name}] To (Create)",   mtd_to,   key=f"{name}_mtd_to")
+            if mtd_from > mtd_to:
+                st.error(f"{name} / MTD: 'From' is after 'To'."); mtd = False
+        else:
+            mtd_from = mtd_to = None
 
-topc1, topc2, topc3 = st.columns([3,2,2])
-measure_col = topc1.selectbox("Measure date (what to count on)", date_like_cols, index=0)
-if f"{measure_col}_Month" not in base.columns:
-    base[f"{measure_col}_Month"] = base[measure_col].dt.to_period("M")
+        # Cohort window (Measure)
+        if cohort:
+            st.markdown("##### 🗓️ Cohort window (Measure Date)")
+            q1, q2, q3 = st.columns([2,3,3])
+            preset2 = q1.selectbox(f"[{name}] Preset", ["This month","All time","Custom"], index=1, key=f"{name}_coh_preset")
+            mmin, mmax = safe_minmax_date(base[measure_col])
+            if preset2 == "This month": coh_from, coh_to = this_month_bounds()
+            elif preset2 == "All time": coh_from, coh_to = mmin, mmax
+            else:                       coh_from, coh_to = mmin, mmax
+            coh_from = q2.date_input(f"[{name}] From (Measure)", coh_from, key=f"{name}_coh_from")
+            coh_to   = q3.date_input(f"[{name}] To (Measure)",   coh_to,   key=f"{name}_coh_to")
+            if coh_from > coh_to:
+                st.error(f"{name} / Cohort: 'From' is after 'To'."); cohort = False
+        else:
+            coh_from = coh_to = None
 
-mtd    = topc2.toggle("Enable MTD", value=True, help="Create-Date window; counts only if Measure-month == Create-month")
-cohort = topc3.toggle("Enable Cohort", value=True, help="Measure-Date window; Create date ignored for the measure count")
+        # Splits & leaderboards
+        st.markdown("#### Breakdowns & Leaderboards")
+        bc1, bc2, bc3, bc4 = st.columns([3,2,2,2])
+        split_dims = bc1.multiselect(f"[{name}] Split by", ["JetLearn Deal Source","Country"], default=[], key=f"{name}_split")
+        show_top_countries = bc2.checkbox(f"[{name}] Top 5 Countries", value=True, key=f"{name}_top_ctry")
+        show_top_sources   = bc3.checkbox(f"[{name}] Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+        show_combo_pairs   = bc4.checkbox(f"[{name}] Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
 
-# MTD range (Create Date)
-if mtd:
-    st.markdown("### 🗓️ MTD window (Create Date)")
-    p1, p2, p3 = st.columns([2,3,3])
-    preset = p1.selectbox("Preset", ["This month", "All time", "Custom"], index=0, key="mtd_preset")
-    cmin, cmax = safe_minmax_date(base["Create Date"])
-    if preset == "This month":  mtd_from, mtd_to = this_month_bounds()
-    elif preset == "All time":  mtd_from, mtd_to = cmin, cmax
-    else:                       mtd_from, mtd_to = cmin, cmax
-    mtd_from = p2.date_input("From (Create)", mtd_from, key="mtd_from")
-    mtd_to   = p3.date_input("To (Create)",   mtd_to,   key="mtd_to")
-    if mtd_from > mtd_to:
-        st.error("MTD: 'From' is after 'To'. Adjust the Create-Date range."); mtd = False
+        meta = dict(
+            name=name, base=base, measure_col=measure_col, mtd=mtd, cohort=cohort,
+            mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
+            split_dims=split_dims, show_top_countries=show_top_countries,
+            show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
+            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
+            ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel
+        )
+        return meta
 
-# Cohort range (Measure Date)
-if cohort:
-    st.markdown("### 🗓️ Cohort window (Measure Date)")
-    q1, q2, q3 = st.columns([2,3,3])
-    preset2 = q1.selectbox("Preset", ["This month", "All time", "Custom"], index=1, key="coh_preset")
-    mmin, mmax = safe_minmax_date(base[measure_col])
-    if preset2 == "This month": coh_from, coh_to = this_month_bounds()
-    elif preset2 == "All time": coh_from, coh_to = mmin, mmax
-    else:                       coh_from, coh_to = mmin, mmax
-    coh_from = q2.date_input("From (Measure)", coh_from, key="coh_from")
-    coh_to   = q3.date_input("To (Measure)",   coh_to,   key="coh_to")
-    if coh_from > coh_to:
-        st.error("Cohort: 'From' is after 'To'. Adjust the Measure-Date range."); cohort = False
+def compute_outputs(meta):
+    base = meta["base"]; measure_col = meta["measure_col"]
+    mtd = meta["mtd"]; cohort = meta["cohort"]
+    mtd_from, mtd_to = meta["mtd_from"], meta["mtd_to"]
+    coh_from, coh_to = meta["coh_from"], meta["coh_to"]
+    split_dims = meta["split_dims"]
+    show_top_countries = meta["show_top_countries"]
+    show_top_sources   = meta["show_top_sources"]
+    show_combo_pairs   = meta["show_combo_pairs"]
 
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+    if f"{measure_col}_Month" not in base.columns:
+        base[f"{measure_col}_Month"] = base[measure_col].dt.to_period("M")
 
-# ---------------- Breakdowns & leaderboards ----------------
-bc1, bc2, bc3, bc4 = st.columns([3,2,2,2])
-split_dims = bc1.multiselect("Split by (optional)", ["JetLearn Deal Source","Country"], default=[],
-                             help="Add per-group tables & charts.")
-show_top_countries = bc2.checkbox("Top 5 Countries", value=True)
-show_top_sources   = bc3.checkbox("Top 3 Deal Sources", value=True)
-show_combo_pairs   = bc4.checkbox("Country × Deal Source (Top 10)", value=False)
+    metrics_rows = []
+    tables = {}
+    charts = {}
 
-st.caption("Tip: use the tabs below to view KPIs, tables, trends, and exports.")
-
-# ---------------- Compute ----------------
-metrics_rows = []
-tables = {}   # name -> DataFrame
-charts = {}   # name -> Altair chart
-
-with st.spinner("Crunching numbers..."):
-    # ----- MTD -----
-    if mtd:
+    # MTD
+    if mtd and mtd_from and mtd_to:
         in_create_window = base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub_mtd = base[in_create_window].copy()
         mtd_flag = (sub_mtd[measure_col].notna()) & (sub_mtd[f"{measure_col}_Month"] == sub_mtd["Create_Month"])
 
         metrics_rows += [
-            {"Scope":"MTD", "Metric": f"Count on '{measure_col}'", "Window": f"{mtd_from} → {mtd_to}", "Value": int(mtd_flag.sum())},
-            {"Scope":"MTD", "Metric": "Create Count in window",    "Window": f"{mtd_from} → {mtd_to}", "Value": int(len(sub_mtd))}
+            {"Scope":"MTD","Metric":f"Count on '{measure_col}'","Window":f"{mtd_from} → {mtd_to}","Value":int(mtd_flag.sum())},
+            {"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub_mtd))},
         ]
 
         if split_dims:
@@ -260,7 +279,6 @@ with st.spinner("Crunching numbers..."):
             }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — MTD"] = both
 
-        # Trend (MTD)
         trend_mtd = sub_mtd.assign(flag=mtd_flag.astype(int)).groupby("Create_Month", dropna=False)["flag"].sum().reset_index()
         trend_mtd = trend_mtd.rename(columns={"Create_Month":"Month","flag":"MTD Count"})
         trend_mtd["Month"] = trend_mtd["Month"].astype(str)
@@ -269,14 +287,14 @@ with st.spinner("Crunching numbers..."):
         ).properties(height=280)
         tables["Trend — MTD (by Create Month)"] = trend_mtd
 
-    # ----- Cohort -----
-    if cohort:
+    # Cohort
+    if cohort and coh_from and coh_to:
         in_measure_window = base[measure_col].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
         in_create_cohort  = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
 
         metrics_rows += [
-            {"Scope":"Cohort", "Metric": f"Count on '{measure_col}'", "Window": f"{coh_from} → {coh_to}", "Value": int(in_measure_window.sum())},
-            {"Scope":"Cohort", "Metric": "Create Count in Cohort window", "Window": f"{coh_from} → {coh_to}", "Value": int(in_create_cohort.sum())}
+            {"Scope":"Cohort","Metric":f"Count on '{measure_col}'","Window":f"{coh_from} → {coh_to}","Value":int(in_measure_window.sum())},
+            {"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_create_cohort.sum())},
         ]
 
         if split_dims:
@@ -342,7 +360,6 @@ with st.spinner("Crunching numbers..."):
             }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — Cohort"] = both2
 
-        # Trend (Cohort): monthly counts by measure month
         trend_coh = base.loc[in_measure_window].copy()
         trend_coh["Measure_Month"] = trend_coh[measure_col].dt.to_period("M")
         trend_coh = trend_coh.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Cohort Count")
@@ -352,106 +369,162 @@ with st.spinner("Crunching numbers..."):
         ).properties(height=280)
         tables["Trend — Cohort (by Measure Month)"] = trend_coh
 
-# ---------------- Narrative insights (fixed: no nested f-strings) ----------------
-st.markdown("### 🔎 Insights")
-if not metrics_rows:
-    st.info("Turn on MTD and/or Cohort to see insights.")
+    return metrics_rows, tables, charts
+
+def kpi_cards(dfk):
+    cols = st.columns(4)
+    for i, row in dfk.iterrows():
+        with cols[i % 4]:
+            st.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-title">{row['Scope']} — {row['Metric']}</div>
+                <div class="kpi-value">{row['Value']:,}</div>
+                <div class="kpi-sub">{row['Window']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# ---------------- Header ----------------
+lc, rc = st.columns([7,3])
+with lc:
+    st.markdown("## 🧪 A/B Compare — MTD vs Cohort Analyzer")
+    st.caption("Two independent filter panels to compare outputs across **different time frames** (and segments). Excludes `1.2 Invalid Deal`.")
+with rc:
+    if st.button("Clone A → B", help="Copy Scenario A selections into Scenario B"):
+        for k, v in st.session_state.items():
+            if str(k).startswith("A_"):
+                st.session_state[str(k).replace("A_","B_",1)] = v
+        st.experimental_rerun()
+
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+
+# ---------------- Panels ----------------
+colA, colB = st.columns(2, gap="large")
+with colA:
+    metaA = panel_controls("A", df, date_like_cols)
+with colB:
+    metaB = panel_controls("B", df, date_like_cols)
+
+# ---------------- Compute ----------------
+with st.spinner("Calculating A/B results..."):
+    metricsA, tablesA, chartsA = compute_outputs(metaA)
+    metricsB, tablesB, chartsB = compute_outputs(metaB)
+
+# ---------------- KPIs side-by-side ----------------
+st.markdown("### 📌 KPIs")
+kc1, kc2 = st.columns(2)
+with kc1:
+    st.markdown("**Scenario A**")
+    if metricsA:
+        kpi_cards(pd.DataFrame(metricsA))
+    else:
+        st.info("No KPIs (turn on MTD and/or Cohort).")
+with kc2:
+    st.markdown("**Scenario B**")
+    if metricsB:
+        kpi_cards(pd.DataFrame(metricsB))
+    else:
+        st.info("No KPIs (turn on MTD and/or Cohort).")
+
+# ---------------- Quick Comparison (if same measure) ----------------
+if metricsA and metricsB and (metaA["measure_col"] == metaB["measure_col"]):
+    st.markdown("### 🆚 Quick Compare")
+    # Build a long table with Scope counts per scenario
+    def to_long(metrics, tag):
+        dfm = pd.DataFrame(metrics)
+        dfm["Scenario"] = tag
+        return dfm[["Scenario","Scope","Metric","Window","Value"]]
+    long_cmp = pd.concat([to_long(metricsA, "A"), to_long(metricsB, "B")], ignore_index=True)
+    # Only compare "Count on 'measure'" KPIs
+    mask_main = long_cmp["Metric"].str.startswith("Count on '")
+    main_cmp = long_cmp[mask_main].copy()
+    if not main_cmp.empty:
+        chart = alt.Chart(main_cmp).mark_bar().encode(
+            x=alt.X("Scope:N", title=None),
+            y=alt.Y("Value:Q"),
+            color=alt.Color("Scenario:N"),
+            column=alt.Column("Scenario:N", header=alt.Header(title=None, labelAngle=0)),
+            tooltip=["Scenario","Scope","Value","Window"]
+        ).properties(height=320)
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No comparable 'Count on ...' KPIs to chart.")
 else:
-    bullets = []
-    try:
-        # MTD country leader
-        if "Top 5 Countries — MTD" in tables and not tables["Top 5 Countries — MTD"].empty:
-            r = tables["Top 5 Countries — MTD"].iloc[0]
-            mtd_col = f"MTD Count on '{measure_col}'"
-            mtd_cnt = int(r[mtd_col]) if mtd_col in r and pd.notna(r[mtd_col]) else 0
-            bullets.append(f"**MTD:** Country leader is **{r['Country']}** with **{mtd_cnt:,}**.")
-
-        # Cohort country leader
-        if "Top 5 Countries — Cohort" in tables and not tables["Top 5 Countries — Cohort"].empty:
-            r = tables["Top 5 Countries — Cohort"].iloc[0]
-            coh_col = f"Cohort Count on '{measure_col}'"
-            coh_cnt = int(r[coh_col]) if coh_col in r and pd.notna(r[coh_col]) else 0
-            bullets.append(f"**Cohort:** Country leader is **{r['Country']}** with **{coh_cnt:,}**.")
-
-        # MTD source leader (name only)
-        if "Top 3 Deal Sources — MTD" in tables and not tables["Top 3 Deal Sources — MTD"].empty:
-            r = tables["Top 3 Deal Sources — MTD"].iloc[0]
-            bullets.append(f"**MTD:** Top deal source is **{r['JetLearn Deal Source']}**.")
-
-        # Cohort source leader (name only)
-        if "Top 3 Deal Sources — Cohort" in tables and not tables["Top 3 Deal Sources — Cohort"].empty:
-            r = tables["Top 3 Deal Sources — Cohort"].iloc[0]
-            bullets.append(f"**Cohort:** Top deal source is **{r['JetLearn Deal Source']}**.")
-    except Exception:
-        pass
-
-    if bullets:
-        st.markdown("- " + "\n- ".join(bullets))
-    else:
-        st.write("No highlights yet — try enabling splits or leaderboards.")
+    st.info("Tip: choose the **same Measure date** in both scenarios to see a side-by-side chart.")
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
-# ---------------- Tabs: KPIs | Tables | Trends | Export ----------------
-tab_kpi, tab_tbl, tab_tr, tab_dl = st.tabs(["📌 KPIs","📋 Tables","📈 Trends","⬇️ Export"])
+# ---------------- Tabs for detail ----------------
+tabA, tabB, tabExp = st.tabs(["📋 Scenario A Tables/Trends", "📋 Scenario B Tables/Trends", "⬇️ Export"])
 
-with tab_kpi:
-    if 'metrics_rows' not in locals() or not metrics_rows:
-        st.info("No KPIs yet.")
+with tabA:
+    if not tablesA and not chartsA:
+        st.info("No tables yet — adjust Scenario A filters.")
     else:
-        dfk = pd.DataFrame(metrics_rows)
-        cols = st.columns(4)
-        for i, row in dfk.iterrows():
-            with cols[i % 4]:
-                st.markdown(f"""
-                <div class="kpi-card">
-                    <div class="kpi-title">{row['Scope']} — {row['Metric']}</div>
-                    <div class="kpi-value">{row['Value']:,}</div>
-                    <div class="kpi-sub">{row['Window']}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-with tab_tbl:
-    if not tables:
-        st.info("No tables yet — adjust filters and toggles.")
-    else:
-        for name, frame in tables.items():
-            st.subheader(name)
+        for name, frame in tablesA.items():
+            if "Trend" in name: continue
+            st.subheader(name + " (A)")
             st.dataframe(frame, use_container_width=True)
+        # Trends
+        if "MTD Trend" in chartsA:
+            st.subheader("MTD Trend (A)")
+            st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
+        if "Cohort Trend" in chartsA:
+            st.subheader("Cohort Trend (A)")
+            st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
 
-with tab_tr:
-    shown = False
-    if "MTD Trend" in charts:
-        st.subheader("MTD Trend (by Create Month)")
-        st.altair_chart(charts["MTD Trend"], use_container_width=True)
-        shown=True
-    if "Cohort Trend" in charts:
-        st.subheader("Cohort Trend (by Measure Month)")
-        st.altair_chart(charts["Cohort Trend"], use_container_width=True)
-        shown=True
-    if not shown:
-        st.info("Turn on MTD and/or Cohort to see trends.")
-
-with tab_dl:
-    if not tables:
-        st.info("Nothing to export yet.")
+with tabB:
+    if not tablesB and not chartsB:
+        st.info("No tables yet — adjust Scenario B filters.")
     else:
-        st.markdown("#### Download result tables")
-        for name, frame in tables.items():
-            c1, c2 = st.columns([4,1])
-            with c1: st.caption(name)
-            with c2:
-                st.download_button("CSV", data=to_csv_bytes(frame),
-                                   file_name=f"{name.replace(' ','_').replace('×','x')}.csv",
-                                   mime="text/csv", key=f"dl_{name}")
+        for name, frame in tablesB.items():
+            if "Trend" in name: continue
+            st.subheader(name + " (B)")
+            st.dataframe(frame, use_container_width=True)
+        # Trends
+        if "MTD Trend" in chartsB:
+            st.subheader("MTD Trend (B)")
+            st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
+        if "Cohort Trend" in chartsB:
+            st.subheader("Cohort Trend (B)")
+            st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
 
-# ---------------- Footer ----------------
+with tabExp:
+    any_tbl = False
+    if tablesA:
+        st.markdown("#### Scenario A")
+        for name, frame in tablesA.items():
+            st.download_button(
+                f"Download A — {name}.csv",
+                data=to_csv_bytes(frame),
+                file_name=f"A_{name.replace(' ','_').replace('×','x')}.csv",
+                mime="text/csv",
+                key=f"dl_A_{name}"
+            )
+            any_tbl = True
+    if tablesB:
+        st.markdown("#### Scenario B")
+        for name, frame in tablesB.items():
+            st.download_button(
+                f"Download B — {name}.csv",
+                data=to_csv_bytes(frame),
+                file_name=f"B_{name.replace(' ','_').replace('×','x')}.csv",
+                mime="text/csv",
+                key=f"dl_B_{name}"
+            )
+            any_tbl = True
+    if not any_tbl:
+        st.info("No tables available to export.")
+
+# ---------------- Footers ----------------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption(
-    f"**Measure:** {measure_col} · "
-    f"Pipeline: {'All' if pipe_all else ', '.join(pipe_sel) or 'None'} · "
-    f"Deal Source: {'All' if src_all else ', '.join(src_sel) or 'None'} · "
-    f"Country: {'All' if ctry_all else ', '.join(ctry_sel) or 'None'} · "
-    f"Counsellor: {'All' if cslr_all else ', '.join(cslr_sel) or 'None'} · "
-    f"Excluded: 1.2 Invalid Deal"
-)
+def mk_caption(meta):
+    return (
+        f"Measure: {meta['measure_col']} · "
+        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
+        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
+        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
+        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
+    )
+st.caption("**Scenario A** — " + mk_caption(metaA))
+st.caption("**Scenario B** — " + mk_caption(metaB))
+st.caption("Excluded globally: 1.2 Invalid Deal")
