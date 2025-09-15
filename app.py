@@ -1,6 +1,6 @@
-# app_compare_pro_tabs.py
-# A/B analyzer with Scenario B in its own tab + a Compare tab
-# Minimal, smart UI: All→type-to-search filters, multi-measure, presets, splits & trends.
+# app_compare_pro_tabs_counsellor.py
+# A/B analyzer with Scenario B in its own tab + Compare tab
+# Adds Student/Academic Counsellor to "Split by" and leaderboards (Top 5 Counsellors)
 
 import streamlit as st
 import pandas as pd
@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ---------- Page ----------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Tabs UI)", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Tabs + Counsellor)", layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{ --text:#0f172a; --muted:#6b7280; --blue-600:#2563eb; --blue-700:#1d4ed8; --border: rgba(15,23,42,.10); --card:#fff; }
@@ -283,17 +283,26 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
             coh_from, coh_to, _, coh_grain = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
 
     with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
-        srow = st.columns([3,2,2])
-        split_dims = srow[0].multiselect(f"[{name}] Split by", ["JetLearn Deal Source", "Country"], default=[], key=f"{name}_split")
-        show_top_countries = srow[1].toggle("Top 5 Countries", value=True, key=f"{name}_top_ctry")
-        show_top_sources   = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+        srow = st.columns([3,2,2,2])
+        split_dims = srow[0].multiselect(
+            f"[{name}] Split by",
+            ["JetLearn Deal Source", "Country", "Student/Academic Counsellor"],
+            default=[],
+            key=f"{name}_split"
+        )
+        show_top_countries   = srow[1].toggle("Top 5 Countries", value=True,  key=f"{name}_top_ctry")
+        show_top_sources     = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+        show_top_counsellors = srow[3].toggle("Top 5 Counsellors", value=False, key=f"{name}_top_cslr")
         show_combo_pairs   = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
 
     return dict(name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
                 mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
                 mtd_grain=mtd_grain, coh_grain=coh_grain,
-                split_dims=split_dims, show_top_countries=show_top_countries,
-                show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs, **gstate)
+                split_dims=split_dims,
+                show_top_countries=show_top_countries,
+                show_top_sources=show_top_sources,
+                show_top_counsellors=show_top_counsellors,
+                show_combo_pairs=show_combo_pairs, **gstate)
 
 # ---------- Engine ----------
 def group_label_from_series(s: pd.Series, grain: str):
@@ -310,8 +319,10 @@ def compute_outputs(meta):
     coh_from, coh_to = meta["coh_from"], meta["coh_to"]
     mtd_grain, coh_grain = meta.get("mtd_grain","Month"), meta.get("coh_grain","Month")
     split_dims = meta["split_dims"]
-    show_top_countries = meta["show_top_countries"]; show_top_sources = meta["show_top_sources"]
-    show_combo_pairs = meta["show_combo_pairs"]
+    show_top_countries   = meta["show_top_countries"]
+    show_top_sources     = meta["show_top_sources"]
+    show_top_counsellors = meta["show_top_counsellors"]
+    show_combo_pairs     = meta["show_combo_pairs"]
 
     metrics_rows, tables, charts = [], {}, {}
 
@@ -344,6 +355,16 @@ def compute_outputs(meta):
             if show_top_sources and "JetLearn Deal Source" in sub.columns:
                 g = sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index().rename(columns={f: f"MTD: {m}" for f,m in zip(flags, measures)})
                 tables["Top 3 Deal Sources — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
+
+            if show_top_counsellors and "Student/Academic Counsellor" in sub.columns:
+                g = sub.groupby("Student/Academic Counsellor", dropna=False)[flags].sum().reset_index().rename(columns={f: f"MTD: {m}" for f,m in zip(flags, measures)})
+                tables["Top 5 Counsellors — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
+
+            if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub.columns):
+                both = sub.groupby(["Country","JetLearn Deal Source"], dropna=False)[flags].sum().reset_index().rename(
+                    columns={f: f"MTD: {m}" for f,m in zip(flags, measures)}
+                ).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
+                tables["Top Country × Deal Source — MTD"] = both
 
             trend = sub.copy(); trend["Bucket"] = group_label_from_series(trend["Create Date"], mtd_grain)
             t = trend.groupby("Bucket")[flags].sum().reset_index().rename(columns={f: m for f,m in zip(flags, measures)})
@@ -378,6 +399,16 @@ def compute_outputs(meta):
             if show_top_sources and "JetLearn Deal Source" in base.columns:
                 g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
                 tables["Top 3 Deal Sources — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
+
+            if show_top_counsellors and "Student/Academic Counsellor" in base.columns:
+                g = tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
+                tables["Top 5 Counsellors — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
+
+            if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
+                both2 = tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index().rename(
+                    columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)}
+                ).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
+                tables["Top Country × Deal Source — Cohort"] = both2
 
             frames=[]
             for m in measures:
@@ -466,6 +497,7 @@ with tabB:
 
 with tabC:
     st.markdown("### 🧠 Smart Compare (A vs B)")
+    dfA = pd.DataFrame(metricsA); dfB = pd.DataFrame(metricsB)
     if dfA.empty or dfB.empty:
         st.info("Turn on KPIs for both scenarios to enable compare.")
     else:
@@ -475,6 +507,7 @@ with tabC:
         else:
             st.dataframe(cmp, use_container_width=True)
             try:
+                # If both scenarios measure the same set, show bar compare by measure
                 if set(metaA["measures"]) == set(metaB["measures"]):
                     sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
                     if not sub.empty:
