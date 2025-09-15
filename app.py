@@ -1,5 +1,6 @@
-# app_compare_pro_minimal_search_v3.py
+# app_compare_pro_minimal_search_v3_fixed.py
 # Minimal A/B analyzer with streamlined "All → type to filter" multiselect UX
+# FIX: robust single-value handling in global filters
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +25,7 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
-.compact-label .stSelectbox label, .compact-label .stMultiSelect label { display:none; } /* collapse labels inside popovers */
+.compact-label .stSelectbox label, .compact-label .stMultiSelect label { display:none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,12 +52,24 @@ def detect_measure_date_columns(df: pd.DataFrame):
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
 
+def coerce_list(x):
+    """Always return a list (handles None / scalar / tuples/sets)."""
+    if x is None: return []
+    if isinstance(x, (list, tuple, set)): return list(x)
+    return [x]
+
 def in_filter(series: pd.Series, all_checked: bool, selected_values):
-    if all_checked: return pd.Series(True, index=series.index)
-    uniq = series.dropna().astype(str).nunique()
-    if selected_values and len(selected_values)==uniq: return pd.Series(True, index=series.index)
-    if not selected_values: return pd.Series(False, index=series.index)
-    return series.astype(str).isin(selected_values)
+    """Robust: works even when a single value is selected."""
+    if all_checked:
+        return pd.Series(True, index=series.index)
+    sel = coerce_list(selected_values)
+    if len(sel) == 0:
+        return pd.Series(False, index=series.index)
+    # If the user effectively selected all distinct values, treat as All
+    uniq = series.dropna().astype(str).unique().tolist()
+    if set(map(str, sel)) >= set(map(str, uniq)):
+        return pd.Series(True, index=series.index)
+    return series.astype(str).isin(list(map(str, sel)))
 
 def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     if s.isna().all(): return fallback
@@ -148,6 +161,7 @@ if not date_like_cols:
 
 # ---------- Minimal, “All → type to filter” filter UI ----------
 def summarize(values, all_flag, max_items=2):
+    values = coerce_list(values)
     if all_flag: return "All"
     if not values: return "None"
     vals = [str(v) for v in values]
@@ -163,11 +177,14 @@ def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: st
     sel_key  = f"{key_prefix}_sel"
     ms_key   = f"{key_prefix}_ms"
 
+    # init
     if all_key not in st.session_state: st.session_state[all_key] = True
     if sel_key not in st.session_state: st.session_state[sel_key] = options.copy()
+    if ms_key  not in st.session_state: st.session_state[ms_key]  = st.session_state[sel_key]
 
-    all_flag = st.session_state[all_key]
-    selected = st.session_state[sel_key]
+    # current state
+    all_flag = bool(st.session_state[all_key])
+    selected = coerce_list(st.session_state[sel_key])
     summary  = summarize(selected, all_flag)
 
     ctx = st.popover(f"{label}: {summary}") if hasattr(st, "popover") else st.expander(f"{label}: {summary}", expanded=False)
@@ -177,10 +194,12 @@ def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: st
             chk = st.checkbox("All", value=all_flag, key=all_key)
             if chk:
                 st.session_state[sel_key] = options.copy()
+                st.session_state[ms_key]  = options.copy()
         with colB:
             if not st.session_state[all_key]:
+                # Native multiselect (always returns a list)
                 st.multiselect(
-                    " ", options=options, default=st.session_state[sel_key],
+                    " ", options=options, default=coerce_list(st.session_state.get(ms_key, selected)),
                     key=ms_key, placeholder=f"Type to search {label.lower()}…",
                     label_visibility="collapsed"
                 )
@@ -188,18 +207,19 @@ def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: st
                 with act1:
                     if st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True):
                         st.session_state[sel_key] = options.copy()
+                        st.session_state[ms_key]  = options.copy()
                         st.rerun()
                 with act2:
                     if st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True):
                         st.session_state[sel_key] = []
+                        st.session_state[ms_key]  = []
                         st.rerun()
             else:
                 st.caption("All values selected")
 
-    # Sync back from multiselect
-    if ms_key in st.session_state and not st.session_state[all_key]:
-        st.session_state[sel_key] = st.session_state[ms_key]
-        st.session_state[all_key] = (len(st.session_state[sel_key]) == len(options))
+    # Sync back (always list)
+    st.session_state[sel_key] = coerce_list(st.session_state.get(ms_key, st.session_state[sel_key]))
+    st.session_state[all_key] = (len(st.session_state[sel_key]) == len(options))
 
     return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summarize(st.session_state[sel_key], st.session_state[all_key])}"
 
@@ -209,7 +229,7 @@ def filters_toolbar(name: str, df: pd.DataFrame):
     with c1: pipe_all, pipe_sel, s1 = smart_multiselect("Pipeline", df, "Pipeline", f"{name}_pipe")
     with c2: src_all,  src_sel,  s2 = smart_multiselect("Deal Source", df, "JetLearn Deal Source", f"{name}_src")
     with c3: ctry_all, ctry_sel, s3 = smart_multiselect("Country", df, "Country", f"{name}_ctry")
-    with c4: cslr_all, cslr_sel, s4 = smart_multiselect("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
+    with c4: cslr_all,  cslr_sel, s4 = smart_multiselect("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
     with c5:
         if st.button("Clear", key=f"{name}_clear", use_container_width=True):
             for prefix, col in [(f"{name}_pipe","Pipeline"), (f"{name}_src","JetLearn Deal Source"),
@@ -217,17 +237,23 @@ def filters_toolbar(name: str, df: pd.DataFrame):
                 opts = sorted([v for v in df[col].dropna().astype(str).unique()])
                 st.session_state[f"{prefix}_all"]  = True
                 st.session_state[f"{prefix}_sel"]  = opts
-                st.session_state.pop(f"{prefix}_ms", None)
+                st.session_state[f"{prefix}_ms"]   = opts
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
-    mask = (
-        in_filter(df["Pipeline"], pipe_all, pipe_sel) &
-        in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
-        in_filter(df["Country"], ctry_all, ctry_sel) &
-        in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
-    )
+    # Robust mask construction
+    try:
+        mask = (
+            in_filter(df["Pipeline"], pipe_all,  pipe_sel) &
+            in_filter(df["JetLearn Deal Source"], src_all,   src_sel) &
+            in_filter(df["Country"], ctry_all,  ctry_sel) &
+            in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
+        )
+    except Exception as e:
+        st.error(f"Filter error: {e}")
+        mask = pd.Series(False, index=df.index)
+
     base = df[mask].copy()
     return base, dict(pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
                       ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel)
@@ -235,7 +261,7 @@ def filters_toolbar(name: str, df: pd.DataFrame):
 def ensure_month_cols(base: pd.DataFrame, measures):
     for m in measures:
         col = f"{m}_Month"
-        if col not in base.columns:
+        if m in base.columns and col not in base.columns:
             base[col] = base[m].dt.to_period("M")
     return base
 
@@ -308,37 +334,40 @@ def compute_outputs(meta):
         sub = base[in_cre].copy()
         flags = []
         for m in measures:
+            if m not in sub.columns: continue
             flg = f"__MTD__{m}"
             sub[flg] = ((sub[m].notna()) & (sub[f"{m}_Month"] == sub["Create_Month"])).astype(int)
             flags.append(flg)
             metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub[flg].sum())})
         metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub))})
 
-        if split_dims:
-            sub["_CreateCount"]=1
-            grp = sub.groupby(split_dims, dropna=False)[flags+["_CreateCount"]].sum().reset_index()
-            rename_map = {"_CreateCount":"Create Count in window"}
-            rename_map.update({f"__MTD__{m}":f"MTD: {m}" for m in measures})
-            grp = grp.rename(columns=rename_map).sort_values(by=f"MTD: {measures[0]}", ascending=False)
-            tables[f"MTD split by {', '.join(split_dims)}"] = grp
+        if flags:
+            if split_dims:
+                sub["_CreateCount"]=1
+                grp = sub.groupby(split_dims, dropna=False)[flags+["_CreateCount"]].sum().reset_index()
+                rename_map = {"_CreateCount":"Create Count in window"}
+                rename_map.update({f: f"MTD: {m}" for f,m in zip(flags, measures)})
+                grp = grp.rename(columns=rename_map).sort_values(by=f"MTD: {measures[0]}", ascending=False)
+                tables[f"MTD split by {', '.join(split_dims)}"] = grp
 
-        if show_top_countries and "Country" in sub.columns:
-            g = sub.groupby("Country", dropna=False)[flags].sum().reset_index().rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
-            tables["Top 5 Countries — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
+            if show_top_countries and "Country" in sub.columns:
+                g = sub.groupby("Country", dropna=False)[flags].sum().reset_index().rename(columns={f: f"MTD: {m}" for f,m in zip(flags, measures)})
+                tables["Top 5 Countries — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
 
-        if show_top_sources and "JetLearn Deal Source" in sub.columns:
-            g = sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index().rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
-            tables["Top 3 Deal Sources — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
+            if show_top_sources and "JetLearn Deal Source" in sub.columns:
+                g = sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index().rename(columns={f: f"MTD: {m}" for f,m in zip(flags, measures)})
+                tables["Top 3 Deal Sources — MTD"] = g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
 
-        trend = sub.copy(); trend["Bucket"] = group_label_from_series(trend["Create Date"], mtd_grain)
-        t = trend.groupby("Bucket")[flags].sum().reset_index().rename(columns={f"__MTD__{m}":m for m in measures})
-        long = t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
-        charts["MTD Trend"] = alt_line(long, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
+            trend = sub.copy(); trend["Bucket"] = group_label_from_series(trend["Create Date"], mtd_grain)
+            t = trend.groupby("Bucket")[flags].sum().reset_index().rename(columns={f: m for f,m in zip(flags, measures)})
+            long = t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
+            charts["MTD Trend"] = alt_line(long, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
 
     # --------- Cohort ---------
     if cohort and coh_from and coh_to and len(measures)>0:
         tmp = base.copy(); ch_flags=[]
         for m in measures:
+            if m not in tmp.columns: continue
             flg = f"__COH__{m}"
             tmp[flg] = tmp[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both").astype(int)
             ch_flags.append(flg)
@@ -346,32 +375,33 @@ def compute_outputs(meta):
         in_cre_coh = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
         metrics_rows.append({"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_cre_coh.sum())})
 
-        if split_dims:
-            tmp["_CreateInCohort"] = in_cre_coh.astype(int)
-            grp2 = tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
-            rename_map2 = {"_CreateInCohort":"Create Count in Cohort window"}
-            rename_map2.update({f"__COH__{m}":f"Cohort: {m}" for m in measures})
-            grp2 = grp2.rename(columns=rename_map2).sort_values(by=f"Cohort: {measures[0]}", ascending=False)
-            tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
+        if ch_flags:
+            if split_dims:
+                tmp["_CreateInCohort"] = in_cre_coh.astype(int)
+                grp2 = tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
+                rename_map2 = {"_CreateInCohort":"Create Count in Cohort window"}
+                rename_map2.update({f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
+                grp2 = grp2.rename(columns=rename_map2).sort_values(by=f"Cohort: {measures[0]}", ascending=False)
+                tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
 
-        if show_top_countries and "Country" in base.columns:
-            g = tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index().rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
-            tables["Top 5 Countries — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
+            if show_top_countries and "Country" in base.columns:
+                g = tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
+                tables["Top 5 Countries — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
 
-        if show_top_sources and "JetLearn Deal Source" in base.columns:
-            g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index().rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
-            tables["Top 3 Deal Sources — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
+            if show_top_sources and "JetLearn Deal Source" in base.columns:
+                g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
+                tables["Top 3 Deal Sources — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
 
-        frames=[]
-        for m in measures:
-            mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
-            sel = base.loc[mask, [m]].copy()
-            if sel.empty: continue
-            sel["Bucket"] = group_label_from_series(sel[m], coh_grain)
-            t = sel.groupby("Bucket")[m].count().reset_index(name="Count"); t["Measure"]=m; frames.append(t)
-        if frames:
-            trend = pd.concat(frames, ignore_index=True)
-            charts["Cohort Trend"] = alt_line(trend, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
+            frames=[]
+            for m in measures:
+                mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
+                sel = base.loc[mask, [m]].copy()
+                if sel.empty: continue
+                sel["Bucket"] = group_label_from_series(sel[m], coh_grain)
+                t = sel.groupby("Bucket")[m].count().reset_index(name="Count"); t["Measure"]=m; frames.append(t)
+            if frames:
+                trend = pd.concat(frames, ignore_index=True)
+                charts["Cohort Trend"] = alt_line(trend, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
 
     return metrics_rows, tables, charts
 
@@ -401,10 +431,10 @@ def build_compare_delta(dfA, dfB):
 
 def mk_caption(meta):
     return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}")
+            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
+            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
+            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
+            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 
 # ---------- Panels ----------
 left, right = st.columns(2, gap="large")
@@ -499,12 +529,6 @@ if show_compare:
 
 # ---------- Foot ----------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-def mk_caption(meta):
-    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}")
 st.caption("**Scenario A** — " + mk_caption(metaA))
 st.caption("**Scenario B** — " + mk_caption(metaB))
 st.caption("Excluded globally: 1.2 Invalid Deal")
