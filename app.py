@@ -1,4 +1,4 @@
-# app_compare_smart.py — Minimal, smart, interactive A/B compare (with First Calibration split)
+# app_compare_smart.py — Counts for First Calibration (no date/month split)
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -44,7 +44,7 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum() > 0:
                 df[col] = parsed
                 date_like.append(col)
-    # Prefer 'Payment Received Date' first if present
+    # Prefer Payment Received Date first if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c != "Payment Received Date"]
     return date_like
@@ -80,12 +80,8 @@ def last_7_days_bounds():
     today = pd.Timestamp.today().date()
     return today - timedelta(days=6), today
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
 @st.cache_data(show_spinner=False)
 def load_and_prepare(data_bytes, path_text):
-    # load
     if data_bytes:
         df = robust_read_csv(BytesIO(data_bytes))
     elif path_text:
@@ -94,31 +90,23 @@ def load_and_prepare(data_bytes, path_text):
         raise ValueError("Please upload a CSV or provide a file path.")
     df.columns = [c.strip() for c in df.columns]
 
-    # required columns
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
 
-    # exclude invalid deals
+    # Exclude invalid deals
     df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 
-    # parse core dates
+    # Parse Create Date
     df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
     df["Create_Month"] = df["Create Date"].dt.to_period("M")
 
-    # detect/parse other date columns
+    # Parse other date-like columns
     date_like_cols = detect_measure_date_columns(df)
 
-    # build helper "(Month)" columns for all date-like fields (including Create Date) to allow splitting
-    month_helpers = []
-    for col in ["Create Date"] + date_like_cols:
-        helper = f"{col} (Month)"
-        df[helper] = df[col].dt.to_period("M").astype(str)
-        month_helpers.append(helper)
+    return df, date_like_cols
 
-    return df, date_like_cols, month_helpers
-
-# ---------- UI: Header with Clone buttons ----------
+# ---------- Header with Clone ----------
 with st.container():
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     hc1, hc2 = st.columns([6,4])
@@ -151,8 +139,8 @@ with ds:
     with c2:
         default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
     try:
-        df, date_like_cols, month_helpers = load_and_prepare(uploaded.getvalue() if uploaded else None,
-                                                             default_path if not uploaded else None)
+        df, date_like_cols = load_and_prepare(uploaded.getvalue() if uploaded else None,
+                                              default_path if not uploaded else None)
         st.success("Data loaded", icon="✅")
     except Exception as e:
         st.error(str(e))
@@ -162,7 +150,7 @@ if not date_like_cols:
     st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date').")
     raise SystemExit
 
-# ---------- Filter blocks ----------
+# ---------- UI helpers ----------
 def filter_block(df, label, colname, key_prefix):
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     c1, c2 = st.columns([1,3])
@@ -192,7 +180,7 @@ def date_preset_row(name, base_series, measure_series, key_prefix, is_mtd=True):
         return None, None
     return dt_from, dt_to
 
-def panel_controls(name: str, df: pd.DataFrame, date_like_cols, month_helpers):
+def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
     st.markdown(f"#### Scenario {name} <span class='badge'>independent</span>", unsafe_allow_html=True)
     with st.container():
         # Global filters
@@ -231,18 +219,12 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols, month_helpers):
             st.caption("Measure-Date window")
             coh_from, coh_to = date_preset_row(name, base["Create Date"], base[measure_col], f"{name}_coh", False)
 
-        # Build split options dynamically
-        split_options = ["JetLearn Deal Source", "Country"]
-        # Add First Calibration Scheduled Date (Month) if present
-        fc_month_col = "First Calibration Scheduled Date (Month)"
-        if fc_month_col in month_helpers or fc_month_col in base.columns:
-            split_options.append(fc_month_col)
-
+        # Split options (NO date/month split for First Calibration)
         with st.expander(f"[{name}] Splits & leaderboards", expanded=False):
             bc1, bc2, bc3 = st.columns([3,2,2])
             split_dims = bc1.multiselect(
                 f"[{name}] Split by (pick one or more)",
-                split_options,
+                ["JetLearn Deal Source", "Country"],   # Only categorical splits
                 default=[],
                 key=f"{name}_split"
             )
@@ -321,17 +303,6 @@ def compute_outputs(meta):
             }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = top_src
 
-        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub_mtd.columns):
-            g4 = sub_mtd.copy(); g4["_MTD Count"], g4["_Create Count in window"] = mtd_flag.astype(int), 1
-            both = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({
-                "_Create Count in window":"sum",
-                "_MTD Count":"sum"
-            }).reset_index().rename(columns={
-                "_Create Count in window":"Create Count in window",
-                "_MTD Count":f"MTD Count on '{measure_col}'"
-            }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(10)
-            tables["Top Country × Deal Source — MTD"] = both
-
         # Trend (MTD)
         trend_mtd = sub_mtd.assign(flag=mtd_flag.astype(int)).groupby("Create_Month", dropna=False)["flag"].sum().reset_index()
         trend_mtd = trend_mtd.rename(columns={"Create_Month":"Month","flag":"MTD Count"})
@@ -389,19 +360,6 @@ def compute_outputs(meta):
             }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(3)
             tables["Top 3 Deal Sources — Cohort"] = top_src2
 
-        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
-            g4 = base.copy()
-            g4["_Cohort Count"] = in_measure_window.astype(int)
-            g4["_Create Count in Cohort window"] = in_create_cohort.astype(int)
-            both2 = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({
-                "_Cohort Count":"sum",
-                "_Create Count in Cohort window":"sum"
-            }).reset_index().rename(columns={
-                "_Cohort Count":f"Cohort Count on '{measure_col}'",
-                "_Create Count in Cohort window":"Create Count in Cohort window"
-            }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(10)
-            tables["Top Country × Deal Source — Cohort"] = both2
-
         # Trend (Cohort) — by measure month
         trend_coh = base.loc[in_measure_window].copy()
         trend_coh["Measure_Month"] = trend_coh[measure_col].dt.to_period("M")
@@ -439,12 +397,12 @@ def build_compare_delta(dfA, dfB):
     out["Δ%"] = (out["Δ"] / out["A"].replace(0, pd.NA) * 100).round(1)
     return out
 
-# ---------- Build panels ----------
+# ---------- Panels ----------
 cA, cB = st.columns(2, gap="large")
 with cA:
-    metaA = panel_controls("A", df, date_like_cols, month_helpers)
+    metaA = panel_controls("A", df, date_like_cols)
 with cB:
-    metaB = panel_controls("B", df, date_like_cols, month_helpers)
+    metaB = panel_controls("B", df, date_like_cols)
 
 # ---------- Compute ----------
 with st.spinner("Calculating results..."):
