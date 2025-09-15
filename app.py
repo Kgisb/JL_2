@@ -1,4 +1,4 @@
-# app_compare_pro_clean.py — Blue, minimal A/B analyzer (granularity for Custom ranges)
+# app_compare_pro_clean.py — Blue, minimal A/B analyzer (granularity for Custom ranges) — FIXED rename bug
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -115,25 +115,24 @@ def date_range_from_preset(label, series: pd.Series, key_prefix: str):
     """Returns (from, to, preset, granularity). granularity in {'Month','Week','Day'}"""
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
     choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
-    grain = "Month"  # default grain for non-custom
     if choice == "Today":
-        return (*today_bounds(), choice, "Day")
+        f, t = today_bounds(); return f, t, choice, "Day"
     if choice == "This month so far":
-        return (*this_month_so_far_bounds(), choice, "Day")
+        f, t = this_month_so_far_bounds(); return f, t, choice, "Day"
     if choice == "Last month":
-        return (*last_month_bounds(), choice, "Month")
+        f, t = last_month_bounds(); return f, t, choice, "Month"
     if choice == "Last quarter":
-        return (*last_quarter_bounds(), choice, "Month")
+        f, t = last_quarter_bounds(); return f, t, choice, "Month"
     if choice == "This year":
-        return (*this_year_so_far_bounds(), choice, "Month")
+        f, t = this_year_so_far_bounds(); return f, t, choice, "Month"
     # Custom
     dmin, dmax = safe_minmax_date(series)
     rng = st.date_input("Custom range", (dmin, dmax), key=f"{key_prefix}_custom")
     grain = st.radio("Granularity", ["Day-wise","Week-wise","Month-wise"], horizontal=True, key=f"{key_prefix}_grain")
     grain = {"Day-wise":"Day","Week-wise":"Week","Month-wise":"Month"}[grain]
     if isinstance(rng, (tuple, list)) and len(rng) == 2:
-        return (rng[0], rng[1], choice, grain)
-    return (dmin, dmax, choice, grain)
+        return rng[0], rng[1], choice, grain
+    return dmin, dmax, choice, grain
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -313,12 +312,10 @@ def group_label_from_series(s: pd.Series, grain: str, is_create=False):
     if grain == "Day":
         return pd.to_datetime(s).dt.date.astype(str)
     if grain == "Week":
-        # ISO week as YYYY-Www
         iso = pd.to_datetime(s).dt.isocalendar()
         return (iso['year'].astype(str) + "-W" + iso['week'].astype(str).str.zfill(2))
     # Month default
-    per = pd.to_datetime(s).dt.to_period("M").astype(str)
-    return per
+    return pd.to_datetime(s).dt.to_period("M").astype(str)
 
 def compute_outputs(meta):
     base = meta["base"]; measures = meta["measures"]
@@ -368,13 +365,14 @@ def compute_outputs(meta):
             g3 = g3.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = g3
 
-        # Trend with custom granularity
+        # Trend with custom granularity (FIXED rename mapping)
         x_label = group_label_from_series(sub_mtd["Create Date"], mtd_grain)
         trend = sub_mtd.copy()
         trend["__X__"] = x_label
-        sum_cols = {flag:"sum" for flag in mtd_flag_cols}
         trend = trend.groupby("__X__")[mtd_flag_cols].sum().reset_index()
-        trend = trend.rename(columns={f"__MTD__{m}": m for m in measures, "__X__":"Bucket"})
+        rename_map_trend = {f"__MTD__{m}": m for m in measures}
+        rename_map_trend["__X__"] = "Bucket"
+        trend = trend.rename(columns=rename_map_trend)
         long = trend.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
         charts["MTD Trend"] = alt_line(long, "Bucket:O", "Count:Q", color="Measure:N",
                                        tooltip=["Bucket","Measure","Count"])
@@ -575,15 +573,6 @@ if show_compare:
         st.info("Turn on KPIs for both scenarios to enable compare.")
 
 # ------------------------ Foot captions ------------------------
-def mk_caption(meta):
-    return (
-        f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
-        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
-        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
-        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
-    )
-
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 st.caption("**Scenario A** — " + mk_caption(metaA))
 st.caption("**Scenario B** — " + mk_caption(metaB))
