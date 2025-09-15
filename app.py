@@ -1,6 +1,6 @@
-# app_compare_pro_minimal_search_v3_fixed.py
+# app_compare_pro_minimal_search_v3_fixed2.py
 # Minimal A/B analyzer with streamlined "All → type to filter" multiselect UX
-# FIX: robust single-value handling in global filters
+# FIX: don't programmatically set widget state during render (prevents StreamlitAPIException)
 
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,6 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
-.compact-label .stSelectbox label, .compact-label .stMultiSelect label { display:none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -53,23 +52,15 @@ def detect_measure_date_columns(df: pd.DataFrame):
     return date_like
 
 def coerce_list(x):
-    """Always return a list (handles None / scalar / tuples/sets)."""
     if x is None: return []
     if isinstance(x, (list, tuple, set)): return list(x)
     return [x]
 
 def in_filter(series: pd.Series, all_checked: bool, selected_values):
-    """Robust: works even when a single value is selected."""
-    if all_checked:
-        return pd.Series(True, index=series.index)
-    sel = coerce_list(selected_values)
-    if len(sel) == 0:
-        return pd.Series(False, index=series.index)
-    # If the user effectively selected all distinct values, treat as All
-    uniq = series.dropna().astype(str).unique().tolist()
-    if set(map(str, sel)) >= set(map(str, uniq)):
-        return pd.Series(True, index=series.index)
-    return series.astype(str).isin(list(map(str, sel)))
+    if all_checked: return pd.Series(True, index=series.index)
+    sel = [str(v) for v in coerce_list(selected_values)]
+    if len(sel) == 0: return pd.Series(False, index=series.index)
+    return series.astype(str).isin(sel)
 
 def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     if s.isna().all(): return fallback
@@ -168,21 +159,17 @@ def summarize(values, all_flag, max_items=2):
     return ", ".join(vals[:max_items]) + (f" +{len(vals)-max_items} more" if len(vals)>max_items else "")
 
 def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
-    """
-    UX: When 'All' is unticked, show ONE native multiselect (built-in type-ahead).
-    Type letters → list filters → click the name. Clean & fast.
-    """
+    """When 'All' is unticked, show ONE native multiselect with type-ahead."""
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     all_key  = f"{key_prefix}_all"
     sel_key  = f"{key_prefix}_sel"
     ms_key   = f"{key_prefix}_ms"
 
-    # init
+    # Init (don't mutate later except via user/UI actions)
     if all_key not in st.session_state: st.session_state[all_key] = True
     if sel_key not in st.session_state: st.session_state[sel_key] = options.copy()
     if ms_key  not in st.session_state: st.session_state[ms_key]  = st.session_state[sel_key]
 
-    # current state
     all_flag = bool(st.session_state[all_key])
     selected = coerce_list(st.session_state[sel_key])
     summary  = summarize(selected, all_flag)
@@ -191,13 +178,14 @@ def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: st
     with ctx:
         colA, colB = st.columns([1,3])
         with colA:
-            chk = st.checkbox("All", value=all_flag, key=all_key)
-            if chk:
+            # User controls 'All'
+            st.checkbox("All", value=all_flag, key=all_key)
+            # If user just turned All ON, mirror to selections for UX
+            if st.session_state[all_key] and len(st.session_state[sel_key]) != len(options):
                 st.session_state[sel_key] = options.copy()
                 st.session_state[ms_key]  = options.copy()
         with colB:
             if not st.session_state[all_key]:
-                # Native multiselect (always returns a list)
                 st.multiselect(
                     " ", options=options, default=coerce_list(st.session_state.get(ms_key, selected)),
                     key=ms_key, placeholder=f"Type to search {label.lower()}…",
@@ -217,9 +205,13 @@ def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: st
             else:
                 st.caption("All values selected")
 
-    # Sync back (always list)
-    st.session_state[sel_key] = coerce_list(st.session_state.get(ms_key, st.session_state[sel_key]))
-    st.session_state[all_key] = (len(st.session_state[sel_key]) == len(options))
+    # Sync back from multiselect (do NOT auto-toggle the checkbox here)
+    if not st.session_state[all_key]:
+        st.session_state[sel_key] = coerce_list(st.session_state.get(ms_key, st.session_state[sel_key]))
+    # When All is on, keep sel list as full options for clarity, but don't flip the checkbox.
+    else:
+        st.session_state[sel_key] = options.copy()
+        st.session_state[ms_key]  = options.copy()
 
     return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summarize(st.session_state[sel_key], st.session_state[all_key])}"
 
@@ -235,25 +227,19 @@ def filters_toolbar(name: str, df: pd.DataFrame):
             for prefix, col in [(f"{name}_pipe","Pipeline"), (f"{name}_src","JetLearn Deal Source"),
                                 (f"{name}_ctry","Country"), (f"{name}_cslr","Student/Academic Counsellor")]:
                 opts = sorted([v for v in df[col].dropna().astype(str).unique()])
-                st.session_state[f"{prefix}_all"]  = True
-                st.session_state[f"{prefix}_sel"]  = opts
-                st.session_state[f"{prefix}_ms"]   = opts
+                st.session_state[f"{prefix}_all"] = True
+                st.session_state[f"{prefix}_sel"] = opts
+                st.session_state[f"{prefix}_ms"]  = opts
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
-    # Robust mask construction
-    try:
-        mask = (
-            in_filter(df["Pipeline"], pipe_all,  pipe_sel) &
-            in_filter(df["JetLearn Deal Source"], src_all,   src_sel) &
-            in_filter(df["Country"], ctry_all,  ctry_sel) &
-            in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
-        )
-    except Exception as e:
-        st.error(f"Filter error: {e}")
-        mask = pd.Series(False, index=df.index)
-
+    mask = (
+        in_filter(df["Pipeline"], pipe_all,  pipe_sel) &
+        in_filter(df["JetLearn Deal Source"], src_all,   src_sel) &
+        in_filter(df["Country"], ctry_all,  ctry_sel) &
+        in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
+    )
     base = df[mask].copy()
     return base, dict(pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
                       ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel)
@@ -529,6 +515,12 @@ if show_compare:
 
 # ---------- Foot ----------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+def mk_caption(meta):
+    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
+            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
+            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
+            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 st.caption("**Scenario A** — " + mk_caption(metaA))
 st.caption("**Scenario B** — " + mk_caption(metaB))
 st.caption("Excluded globally: 1.2 Invalid Deal")
