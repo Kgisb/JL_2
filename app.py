@@ -1,12 +1,13 @@
-# app_compare_pro.py — Blue, minimal, mobile-friendly A/B analyzer with date presets & hamburger menu
+# app_compare_pro_compact.py — Blue, minimal A/B analyzer with COMPACT global filters (popover/expander) + selection summary
 import streamlit as st
 import pandas as pd
 import altair as alt
 from io import BytesIO
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 # ------------------------ Page & Theme ------------------------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Pro)", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Pro, Compact Filters)",
+                   layout="wide", page_icon="📊")
 
 st.markdown("""
 <style>
@@ -18,14 +19,13 @@ st.markdown("""
 html, body, [class*="css"] {
   font-family: ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
 }
-
-.block-container { padding-top: 0.4rem; padding-bottom: 1rem; }
+.block-container { padding-top: .4rem; padding-bottom: .8rem; }
 
 /* Top bar */
 .nav {
   position: sticky; top: 0; z-index: 20; padding: 8px 12px;
   background: linear-gradient(90deg, var(--blue-700), var(--blue-600));
-  color: #fff; border-radius: 12px; margin-bottom: 12px;
+  color: #fff; border-radius: 12px; margin-bottom: 10px;
 }
 .nav .title { font-weight: 800; letter-spacing:.2px; }
 .nav .sub   { font-size:.85rem; opacity:.9; margin-top:2px; }
@@ -35,27 +35,22 @@ html, body, [class*="css"] {
 }
 .nav .btn:hover { background: rgba(255,255,255,.08); }
 
-/* Card + sections */
-.card { border:1px solid var(--border); background:var(--card); border-radius:14px; padding:12px 14px; }
-.section-title { display:flex; align-items:center; gap:.5rem; font-weight:800; margin:.25rem 0 .6rem 0; }
-.badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); color:#0f172a; background:#f8fafc; }
-hr.soft { border:0; height:1px; background:var(--border); margin: .6rem 0 1rem; }
+/* Compact filters bar */
+.filters-bar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 12px;
+  background: #f8fafc;
+}
 
-/* KPI */
+/* Sections & cards */
+.section-title { display:flex; align-items:center; gap:.5rem; font-weight:800; margin:.25rem 0 .6rem; }
+.badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
+hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .kpi { padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--card); }
 .kpi .label { color:var(--muted); font-size:.78rem; margin-bottom:4px; }
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
 
-/* Hamburger */
-.menu-pill {
-  display:inline-flex; align-items:center; gap:.5rem; padding:6px 10px; border-radius:999px;
-  background: rgba(255,255,255,.15); border:1px solid rgba(255,255,255,.35);
-  color:#fff; font-weight:600; cursor:pointer;
-}
-.menu-pill:hover { background: rgba(255,255,255,.22); }
-
-/* Mobile tweaks */
 @media (max-width: 820px) {
   .block-container { padding-left:.5rem; padding-right:.5rem; }
 }
@@ -69,7 +64,7 @@ REQUIRED_COLS = [
 ]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
 
-# ------------------------ Utilities ------------------------
+# ------------------------ Utils ------------------------
 def robust_read_csv(file_or_path):
     for enc in ["utf-8","utf-8-sig","cp1252","latin1"]:
         try:
@@ -79,7 +74,6 @@ def robust_read_csv(file_or_path):
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
 def detect_measure_date_columns(df: pd.DataFrame):
-    """Return list of date-like columns excluding 'Create Date'; parse to datetime."""
     date_like = []
     for col in df.columns:
         if col == "Create Date":
@@ -108,174 +102,153 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
         return fallback
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
-# ----- Date preset helpers -----
+# Date presets
 def today_bounds():
-    t = pd.Timestamp.today().date()
-    return t, t
-
+    t = pd.Timestamp.today().date(); return t, t
 def this_month_so_far_bounds():
-    t = pd.Timestamp.today().date()
-    start = t.replace(day=1)
-    return start, t
-
+    t = pd.Timestamp.today().date(); return t.replace(day=1), t
 def last_month_bounds():
     first_this = pd.Timestamp.today().date().replace(day=1)
     last_prev = first_this - timedelta(days=1)
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
-
-def quarter_start(y, q):
-    return date(y, 3*(q-1)+1, 1)
-
+def quarter_start(y, q): return date(y, 3*(q-1)+1, 1)
 def last_quarter_bounds():
-    t = pd.Timestamp.today().date()
-    q = (t.month - 1)//3 + 1
-    if q == 1:
-        y, lq = t.year - 1, 4
-    else:
-        y, lq = t.year, q - 1
+    t = pd.Timestamp.today().date(); q = (t.month - 1)//3 + 1
+    if q == 1: y, lq = t.year - 1, 4
+    else:      y, lq = t.year, q - 1
     start = quarter_start(y, lq)
-    if lq == 4:
-        next_start = quarter_start(y+1, 1)
-    else:
-        next_start = quarter_start(y, lq+1)
-    end = next_start - timedelta(days=1)
-    return start, end
-
+    next_start = quarter_start(y+1, 1) if lq == 4 else quarter_start(y, lq+1)
+    return start, (next_start - timedelta(days=1))
 def this_year_so_far_bounds():
-    t = pd.Timestamp.today().date()
-    return date(t.year, 1, 1), t
+    t = pd.Timestamp.today().date(); return date(t.year,1,1), t
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
-    """UI: radio for presets; for Custom shows a range picker."""
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
     choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
-    if choice == "Today":
-        return today_bounds()
-    elif choice == "This month so far":
-        return this_month_so_far_bounds()
-    elif choice == "Last month":
-        return last_month_bounds()
-    elif choice == "Last quarter":
-        return last_quarter_bounds()
-    elif choice == "This year":
-        return this_year_so_far_bounds()
-    else:
-        dmin, dmax = safe_minmax_date(series)
-        rng = st.date_input("Custom range", (dmin, dmax), key=f"{key_prefix}_custom")
-        if isinstance(rng, (tuple, list)) and len(rng) == 2:
-            return rng[0], rng[1]
-        return dmin, dmax
+    if choice == "Today": return today_bounds()
+    if choice == "This month so far": return this_month_so_far_bounds()
+    if choice == "Last month": return last_month_bounds()
+    if choice == "Last quarter": return last_quarter_bounds()
+    if choice == "This year": return this_year_so_far_bounds()
+    dmin, dmax = safe_minmax_date(series)
+    rng = st.date_input("Custom range", (dmin, dmax), key=f"{key_prefix}_custom")
+    if isinstance(rng, (tuple, list)) and len(rng) == 2:
+        return rng[0], rng[1]
+    return dmin, dmax
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 def alt_line(df, x, y, color=None, tooltip=None, height=260):
-    enc = dict(
-        x=alt.X(x, title=None),
-        y=alt.Y(y, title=None),
-        tooltip=tooltip or []
-    )
-    if color:
-        enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
-    ch = alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
-    return ch
+    enc = dict(x=alt.X(x, title=None), y=alt.Y(y, title=None), tooltip=tooltip or [])
+    if color: enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
+    return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
 
-# ------------------------ Top Nav (Hamburger + actions) ------------------------
+# ------------------------ Top Nav ------------------------
 with st.container():
     st.markdown('<div class="nav">', unsafe_allow_html=True)
     c1, c2 = st.columns([6,6])
     with c1:
-        colm1, colm2 = st.columns([1,11])
-        with colm1:
-            st.markdown('<span class="menu-pill">☰</span>', unsafe_allow_html=True)
-        with colm2:
-            st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Pro)</div>', unsafe_allow_html=True)
-            st.markdown('<div class="sub">Blue, minimal, mobile-friendly • multi-measure • date presets • smart compare</div>', unsafe_allow_html=True)
+        left1, left2 = st.columns([1,11])
+        with left1: st.markdown('<span class="menu-pill">☰</span>', unsafe_allow_html=True)
+        with left2:
+            st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Pro, Compact Filters)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="sub">Blue, minimal UI • multi-measure • date presets • smart compare</div>', unsafe_allow_html=True)
     with c2:
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("Clone A → B", key="clone_ab", help="Copy Scenario A controls to B"):
+            if st.button("Clone A → B", key="clone_ab"):
                 for k in list(st.session_state.keys()):
                     if str(k).startswith("A_"):
                         st.session_state[str(k).replace("A_","B_",1)] = st.session_state[k]
                 st.rerun()
         with b2:
-            if st.button("Clone B → A", key="clone_ba", help="Copy Scenario B controls to A"):
+            if st.button("Clone B → A", key="clone_ba"):
                 for k in list(st.session_state.keys()):
                     if str(k).startswith("B_"):
                         st.session_state[str(k).replace("B_","A_",1)] = st.session_state[k]
                 st.rerun()
         with b3:
-            if st.button("Reset", key="reset_all", help="Clear all controls"):
-                st.session_state.clear()
-                st.rerun()
+            if st.button("Reset", key="reset_all"):
+                st.session_state.clear(); st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
-
-with st.expander("☰ Menu", expanded=False):
-    st.markdown(
-        "- **Upload/Path** your CSV\n"
-        "- Pick **Measures** (you can select multiple date fields)\n"
-        "- Choose **Mode**: MTD / Cohort / Both\n"
-        "- Apply **Date Presets** (Today, This month so far, Last month, Last quarter, This year, Custom)\n"
-        "- Toggle **Results** sections to reveal KPIs / Splits / Trends / Compare\n"
-        "- Use **Clone** buttons to mirror A/B scenarios\n",
-    )
 
 # ------------------------ Data source ------------------------
 with st.expander("📦 Data source", expanded=True):
     col_u, col_p = st.columns([3,2])
-    with col_u:
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    with col_p:
-        default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
-    if uploaded:
-        df = robust_read_csv(BytesIO(uploaded.getvalue()))
-    else:
-        df = robust_read_csv(default_path)
+    with col_u: uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    with col_p: default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
+    if uploaded: df = robust_read_csv(BytesIO(uploaded.getvalue()))
+    else:        df = robust_read_csv(default_path)
 
 df.columns = [c.strip() for c in df.columns]
 missing = [c for c in REQUIRED_COLS if c not in df.columns]
 if missing:
-    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
-    st.stop()
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}"); st.stop()
 
-# Exclude invalid deals, parse dates
+# Exclude invalid deals, parse
 df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
 df["Create_Month"] = df["Create Date"].dt.to_period("M")
 date_like_cols = detect_measure_date_columns(df)
 if not date_like_cols:
-    st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date').")
-    st.stop()
+    st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
 
-# ------------------------ UI helpers ------------------------
-def filter_block(df, label, colname, key_prefix):
+# ------------------------ Compact Global Filters (Popover/Expander) ------------------------
+def summarize_values(values, all_flag, max_items=3):
+    if all_flag: return "All"
+    if not values: return "None"
+    vals = [str(v) for v in values]
+    if len(vals) <= max_items: return ", ".join(vals)
+    return ", ".join(vals[:max_items]) + f" +{len(vals) - max_items} more"
+
+def filter_pop(label, df, colname, key_prefix):
+    """Compact control: a button label shows summary; clicking reveals multiselect in a popover (or expander)."""
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
-    with st.container():
-        c1, c2 = st.columns([1,3])
-        all_flag = c1.toggle("All", value=True, key=f"{key_prefix}_all")
-        selected = c2.multiselect(label, options, default=options, disabled=all_flag, key=f"{key_prefix}_sel")
-    return all_flag, selected
+    total = len(options)
+    # Read current state from session (or defaults)
+    all_key, sel_key = f"{key_prefix}_all", f"{key_prefix}_sel"
+    if all_key not in st.session_state: st.session_state[all_key] = True
+    if sel_key not in st.session_state: st.session_state[sel_key] = options
 
-def ensure_month_cols(base: pd.DataFrame, measures):
-    for m in measures:
-        col = f"{m}_Month"
-        if col not in base.columns:
-            base[col] = base[m].dt.to_period("M")
-    return base
+    all_flag = st.session_state[all_key]
+    cur_selected = st.session_state[sel_key]
+    summary = summarize_values(cur_selected, all_flag)
 
-def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
-    st.markdown(f"<div class='section-title'>Scenario {name} <span class='badge'>independent</span></div>", unsafe_allow_html=True)
-    with st.container():
-        with st.expander(f"[{name}] Global filters", expanded=True):
-            g1, g2 = st.columns(2)
-            with g1:
-                pipe_all, pipe_sel = filter_block(df, "Pipeline", "Pipeline", f"{name}_pipe")
-                src_all,  src_sel  = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
-            with g2:
-                ctry_all, ctry_sel = filter_block(df, "Country", "Country", f"{name}_ctry")
-                cslr_all, cslr_sel = filter_block(df, "Counsellor", "Student/Academic Counsellor", f"{name}_cslr")
+    # Use native popover if available; otherwise fallback to collapsed expander
+    if hasattr(st, "popover"):
+        with st.popover(f"{label}: {summary}"):
+            st.checkbox("All", value=all_flag, key=all_key)
+            st.multiselect(f"Select {label}", options, default=options,
+                           disabled=st.session_state[all_key], key=sel_key)
+    else:
+        with st.expander(f"{label}: {summary}", expanded=False):
+            st.checkbox("All", value=all_flag, key=all_key)
+            st.multiselect(f"Select {label}", options, default=options,
+                           disabled=st.session_state[all_key], key=sel_key)
+
+    # Return current values after possible change
+    return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summary}"
+
+def filters_toolbar(name, df):
+    st.markdown("<div class='filters-bar'>", unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns([2,2,2,2,1])
+    with c1: pipe_all, pipe_sel, s1 = filter_pop("Pipeline", df, "Pipeline", f"{name}_pipe")
+    with c2: src_all,  src_sel,  s2 = filter_pop("Deal Source", df, "JetLearn Deal Source", f"{name}_src")
+    with c3: ctry_all, ctry_sel, s3 = filter_pop("Country", df, "Country", f"{name}_ctry")
+    with c4: cslr_all, cslr_sel, s4 = filter_pop("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
+    with c5:
+        if st.button("Clear", key=f"{name}_clear"):
+            for prefix, col in [(f"{name}_pipe","Pipeline"), (f"{name}_src","JetLearn Deal Source"),
+                                (f"{name}_ctry","Country"), (f"{name}_cslr","Student/Academic Counsellor")]:
+                st.session_state[f"{prefix}_all"] = True
+                st.session_state[f"{prefix}_sel"] = sorted([v for v in df[col].dropna().astype(str).unique()])
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # One-line human summary (exact values, truncated neatly)
+    st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
     mask_cat = (
         in_filter(df["Pipeline"], pipe_all, pipe_sel) &
@@ -284,8 +257,24 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
         in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
     )
     base = df[mask_cat].copy()
+    return base, dict(pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
+                      ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel)
 
-    st.markdown("###### Measures & windows")
+def ensure_month_cols(base: pd.DataFrame, measures):
+    for m in measures:
+        col = f"{m}_Month"
+        if col not in base.columns:
+            base[col] = base[m].dt.to_period("M")
+    return base
+
+# ------------------------ Panel Controls ------------------------
+def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
+    st.markdown(f"<div class='section-title'>Scenario {name} <span class='badge'>independent</span></div>", unsafe_allow_html=True)
+
+    # SUPER COMPACT Global Filters (not expanded; popover/expander on click)
+    base, gstate = filters_toolbar(name, df)
+
+    # Measures & windows row
     mrow1 = st.columns([4,2,2])
     measures = mrow1[0].multiselect(f"[{name}] Measure date(s)", options=date_like_cols,
                                     default=[date_like_cols[0]] if date_like_cols else [],
@@ -301,7 +290,7 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
         measures = []
     base = ensure_month_cols(base, measures)
 
-    # Date presets
+    # Date presets (Create-Date for MTD; Measure-Date for Cohort)
     mtd_from = mtd_to = coh_from = coh_to = None
     c1, c2 = st.columns(2)
     if mtd:
@@ -314,7 +303,7 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
             first_series = base[measures[0]] if measures else base["Create Date"]
             coh_from, coh_to = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
 
-    # Splits & leaderboards
+    # Splits & leaderboards (optional; compact by default)
     with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
         srow = st.columns([3,2,2])
         split_dims = srow[0].multiselect(f"[{name}] Split by", ["JetLearn Deal Source", "Country"], default=[], key=f"{name}_split")
@@ -327,12 +316,10 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
         mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
         split_dims=split_dims, show_top_countries=show_top_countries,
         show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
-        pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
-        ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel,
-        compact=compact
+        compact=compact, **gstate
     )
 
-# ------------------------ Compute ------------------------
+# ------------------------ Engine ------------------------
 def compute_outputs(meta):
     base = meta["base"]; measures = meta["measures"]
     mtd = meta["mtd"]; cohort = meta["cohort"]
@@ -434,9 +421,7 @@ def compute_outputs(meta):
     return metrics_rows, tables, charts
 
 def kpi_grid(dfk, label_prefix=""):
-    if dfk.empty:
-        st.info("No KPIs yet.")
-        return
+    if dfk.empty: st.info("No KPIs yet."); return
     cols = st.columns(4)
     for i, row in dfk.iterrows():
         with cols[i % 4]:
@@ -449,30 +434,20 @@ def kpi_grid(dfk, label_prefix=""):
 """, unsafe_allow_html=True)
 
 def build_compare_delta(dfA, dfB):
-    """
-    Safely compare KPI rows between Scenario A and B.
-    Ensures numeric dtypes and guards against divide-by-zero.
-    """
-    if dfA.empty or dfB.empty:
-        return pd.DataFrame()
-
-    key = ["Scope", "Metric"]
-
-    a = dfA[key + ["Value"]].copy().rename(columns={"Value": "A"})
-    b = dfB[key + ["Value"]].copy().rename(columns={"Value": "B"})
+    if dfA.empty or dfB.empty: return pd.DataFrame()
+    key = ["Scope","Metric"]
+    a = dfA[key + ["Value"]].copy().rename(columns={"Value":"A"})
+    b = dfB[key + ["Value"]].copy().rename(columns={"Value":"B"})
     a["A"] = pd.to_numeric(a["A"], errors="coerce")
     b["B"] = pd.to_numeric(b["B"], errors="coerce")
-
     out = pd.merge(a, b, on=key, how="inner")
     out["A"] = pd.to_numeric(out["A"], errors="coerce")
     out["B"] = pd.to_numeric(out["B"], errors="coerce")
     out["Δ"] = pd.to_numeric(out["B"] - out["A"], errors="coerce")
-
     denom = out["A"].astype("float")
     zero_or_nan = denom.isna() | (denom == 0)
     denom = denom.where(~zero_or_nan)
     out["Δ%"] = ((out["Δ"].astype("float") / denom) * 100).round(1)
-
     return out
 
 def mk_caption(meta):
@@ -511,20 +486,17 @@ if show_kpis:
     kc1, kc2 = st.columns(2)
     with kc1:
         st.markdown("**Scenario A**")
-        dfA = pd.DataFrame(metricsA)
-        kpi_grid(dfA, "A · ")
+        dfA = pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
     with kc2:
         st.markdown("**Scenario B**")
-        dfB = pd.DataFrame(metricsB)
-        kpi_grid(dfB, "B · ")
+        dfB = pd.DataFrame(metricsB); kpi_grid(dfB, "B · ")
 
 # ------------------------ Splits & Leaderboards ------------------------
 if show_splits:
     st.markdown("### 🧩 Splits & Leaderboards")
     tabA, tabB = st.tabs(["Scenario A", "Scenario B"])
     with tabA:
-        if not tablesA:
-            st.info("No tables — enable splits/leaderboards in Scenario A.")
+        if not tablesA: st.info("No tables — enable splits/leaderboards in Scenario A.")
         else:
             for name, frame in tablesA.items():
                 st.subheader("A · " + name)
@@ -532,8 +504,7 @@ if show_splits:
                 st.download_button("Download CSV (A · " + name + ")", to_csv_bytes(frame),
                                    file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
     with tabB:
-        if not tablesB:
-            st.info("No tables — enable splits/leaderboards in Scenario B.")
+        if not tablesB: st.info("No tables — enable splits/leaderboards in Scenario B.")
         else:
             for name, frame in tablesB.items():
                 st.subheader("B · " + name)
@@ -550,15 +521,13 @@ if show_trends:
             st.markdown("**Scenario A**")
             if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
             if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
-        else:
-            st.info("Enable MTD/Cohort in A and set ranges.")
+        else: st.info("Enable MTD/Cohort in A and set ranges.")
     with t2:
         if "MTD Trend" in chartsB or "Cohort Trend" in chartsB:
             st.markdown("**Scenario B**")
             if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
             if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
-        else:
-            st.info("Enable MTD/Cohort in B and set ranges.")
+        else: st.info("Enable MTD/Cohort in B and set ranges.")
 
 # ------------------------ Smart Compare ------------------------
 if show_compare:
@@ -571,7 +540,6 @@ if show_compare:
         else:
             st.dataframe(cmp, use_container_width=True)
             try:
-                # Small-multiples if same measure sets
                 if set(metaA["measures"]) == set(metaB["measures"]):
                     sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
                     if not sub.empty:
@@ -593,7 +561,7 @@ if show_compare:
         st.info("Turn on KPIs for both scenarios to enable compare.")
 
 # ------------------------ Foot captions ------------------------
-def mk_caption(meta):
+def _mkcap(meta):
     return (
         f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
         f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
@@ -601,8 +569,7 @@ def mk_caption(meta):
         f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
         f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
     )
-
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption("**Scenario A** — " + mk_caption(metaA))
-st.caption("**Scenario B** — " + mk_caption(metaB))
+st.caption("**Scenario A** — " + _mkcap(metaA))
+st.caption("**Scenario B** — " + _mkcap(metaB))
 st.caption("Excluded globally: 1.2 Invalid Deal")
