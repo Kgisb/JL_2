@@ -1,4 +1,4 @@
-# app_compare_pro_clean.py — Blue, minimal A/B analyzer (no "compact mode"), popover filters + summaries
+# app_compare_pro_clean.py — Blue, minimal A/B analyzer (granularity for Custom ranges)
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -20,8 +20,6 @@ html, body, [class*="css"] {
   font-family: ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
 }
 .block-container { padding-top: .4rem; padding-bottom: .8rem; }
-
-/* Top bar */
 .nav {
   position: sticky; top: 0; z-index: 20; padding: 8px 12px;
   background: linear-gradient(90deg, var(--blue-700), var(--blue-600));
@@ -29,15 +27,11 @@ html, body, [class*="css"] {
 }
 .nav .title { font-weight: 800; letter-spacing:.2px; }
 .nav .sub   { font-size:.85rem; opacity:.9; margin-top:2px; }
-
-/* Compact filters bar */
 .filters-bar {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   padding: 6px 8px; border: 1px solid var(--border); border-radius: 12px;
   background: #f8fafc;
 }
-
-/* Sections & cards */
 .section-title { display:flex; align-items:center; gap:.5rem; font-weight:800; margin:.25rem 0 .6rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
@@ -45,7 +39,6 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .kpi .label { color:var(--muted); font-size:.78rem; margin-bottom:4px; }
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
-
 @media (max-width: 820px) {
   .block-container { padding-left:.5rem; padding-right:.5rem; }
 }
@@ -97,7 +90,7 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
         return fallback
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
-# Date presets
+# Date presets + granularity for Custom
 def today_bounds():
     t = pd.Timestamp.today().date(); return t, t
 def this_month_so_far_bounds():
@@ -119,18 +112,28 @@ def this_year_so_far_bounds():
     t = pd.Timestamp.today().date(); return date(t.year,1,1), t
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
+    """Returns (from, to, preset, granularity). granularity in {'Month','Week','Day'}"""
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
     choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
-    if choice == "Today": return today_bounds()
-    if choice == "This month so far": return this_month_so_far_bounds()
-    if choice == "Last month": return last_month_bounds()
-    if choice == "Last quarter": return last_quarter_bounds()
-    if choice == "This year": return this_year_so_far_bounds()
+    grain = "Month"  # default grain for non-custom
+    if choice == "Today":
+        return (*today_bounds(), choice, "Day")
+    if choice == "This month so far":
+        return (*this_month_so_far_bounds(), choice, "Day")
+    if choice == "Last month":
+        return (*last_month_bounds(), choice, "Month")
+    if choice == "Last quarter":
+        return (*last_quarter_bounds(), choice, "Month")
+    if choice == "This year":
+        return (*this_year_so_far_bounds(), choice, "Month")
+    # Custom
     dmin, dmax = safe_minmax_date(series)
     rng = st.date_input("Custom range", (dmin, dmax), key=f"{key_prefix}_custom")
+    grain = st.radio("Granularity", ["Day-wise","Week-wise","Month-wise"], horizontal=True, key=f"{key_prefix}_grain")
+    grain = {"Day-wise":"Day","Week-wise":"Week","Month-wise":"Month"}[grain]
     if isinstance(rng, (tuple, list)) and len(rng) == 2:
-        return rng[0], rng[1]
-    return dmin, dmax
+        return (rng[0], rng[1], choice, grain)
+    return (dmin, dmax, choice, grain)
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -232,7 +235,6 @@ def filters_toolbar(name, df):
                 st.session_state[f"{prefix}_sel"] = sorted([v for v in df[col].dropna().astype(str).unique()])
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
-
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
     mask_cat = (
@@ -264,7 +266,6 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
                                     default=[date_like_cols[0]] if date_like_cols else [],
                                     key=f"{name}_measures")
     window_mode = mrow1[1].radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
-    # no compact mode here
 
     mtd = window_mode in ("MTD","Both")
     cohort = window_mode in ("Cohort","Both")
@@ -276,16 +277,18 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
 
     # Date presets (Create-Date for MTD; Measure-Date for Cohort)
     mtd_from = mtd_to = coh_from = coh_to = None
+    mtd_preset = coh_preset = None
+    mtd_grain = coh_grain = "Month"
     c1, c2 = st.columns(2)
     if mtd:
         with c1:
             st.caption("Create-Date window (MTD)")
-            mtd_from, mtd_to = date_range_from_preset(f"[{name}] MTD Range", base["Create Date"], f"{name}_mtd")
+            mtd_from, mtd_to, mtd_preset, mtd_grain = date_range_from_preset(f"[{name}] MTD Range", base["Create Date"], f"{name}_mtd")
     if cohort:
         with c2:
             st.caption("Measure-Date window (Cohort)")
             first_series = base[measures[0]] if measures else base["Create Date"]
-            coh_from, coh_to = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
+            coh_from, coh_to, coh_preset, coh_grain = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
 
     # Splits & leaderboards (optional)
     with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
@@ -298,17 +301,31 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
     return dict(
         name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
         mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
+        mtd_preset=mtd_preset, coh_preset=coh_preset, mtd_grain=mtd_grain, coh_grain=coh_grain,
         split_dims=split_dims, show_top_countries=show_top_countries,
         show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
         **gstate
     )
 
 # ------------------------ Engine ------------------------
+def group_label_from_series(s: pd.Series, grain: str, is_create=False):
+    """Return a textual label Series based on grain ('Day','Week','Month')."""
+    if grain == "Day":
+        return pd.to_datetime(s).dt.date.astype(str)
+    if grain == "Week":
+        # ISO week as YYYY-Www
+        iso = pd.to_datetime(s).dt.isocalendar()
+        return (iso['year'].astype(str) + "-W" + iso['week'].astype(str).str.zfill(2))
+    # Month default
+    per = pd.to_datetime(s).dt.to_period("M").astype(str)
+    return per
+
 def compute_outputs(meta):
     base = meta["base"]; measures = meta["measures"]
     mtd = meta["mtd"]; cohort = meta["cohort"]
     mtd_from, mtd_to = meta["mtd_from"], meta["mtd_to"]
     coh_from, coh_to = meta["coh_from"], meta["coh_to"]
+    mtd_grain, coh_grain = meta.get("mtd_grain","Month"), meta.get("coh_grain","Month")
     split_dims = meta["split_dims"]
     show_top_countries = meta["show_top_countries"]
     show_top_sources   = meta["show_top_sources"]
@@ -341,31 +358,26 @@ def compute_outputs(meta):
 
         if show_top_countries and "Country" in sub_mtd.columns:
             g2 = sub_mtd.groupby("Country", dropna=False)[mtd_flag_cols].sum().reset_index()
-            rename_map_ctry = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
-            g2 = g2.rename(columns=rename_map_ctry)
+            g2 = g2.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             g2 = g2.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             tables["Top 5 Countries — MTD"] = g2
 
         if show_top_sources and "JetLearn Deal Source" in sub_mtd.columns:
             g3 = sub_mtd.groupby("JetLearn Deal Source", dropna=False)[mtd_flag_cols].sum().reset_index()
-            rename_map_src = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
-            g3 = g3.rename(columns=rename_map_src)
+            g3 = g3.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             g3 = g3.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = g3
 
-        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub_mtd.columns):
-            g4 = sub_mtd.groupby(["Country","JetLearn Deal Source"], dropna=False)[mtd_flag_cols].sum().reset_index()
-            rename_map_pair = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
-            g4 = g4.rename(columns=rename_map_pair)
-            g4 = g4.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
-            tables["Top Country × Deal Source — MTD"] = g4
-
-        trend = sub_mtd.groupby("Create_Month")[mtd_flag_cols].sum().reset_index()
-        trend = trend.rename(columns={f"__MTD__{m}": m for m in measures})
-        trend["Create_Month"] = trend["Create_Month"].astype(str)
-        long = trend.melt(id_vars="Create_Month", var_name="Measure", value_name="Count")
-        charts["MTD Trend"] = alt_line(long, "Create_Month:O", "Count:Q", color="Measure:N",
-                                       tooltip=["Create_Month","Measure","Count"])
+        # Trend with custom granularity
+        x_label = group_label_from_series(sub_mtd["Create Date"], mtd_grain)
+        trend = sub_mtd.copy()
+        trend["__X__"] = x_label
+        sum_cols = {flag:"sum" for flag in mtd_flag_cols}
+        trend = trend.groupby("__X__")[mtd_flag_cols].sum().reset_index()
+        trend = trend.rename(columns={f"__MTD__{m}": m for m in measures, "__X__":"Bucket"})
+        long = trend.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
+        charts["MTD Trend"] = alt_line(long, "Bucket:O", "Count:Q", color="Measure:N",
+                                       tooltip=["Bucket","Measure","Count"])
 
     # ----- Cohort -----
     if cohort and coh_from and coh_to and len(measures)>0:
@@ -392,37 +404,31 @@ def compute_outputs(meta):
 
         if show_top_countries and "Country" in base.columns:
             g2 = tmp.groupby("Country", dropna=False)[coh_flag_cols].sum().reset_index()
-            rename_map_ctry2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
-            g2 = g2.rename(columns=rename_map_ctry2)
+            g2 = g2.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             g2 = g2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             tables["Top 5 Countries — Cohort"] = g2
 
         if show_top_sources and "JetLearn Deal Source" in base.columns:
             g3 = tmp.groupby("JetLearn Deal Source", dropna=False)[coh_flag_cols].sum().reset_index()
-            rename_map_src2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
-            g3 = g3.rename(columns=rename_map_src2)
+            g3 = g3.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             g3 = g3.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — Cohort"] = g3
 
-        if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
-            g4 = tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[coh_flag_cols].sum().reset_index()
-            rename_map_pair2 = {f"__COH__{m}": f"Cohort: {m}" for m in measures}
-            g4 = g4.rename(columns=rename_map_pair2)
-            g4 = g4.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
-            tables["Top Country × Deal Source — Cohort"] = g4
-
+        # Trend with custom granularity based on Measure date
         trend_frames = []
         for m in measures:
             mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
-            loc = base.loc[mask, [m]].copy()
-            loc["Measure_Month"] = loc[m].dt.to_period("M").astype(str)
-            t = loc.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Count")
+            sel = base.loc[mask, [m]].copy()
+            if sel.empty:
+                continue
+            sel["Bucket"] = group_label_from_series(sel[m], coh_grain)
+            t = sel.groupby("Bucket")[m].count().reset_index(name="Count")
             t["Measure"] = m
             trend_frames.append(t)
         if trend_frames:
             trend_coh = pd.concat(trend_frames, ignore_index=True)
-            charts["Cohort Trend"] = alt_line(trend_coh, "Measure_Month:O", "Count:Q", color="Measure:N",
-                                              tooltip=["Measure_Month","Measure","Count"])
+            charts["Cohort Trend"] = alt_line(trend_coh, "Bucket:O", "Count:Q", color="Measure:N",
+                                              tooltip=["Bucket","Measure","Count"])
 
     return metrics_rows, tables, charts
 
@@ -480,7 +486,7 @@ st.markdown("<div class='section-title'>Results</div>", unsafe_allow_html=True)
 r1, r2, r3, r4 = st.columns([2,2,2,2])
 show_kpis     = r1.toggle("Show KPIs", value=True)
 show_splits   = r2.toggle("Show Splits & Leaderboards", value=False)
-show_trends   = r3.toggle("Show Trends", value=False)
+show_trends   = r3.toggle("Show Trends", value=True)
 show_compare  = r4.toggle("Show Smart Compare", value=True)
 
 # ------------------------ Compute ------------------------
@@ -569,6 +575,15 @@ if show_compare:
         st.info("Turn on KPIs for both scenarios to enable compare.")
 
 # ------------------------ Foot captions ------------------------
+def mk_caption(meta):
+    return (
+        f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
+        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
+        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
+        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
+    )
+
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 st.caption("**Scenario A** — " + mk_caption(metaA))
 st.caption("**Scenario B** — " + mk_caption(metaB))
