@@ -1,4 +1,4 @@
-# app_compare_smart.py — Minimal, smart, interactive A/B compare (compat-friendly)
+# app_compare_smart.py — Minimal, smart, interactive A/B compare (with First Calibration split)
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -34,6 +34,7 @@ def robust_read_csv(file_or_path):
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
 def detect_measure_date_columns(df: pd.DataFrame):
+    """Return list of date-like columns excluding 'Create Date'; parse to datetime."""
     date_like = []
     for col in df.columns:
         if col == "Create Date":
@@ -43,15 +44,16 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum() > 0:
                 df[col] = parsed
                 date_like.append(col)
+    # Prefer 'Payment Received Date' first if present
     if "Payment Received Date" in date_like:
-        date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
+        date_like = ["Payment Received Date"] + [c for c in date_like if c != "Payment Received Date"]
     return date_like
 
 def in_filter(series: pd.Series, all_checked: bool, selected_values):
     if all_checked:
         return pd.Series(True, index=series.index)
     uniq = series.dropna().astype(str).nunique()
-    if selected_values and len(selected_values)==uniq:
+    if selected_values and len(selected_values) == uniq:
         return pd.Series(True, index=series.index)
     if not selected_values:
         return pd.Series(False, index=series.index)
@@ -83,6 +85,7 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def load_and_prepare(data_bytes, path_text):
+    # load
     if data_bytes:
         df = robust_read_csv(BytesIO(data_bytes))
     elif path_text:
@@ -90,22 +93,38 @@ def load_and_prepare(data_bytes, path_text):
     else:
         raise ValueError("Please upload a CSV or provide a file path.")
     df.columns = [c.strip() for c in df.columns]
+
+    # required columns
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
+
+    # exclude invalid deals
     df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
+
+    # parse core dates
     df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
     df["Create_Month"] = df["Create Date"].dt.to_period("M")
-    date_like_cols = detect_measure_date_columns(df)
-    return df, date_like_cols
 
-# Header with Clone buttons (uses st.rerun)
+    # detect/parse other date columns
+    date_like_cols = detect_measure_date_columns(df)
+
+    # build helper "(Month)" columns for all date-like fields (including Create Date) to allow splitting
+    month_helpers = []
+    for col in ["Create Date"] + date_like_cols:
+        helper = f"{col} (Month)"
+        df[helper] = df[col].dt.to_period("M").astype(str)
+        month_helpers.append(helper)
+
+    return df, date_like_cols, month_helpers
+
+# ---------- UI: Header with Clone buttons ----------
 with st.container():
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     hc1, hc2 = st.columns([6,4])
     with hc1:
         st.markdown("### ✨ MTD vs Cohort — A/B Compare (Smart)")
-        st.caption("Minimal, interactive analysis with independent A/B filters, quick presets, splits & smart compare.")
+        st.caption("Minimal, interactive analysis with independent A/B filters, presets, splits & smart compare.")
     with hc2:
         st.write(""); st.write("")
         col1, col2 = st.columns(2)
@@ -123,6 +142,7 @@ with st.container():
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
+# ---------- Data source ----------
 ds = st.expander("Data source", expanded=True)
 with ds:
     c1, c2 = st.columns([3,2])
@@ -131,16 +151,18 @@ with ds:
     with c2:
         default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
     try:
-        df, date_like_cols = load_and_prepare(uploaded.getvalue() if uploaded else None, default_path if not uploaded else None)
-        st.success("Data loaded", icon="✅")  # <— this is the correct function; no st.su*
+        df, date_like_cols, month_helpers = load_and_prepare(uploaded.getvalue() if uploaded else None,
+                                                             default_path if not uploaded else None)
+        st.success("Data loaded", icon="✅")
     except Exception as e:
         st.error(str(e))
         raise
 
 if not date_like_cols:
-    st.error("No other date-like columns found (e.g., 'Payment Received Date').")
+    st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date').")
     raise SystemExit
 
+# ---------- Filter blocks ----------
 def filter_block(df, label, colname, key_prefix):
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     c1, c2 = st.columns([1,3])
@@ -164,23 +186,25 @@ def date_preset_row(name, base_series, measure_series, key_prefix, is_mtd=True):
         dt_from, dt_to = dmin, dmax
     c1, c2 = st.columns(2)
     dt_from = c1.date_input(f"[{name}] From", dt_from, key=f"{key_prefix}_from")
-    dt_to = c2.date_input(f"[{name}] To", dt_to, key=f"{key_prefix}_to")
+    dt_to   = c2.date_input(f"[{name}] To",   dt_to,   key=f"{key_prefix}_to")
     if dt_from > dt_to:
         st.error(f"{name}: 'From' is after 'To'.")
         return None, None
     return dt_from, dt_to
 
-def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
+def panel_controls(name: str, df: pd.DataFrame, date_like_cols, month_helpers):
     st.markdown(f"#### Scenario {name} <span class='badge'>independent</span>", unsafe_allow_html=True)
     with st.container():
+        # Global filters
         with st.expander(f"[{name}] Global filters", expanded=True):
             f1c1, f1c2 = st.columns(2)
             with f1c1:
                 pipe_all, pipe_sel = filter_block(df, "Pipeline", "Pipeline", f"{name}_pipe")
-                src_all, src_sel = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
+                src_all,  src_sel  = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
             with f1c2:
                 ctry_all, ctry_sel = filter_block(df, "Country", "Country", f"{name}_ctry")
                 cslr_all, cslr_sel = filter_block(df, "Counsellor", "Student/Academic Counsellor", f"{name}_cslr")
+
         mask_cat = (
             in_filter(df["Pipeline"], pipe_all, pipe_sel) &
             in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
@@ -188,13 +212,17 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
             in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
         )
         base = df[mask_cat].copy()
+
+        # Measure + toggles
         st.markdown("##### Measure & windows")
         mc1, mc2, mc3 = st.columns([3,2,2])
         measure_col = mc1.selectbox(f"[{name}] Measure date", date_like_cols, index=0, key=f"{name}_measure")
         if f"{measure_col}_Month" not in base.columns:
             base[f"{measure_col}_Month"] = base[measure_col].dt.to_period("M")
-        mtd = mc2.toggle(f"[{name}] MTD", value=True, key=f"{name}_mtd")
+        mtd    = mc2.toggle(f"[{name}] MTD", value=True, key=f"{name}_mtd")
         cohort = mc3.toggle(f"[{name}] Cohort", value=True, key=f"{name}_coh")
+
+        # Ranges
         mtd_from = mtd_to = coh_from = coh_to = None
         if mtd:
             st.caption("Create-Date window")
@@ -202,12 +230,26 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
         if cohort:
             st.caption("Measure-Date window")
             coh_from, coh_to = date_preset_row(name, base["Create Date"], base[measure_col], f"{name}_coh", False)
+
+        # Build split options dynamically
+        split_options = ["JetLearn Deal Source", "Country"]
+        # Add First Calibration Scheduled Date (Month) if present
+        fc_month_col = "First Calibration Scheduled Date (Month)"
+        if fc_month_col in month_helpers or fc_month_col in base.columns:
+            split_options.append(fc_month_col)
+
         with st.expander(f"[{name}] Splits & leaderboards", expanded=False):
             bc1, bc2, bc3 = st.columns([3,2,2])
-            split_dims = bc1.multiselect(f"[{name}] Split by", ["JetLearn Deal Source","Country"], default=[], key=f"{name}_split")
+            split_dims = bc1.multiselect(
+                f"[{name}] Split by (pick one or more)",
+                split_options,
+                default=[],
+                key=f"{name}_split"
+            )
             show_top_countries = bc2.checkbox(f"[{name}] Top 5 Countries", value=True, key=f"{name}_top_ctry")
-            show_top_sources = bc3.checkbox(f"[{name}] Top 3 Deal Sources", value=True, key=f"{name}_top_src")
-            show_combo_pairs = st.checkbox(f"[{name}] Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
+            show_top_sources   = bc3.checkbox(f"[{name}] Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+            show_combo_pairs   = st.checkbox(f"[{name}] Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
+
         return dict(
             name=name, base=base, measure_col=measure_col, mtd=mtd, cohort=cohort,
             mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
@@ -224,47 +266,73 @@ def compute_outputs(meta):
     coh_from, coh_to = meta["coh_from"], meta["coh_to"]
     split_dims = meta["split_dims"]
     show_top_countries = meta["show_top_countries"]
-    show_top_sources = meta["show_top_sources"]
-    show_combo_pairs = meta["show_combo_pairs"]
+    show_top_sources   = meta["show_top_sources"]
+    show_combo_pairs   = meta["show_combo_pairs"]
+
     if f"{measure_col}_Month" not in base.columns:
         base[f"{measure_col}_Month"] = base[measure_col].dt.to_period("M")
+
     metrics_rows = []
     tables = {}
     charts = {}
 
-    # MTD
+    # ---------- MTD ----------
     if mtd and mtd_from and mtd_to:
         in_create_window = base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub_mtd = base[in_create_window].copy()
         mtd_flag = (sub_mtd[measure_col].notna()) & (sub_mtd[f"{measure_col}_Month"] == sub_mtd["Create_Month"])
+
         metrics_rows += [
             {"Scope":"MTD","Metric":f"Count on '{measure_col}'","Window":f"{mtd_from} → {mtd_to}","Value":int(mtd_flag.sum())},
             {"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub_mtd))},
         ]
+
         if split_dims:
-            g = sub_mtd.copy(); g["_MTD Count"] = mtd_flag.astype(int); g["_Create Count in window"] = 1
-            grp = g.groupby(split_dims, dropna=False).agg({"_Create Count in window":"sum","_MTD Count":"sum"}).reset_index().rename(
-                columns={"_Create Count in window":"Create Count in window","_MTD Count":f"MTD Count on '{measure_col}'"}
-            ).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False)
+            g = sub_mtd.copy()
+            g["_MTD Count"], g["_Create Count in window"] = mtd_flag.astype(int), 1
+            grp = g.groupby(split_dims, dropna=False).agg({
+                "_Create Count in window":"sum",
+                "_MTD Count":"sum"
+            }).reset_index().rename(columns={
+                "_Create Count in window":"Create Count in window",
+                "_MTD Count":f"MTD Count on '{measure_col}'"
+            }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False)
             tables[f"MTD split by {', '.join(split_dims)}"] = grp
+
         if show_top_countries and "Country" in sub_mtd.columns:
-            g2 = sub_mtd.copy(); g2["_MTD Count"] = mtd_flag.astype(int); g2["_Create Count in window"] = 1
-            top_ctry = g2.groupby("Country", dropna=False).agg({"_Create Count in window":"sum","_MTD Count":"sum"}).reset_index().rename(
-                columns={"_Create Count in window":"Create Count in window","_MTD Count":f"MTD Count on '{measure_col}'"}
-            ).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(5)
+            g2 = sub_mtd.copy(); g2["_MTD Count"], g2["_Create Count in window"] = mtd_flag.astype(int), 1
+            top_ctry = g2.groupby("Country", dropna=False).agg({
+                "_Create Count in window":"sum",
+                "_MTD Count":"sum"
+            }).reset_index().rename(columns={
+                "_Create Count in window":"Create Count in window",
+                "_MTD Count":f"MTD Count on '{measure_col}'"
+            }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(5)
             tables["Top 5 Countries — MTD"] = top_ctry
+
         if show_top_sources and "JetLearn Deal Source" in sub_mtd.columns:
-            g3 = sub_mtd.copy(); g3["_MTD Count"] = mtd_flag.astype(int); g3["_Create Count in window"] = 1
-            top_src = g3.groupby("JetLearn Deal Source", dropna=False).agg({"_Create Count in window":"sum","_MTD Count":"sum"}).reset_index().rename(
-                columns={"_Create Count in window":"Create Count in window","_MTD Count":f"MTD Count on '{measure_col}'"}
-            ).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(3)
+            g3 = sub_mtd.copy(); g3["_MTD Count"], g3["_Create Count in window"] = mtd_flag.astype(int), 1
+            top_src = g3.groupby("JetLearn Deal Source", dropna=False).agg({
+                "_Create Count in window":"sum",
+                "_MTD Count":"sum"
+            }).reset_index().rename(columns={
+                "_Create Count in window":"Create Count in window",
+                "_MTD Count":f"MTD Count on '{measure_col}'"
+            }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = top_src
+
         if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub_mtd.columns):
-            g4 = sub_mtd.copy(); g4["_MTD Count"] = mtd_flag.astype(int); g4["_Create Count in window"] = 1
-            both = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({"_Create Count in window":"sum","_MTD Count":"sum"}).reset_index().rename(
-                columns={"_Create Count in window":"Create Count in window","_MTD Count":f"MTD Count on '{measure_col}'"}
-            ).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(10)
+            g4 = sub_mtd.copy(); g4["_MTD Count"], g4["_Create Count in window"] = mtd_flag.astype(int), 1
+            both = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({
+                "_Create Count in window":"sum",
+                "_MTD Count":"sum"
+            }).reset_index().rename(columns={
+                "_Create Count in window":"Create Count in window",
+                "_MTD Count":f"MTD Count on '{measure_col}'"
+            }).sort_values(by=f"MTD Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — MTD"] = both
+
+        # Trend (MTD)
         trend_mtd = sub_mtd.assign(flag=mtd_flag.astype(int)).groupby("Create_Month", dropna=False)["flag"].sum().reset_index()
         trend_mtd = trend_mtd.rename(columns={"Create_Month":"Month","flag":"MTD Count"})
         trend_mtd["Month"] = trend_mtd["Month"].astype(str)
@@ -272,38 +340,69 @@ def compute_outputs(meta):
             x="Month:O", y="MTD Count:Q", tooltip=["Month","MTD Count"]
         ).properties(height=260)
 
-    # Cohort
+    # ---------- Cohort ----------
     if cohort and coh_from and coh_to:
         in_measure_window = base[measure_col].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
-        in_create_cohort = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
+        in_create_cohort  = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
+
         metrics_rows += [
             {"Scope":"Cohort","Metric":f"Count on '{measure_col}'","Window":f"{coh_from} → {coh_to}","Value":int(in_measure_window.sum())},
             {"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_create_cohort.sum())},
         ]
+
         if split_dims:
-            g = base.copy(); g["_Cohort Count"] = in_measure_window.astype(int); g["_Create Count in Cohort window"] = in_create_cohort.astype(int)
-            grp2 = g.groupby(split_dims, dropna=False).agg({"_Cohort Count":"sum","_Create Count in Cohort window":"sum"}).reset_index().rename(
-                columns={"_Cohort Count":f"Cohort Count on '{measure_col}'","_Create Count in Cohort window":"Create Count in Cohort window"}
-            ).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False)
+            g = base.copy()
+            g["_Cohort Count"] = in_measure_window.astype(int)
+            g["_Create Count in Cohort window"] = in_create_cohort.astype(int)
+            grp2 = g.groupby(split_dims, dropna=False).agg({
+                "_Cohort Count":"sum",
+                "_Create Count in Cohort window":"sum"
+            }).reset_index().rename(columns={
+                "_Cohort Count":f"Cohort Count on '{measure_col}'",
+                "_Create Count in Cohort window":"Create Count in Cohort window"
+            }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False)
             tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
+
         if show_top_countries and "Country" in base.columns:
-            g2 = base.copy(); g2["_Cohort Count"] = in_measure_window.astype(int); g2["_Create Count in Cohort window"] = in_create_cohort.astype(int)
-            top_ctry2 = g2.groupby("Country", dropna=False).agg({"_Cohort Count":"sum","_Create Count in Cohort window":"sum"}).reset_index().rename(
-                columns={"_Cohort Count":f"Cohort Count on '{measure_col}'","_Create Count in Cohort window":"Create Count in Cohort window"}
-            ).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(5)
+            g2 = base.copy()
+            g2["_Cohort Count"] = in_measure_window.astype(int)
+            g2["_Create Count in Cohort window"] = in_create_cohort.astype(int)
+            top_ctry2 = g2.groupby("Country", dropna=False).agg({
+                "_Cohort Count":"sum",
+                "_Create Count in Cohort window":"sum"
+            }).reset_index().rename(columns={
+                "_Cohort Count":f"Cohort Count on '{measure_col}'",
+                "_Create Count in Cohort window":"Create Count in Cohort window"
+            }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(5)
             tables["Top 5 Countries — Cohort"] = top_ctry2
+
         if show_top_sources and "JetLearn Deal Source" in base.columns:
-            g3 = base.copy(); g3["_Cohort Count"] = in_measure_window.astype(int); g3["_Create Count in Cohort window"] = in_create_cohort.astype(int)
-            top_src2 = g3.groupby("JetLearn Deal Source", dropna=False).agg({"_Cohort Count":"sum","_Create Count in Cohort window":"sum"}).reset_index().rename(
-                columns={"_Cohort Count":f"Cohort Count on '{measure_col}'","_Create Count in Cohort window":"Create Count in Cohort window"}
-            ).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(3)
+            g3 = base.copy()
+            g3["_Cohort Count"] = in_measure_window.astype(int)
+            g3["_Create Count in Cohort window"] = in_create_cohort.astype(int)
+            top_src2 = g3.groupby("JetLearn Deal Source", dropna=False).agg({
+                "_Cohort Count":"sum",
+                "_Create Count in Cohort window":"sum"
+            }).reset_index().rename(columns={
+                "_Cohort Count":f"Cohort Count on '{measure_col}'",
+                "_Create Count in Cohort window":"Create Count in Cohort window"
+            }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(3)
             tables["Top 3 Deal Sources — Cohort"] = top_src2
+
         if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
-            g4 = base.copy(); g4["_Cohort Count"] = in_measure_window.astype(int); g4["_Create Count in Cohort window"] = in_create_cohort.astype(int)
-            both2 = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({"_Cohort Count":"sum","_Create Count in Cohort window":"sum"}).reset_index().rename(
-                columns={"_Cohort Count":f"Cohort Count on '{measure_col}'","_Create Count in Cohort window":"Create Count in Cohort window"}
-            ).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(10)
+            g4 = base.copy()
+            g4["_Cohort Count"] = in_measure_window.astype(int)
+            g4["_Create Count in Cohort window"] = in_create_cohort.astype(int)
+            both2 = g4.groupby(["Country","JetLearn Deal Source"], dropna=False).agg({
+                "_Cohort Count":"sum",
+                "_Create Count in Cohort window":"sum"
+            }).reset_index().rename(columns={
+                "_Cohort Count":f"Cohort Count on '{measure_col}'",
+                "_Create Count in Cohort window":"Create Count in Cohort window"
+            }).sort_values(by=f"Cohort Count on '{measure_col}'", ascending=False).head(10)
             tables["Top Country × Deal Source — Cohort"] = both2
+
+        # Trend (Cohort) — by measure month
         trend_coh = base.loc[in_measure_window].copy()
         trend_coh["Measure_Month"] = trend_coh[measure_col].dt.to_period("M")
         trend_coh = trend_coh.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Cohort Count")
@@ -340,18 +439,21 @@ def build_compare_delta(dfA, dfB):
     out["Δ%"] = (out["Δ"] / out["A"].replace(0, pd.NA) * 100).round(1)
     return out
 
+# ---------- Build panels ----------
 cA, cB = st.columns(2, gap="large")
 with cA:
-    metaA = panel_controls("A", df, date_like_cols)
+    metaA = panel_controls("A", df, date_like_cols, month_helpers)
 with cB:
-    metaB = panel_controls("B", df, date_like_cols)
+    metaB = panel_controls("B", df, date_like_cols, month_helpers)
 
+# ---------- Compute ----------
 with st.spinner("Calculating results..."):
     metricsA, tablesA, chartsA = compute_outputs(metaA)
     metricsB, tablesB, chartsB = compute_outputs(metaB)
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
+# ---------- KPIs ----------
 st.markdown("### 📌 KPI Overview")
 kc1, kc2 = st.columns(2)
 with kc1:
@@ -363,6 +465,7 @@ with kc2:
     dfB = pd.DataFrame(metricsB)
     kpi_grid(dfB, "B · ")
 
+# ---------- Smart compare ----------
 if 'dfA' in locals() and 'dfB' in locals() and not dfA.empty and not dfB.empty:
     st.markdown("### 🧠 Smart Compare (A vs B)")
     cmp = build_compare_delta(dfA, dfB)
@@ -391,6 +494,7 @@ else:
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
+# ---------- Detail tabs ----------
 tabA, tabB = st.tabs(["📋 Scenario A Details", "📋 Scenario B Details"])
 with tabA:
     if not tablesA and not chartsA:
