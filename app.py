@@ -1,52 +1,63 @@
-# app_compare_smart.py — Pro, mobile-friendly, multi-measure A/B analyzer (smart UI)
+# app_compare_pro.py — Blue, minimal, mobile-friendly A/B analyzer with date presets & hamburger menu
 import streamlit as st
 import pandas as pd
 import altair as alt
 from io import BytesIO
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 # ------------------------ Page & Theme ------------------------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Smart UI)", layout="wide", page_icon="✨")
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Pro)", layout="wide", page_icon="📊")
 
 st.markdown("""
 <style>
-/* Base & typography */
 :root{
-  --bg:#ffffff; --card:#ffffff; --muted:#6b7280; --text:#0f172a; --accent:#2563eb;
-  --border: rgba(15,23,42,.12); --soft: rgba(2,6,23,.05);
+  --bg:#ffffff; --text:#0f172a; --muted:#6b7280;
+  --blue:#1e40af; --blue-600:#2563eb; --blue-700:#1d4ed8;
+  --border: rgba(15,23,42,.10); --card:#ffffff;
 }
-html, body, [class*="css"]  { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
-                              Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; }
-.block-container { padding-top: 0.6rem; padding-bottom: 1.2rem; }
+html, body, [class*="css"] {
+  font-family: ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
+}
 
-/* Sticky header bar */
-.header {
-  position: sticky; top: 0; z-index: 10; background: var(--bg);
-  border-bottom: 1px solid var(--border); padding: 8px 0 6px;
-}
-.h-title { font-weight: 700; font-size: 1.05rem; }
-.h-sub   { color: var(--muted); font-size: .82rem; margin-top: 2px; }
+.block-container { padding-top: 0.4rem; padding-bottom: 1rem; }
 
-/* Cards & sections */
-.card {
-  border: 1px solid var(--border); background: var(--card); border-radius: 14px; padding: 12px 14px;
+/* Top bar */
+.nav {
+  position: sticky; top: 0; z-index: 20; padding: 8px 12px;
+  background: linear-gradient(90deg, var(--blue-700), var(--blue-600));
+  color: #fff; border-radius: 12px; margin-bottom: 12px;
 }
-.section-title {
-  display:flex; align-items:center; gap:.5rem; font-weight:700; margin:.25rem 0 .5rem 0;
+.nav .title { font-weight: 800; letter-spacing:.2px; }
+.nav .sub   { font-size:.85rem; opacity:.9; margin-top:2px; }
+.nav .btn {
+  border:1px solid rgba(255,255,255,.35); color:#fff; background: transparent;
+  padding: 6px 10px; border-radius: 10px; font-size:.85rem; cursor:pointer;
 }
-.badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); color:#111827; background:#f9fafb; }
+.nav .btn:hover { background: rgba(255,255,255,.08); }
+
+/* Card + sections */
+.card { border:1px solid var(--border); background:var(--card); border-radius:14px; padding:12px 14px; }
+.section-title { display:flex; align-items:center; gap:.5rem; font-weight:800; margin:.25rem 0 .6rem 0; }
+.badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); color:#0f172a; background:#f8fafc; }
 hr.soft { border:0; height:1px; background:var(--border); margin: .6rem 0 1rem; }
 
-/* KPI card */
+/* KPI */
 .kpi { padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--card); }
 .kpi .label { color:var(--muted); font-size:.78rem; margin-bottom:4px; }
-.kpi .value { font-size:1.45rem; font-weight:750; line-height:1.05; color:var(--text); }
-.kpi .delta { font-size:.85rem; color:var(--accent); }
+.kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
+.kpi .delta { font-size:.84rem; color: var(--blue-600); }
+
+/* Hamburger */
+.menu-pill {
+  display:inline-flex; align-items:center; gap:.5rem; padding:6px 10px; border-radius:999px;
+  background: rgba(255,255,255,.15); border:1px solid rgba(255,255,255,.35);
+  color:#fff; font-weight:600; cursor:pointer;
+}
+.menu-pill:hover { background: rgba(255,255,255,.22); }
 
 /* Mobile tweaks */
 @media (max-width: 820px) {
-  .block-container { padding-left: .5rem; padding-right: .5rem; }
-  .h-title { font-size: 1rem; }
+  .block-container { padding-left:.5rem; padding-right:.5rem; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -56,6 +67,8 @@ REQUIRED_COLS = [
     "Pipeline","JetLearn Deal Source","Country",
     "Student/Academic Counsellor","Deal Stage","Create Date",
 ]
+
+PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
 
 # ------------------------ Utilities ------------------------
 def robust_read_csv(file_or_path):
@@ -97,11 +110,15 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
         return fallback
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
-def this_month_bounds():
-    today = pd.Timestamp.today().date()
-    start = today.replace(day=1)
-    next_start = (start.replace(year=start.year+1, month=1) if start.month==12 else start.replace(month=start.month+1))
-    return start, (next_start - timedelta(days=1))
+# ----- Date preset helpers -----
+def today_bounds():
+    t = pd.Timestamp.today().date()
+    return t, t
+
+def this_month_so_far_bounds():
+    t = pd.Timestamp.today().date()
+    start = t.replace(day=1)
+    return start, t
 
 def last_month_bounds():
     first_this = pd.Timestamp.today().date().replace(day=1)
@@ -109,80 +126,104 @@ def last_month_bounds():
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
 
-def last_7_days_bounds():
-    today = pd.Timestamp.today().date()
-    return today - timedelta(days=6), today
+def quarter_start(y, q):
+    return date(y, 3*(q-1)+1, 1)
+
+def last_quarter_bounds():
+    t = pd.Timestamp.today().date()
+    q = (t.month - 1)//3 + 1
+    if q == 1:
+        y, lq = t.year - 1, 4
+    else:
+        y, lq = t.year, q - 1
+    start = quarter_start(y, lq)
+    # End = day before next quarter start
+    if lq == 4:
+        next_start = quarter_start(y+1, 1)
+    else:
+        next_start = quarter_start(y, lq+1)
+    end = next_start - timedelta(days=1)
+    return start, end
+
+def this_year_so_far_bounds():
+    t = pd.Timestamp.today().date()
+    return date(t.year, 1, 1), t
+
+def date_range_from_preset(label, series: pd.Series, key_prefix: str):
+    """UI: radio for presets; for Custom shows a range picker."""
+    presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
+    choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
+    if choice == "Today":
+        return today_bounds()
+    elif choice == "This month so far":
+        return this_month_so_far_bounds()
+    elif choice == "Last month":
+        return last_month_bounds()
+    elif choice == "Last quarter":
+        return last_quarter_bounds()
+    elif choice == "This year":
+        return this_year_so_far_bounds()
+    else:
+        dmin, dmax = safe_minmax_date(series)
+        rng = st.date_input("Custom range", (dmin, dmax), key=f"{key_prefix}_custom")
+        if isinstance(rng, (tuple, list)) and len(rng) == 2:
+            return rng[0], rng[1]
+        return dmin, dmax
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
-@st.cache_data(show_spinner=False)
-def load_and_prepare(data_bytes, path_text):
-    # Load
-    if data_bytes:
-        df = robust_read_csv(BytesIO(data_bytes))
-    elif path_text:
-        df = robust_read_csv(path_text)
-    else:
-        raise ValueError("Please upload a CSV or provide a file path.")
-    df.columns = [c.strip() for c in df.columns]
-
-    # Required cols
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
-
-    # Exclude invalid
-    df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
-
-    # Parse main dates
-    df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
-    df["Create_Month"] = df["Create Date"].dt.to_period("M")
-
-    # Detect other date-like
-    date_like_cols = detect_measure_date_columns(df)
-
-    return df, date_like_cols
-
-# ------------------------ Altair theme (colors) ------------------------
-# Simple palette used consistently
-PALETTE = ["#2563eb", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899"]
-
-def altair_themed_line(df, x, y, color=None, tooltip=None, height=260):
-    ch = alt.Chart(df).mark_line(point=True).encode(
+def alt_line(df, x, y, color=None, tooltip=None, height=260):
+    enc = dict(
         x=alt.X(x, title=None),
         y=alt.Y(y, title=None),
-        color=alt.Color(color, scale=alt.Scale(range=PALETTE)) if color else alt.value(PALETTE[0]),
         tooltip=tooltip or []
-    ).properties(height=height)
+    )
+    if color:
+        enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
+    ch = alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
     return ch
 
-# ------------------------ Header ------------------------
+# ------------------------ Top Nav (Hamburger + actions) ------------------------
 with st.container():
-    st.markdown('<div class="header">', unsafe_allow_html=True)
-    h1, h2 = st.columns([7,5])
-    with h1:
-        st.markdown('<div class="h-title">✨ MTD vs Cohort — A/B Compare (Smart)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="h-sub">Minimal, mobile-friendly analysis • multi-measure • splits • smart compare</div>', unsafe_allow_html=True)
-    with h2:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("Clone A → B"):
+    st.markdown('<div class="nav">', unsafe_allow_html=True)
+    c1, c2 = st.columns([6,6])
+    with c1:
+        colm1, colm2 = st.columns([1,11])
+        with colm1:
+            st.markdown('<span class="menu-pill">☰</span>', unsafe_allow_html=True)
+        with colm2:
+            st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Pro)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="sub">Blue, minimal, mobile-friendly • multi-measure • date presets • smart compare</div>', unsafe_allow_html=True)
+    with c2:
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("Clone A → B", key="clone_ab", help="Copy Scenario A controls to B"):
                 for k in list(st.session_state.keys()):
                     if str(k).startswith("A_"):
                         st.session_state[str(k).replace("A_","B_",1)] = st.session_state[k]
                 st.rerun()
-        with c2:
-            if st.button("Clone B → A"):
+        with b2:
+            if st.button("Clone B → A", key="clone_ba", help="Copy Scenario B controls to A"):
                 for k in list(st.session_state.keys()):
                     if str(k).startswith("B_"):
                         st.session_state[str(k).replace("B_","A_",1)] = st.session_state[k]
                 st.rerun()
-        with c3:
-            if st.button("Reset"):
+        with b3:
+            if st.button("Reset", key="reset_all", help="Clear all controls"):
                 st.session_state.clear()
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+
+with st.expander("☰ Menu", expanded=False):
+    st.markdown(
+        "- **Upload/Path** your CSV\n"
+        "- Pick **Measures** (you can select multiple date fields)\n"
+        "- Choose **Mode**: MTD / Cohort / Both\n"
+        "- Apply **Date Presets** (Today, This month so far, Last month, Last quarter, This year, Custom)\n"
+        "- Toggle **Results** sections to reveal KPIs / Splits / Trends / Compare\n"
+        "- Use **Clone** buttons to mirror A/B scenarios\n",
+    )
 
 # ------------------------ Data source ------------------------
 with st.expander("📦 Data source", expanded=True):
@@ -191,14 +232,22 @@ with st.expander("📦 Data source", expanded=True):
         uploaded = st.file_uploader("Upload CSV", type=["csv"])
     with col_p:
         default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
-    try:
-        df, date_like_cols = load_and_prepare(uploaded.getvalue() if uploaded else None,
-                                              default_path if not uploaded else None)
-        st.success("Data loaded", icon="✅")
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    if uploaded:
+        df = robust_read_csv(BytesIO(uploaded.getvalue()))
+    else:
+        df = robust_read_csv(default_path)
 
+df.columns = [c.strip() for c in df.columns]
+missing = [c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
+    st.stop()
+
+# Exclude invalid deals, parse dates
+df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
+df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
+df["Create_Month"] = df["Create Date"].dt.to_period("M")
+date_like_cols = detect_measure_date_columns(df)
 if not date_like_cols:
     st.error("No date-like columns found besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
@@ -212,11 +261,6 @@ def filter_block(df, label, colname, key_prefix):
         selected = c2.multiselect(label, options, default=options, disabled=all_flag, key=f"{key_prefix}_sel")
     return all_flag, selected
 
-def date_range_slider(name, series, key_prefix):
-    """Date slider based on series min/max (mobile-friendly)."""
-    dmin, dmax = safe_minmax_date(series)
-    return st.slider(f"[{name}] Range", min_value=dmin, max_value=dmax, value=(dmin, dmax), key=f"{key_prefix}_slider")
-
 def ensure_month_cols(base: pd.DataFrame, measures):
     for m in measures:
         col = f"{m}_Month"
@@ -227,75 +271,71 @@ def ensure_month_cols(base: pd.DataFrame, measures):
 def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
     st.markdown(f"<div class='section-title'>Scenario {name} <span class='badge'>independent</span></div>", unsafe_allow_html=True)
     with st.container():
-        with st.container():
-            with st.expander(f"[{name}] Global filters", expanded=True):
-                g1, g2 = st.columns(2)
-                with g1:
-                    pipe_all, pipe_sel = filter_block(df, "Pipeline", "Pipeline", f"{name}_pipe")
-                    src_all,  src_sel  = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
-                with g2:
-                    ctry_all, ctry_sel = filter_block(df, "Country", "Country", f"{name}_ctry")
-                    cslr_all, cslr_sel = filter_block(df, "Counsellor", "Student/Academic Counsellor", f"{name}_cslr")
+        with st.expander(f"[{name}] Global filters", expanded=True):
+            g1, g2 = st.columns(2)
+            with g1:
+                pipe_all, pipe_sel = filter_block(df, "Pipeline", "Pipeline", f"{name}_pipe")
+                src_all,  src_sel  = filter_block(df, "Deal Source", "JetLearn Deal Source", f"{name}_src")
+            with g2:
+                ctry_all, ctry_sel = filter_block(df, "Country", "Country", f"{name}_ctry")
+                cslr_all, cslr_sel = filter_block(df, "Counsellor", "Student/Academic Counsellor", f"{name}_cslr")
 
-        mask_cat = (
-            in_filter(df["Pipeline"], pipe_all, pipe_sel) &
-            in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
-            in_filter(df["Country"], ctry_all, ctry_sel) &
-            in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
-        )
-        base = df[mask_cat].copy()
+    mask_cat = (
+        in_filter(df["Pipeline"], pipe_all, pipe_sel) &
+        in_filter(df["JetLearn Deal Source"], src_all, src_sel) &
+        in_filter(df["Country"], ctry_all, ctry_sel) &
+        in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
+    )
+    base = df[mask_cat].copy()
 
-        st.markdown("###### Measures & windows")
-        mrow1 = st.columns([3,2,2])
-        measures = mrow1[0].multiselect(f"[{name}] Measure date(s) — counts per field",
-                                        options=date_like_cols,
-                                        default=[date_like_cols[0]] if date_like_cols else [],
-                                        key=f"{name}_measures")
-        # Segment control for which windows are active
-        window_mode = mrow1[1].radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
-        compact = mrow1[2].toggle("Compact Mode (mobile)", value=False, key=f"{name}_compact")
+    st.markdown("###### Measures & windows")
+    mrow1 = st.columns([4,2,2])
+    measures = mrow1[0].multiselect(f"[{name}] Measure date(s)", options=date_like_cols,
+                                    default=[date_like_cols[0]] if date_like_cols else [],
+                                    key=f"{name}_measures")
+    window_mode = mrow1[1].radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
+    compact = mrow1[2].toggle("Compact Mode", value=False, key=f"{name}_compact")
 
-        mtd = window_mode in ("MTD","Both")
-        cohort = window_mode in ("Cohort","Both")
+    mtd = window_mode in ("MTD","Both")
+    cohort = window_mode in ("Cohort","Both")
 
-        if not measures:
-            st.warning("Pick at least one Measure date.")
-            measures = []
+    if not measures:
+        st.warning("Pick at least one Measure date.")
+        measures = []
+    base = ensure_month_cols(base, measures)
 
-        base = ensure_month_cols(base, measures)
+    # Date presets
+    mtd_from = mtd_to = coh_from = coh_to = None
+    c1, c2 = st.columns(2)
+    if mtd:
+        with c1:
+            st.caption("Create-Date window (MTD)")
+            mtd_from, mtd_to = date_range_from_preset(f"[{name}] MTD Range", base["Create Date"], f"{name}_mtd")
+    if cohort:
+        with c2:
+            st.caption("Measure-Date window (Cohort)")
+            first_series = base[measures[0]] if measures else base["Create Date"]
+            coh_from, coh_to = date_range_from_preset(f"[{name}] Cohort Range", first_series, f"{name}_coh")
 
-        # Date pickers with sliders (mobile)
-        c1, c2 = st.columns(2)
-        mtd_from = mtd_to = coh_from = coh_to = None
-        if mtd:
-            with c1:
-                st.caption("Create-Date window")
-                mtd_from, mtd_to = date_range_slider(name + " · MTD", base["Create Date"], f"{name}_mtd")
-        if cohort:
-            with c2:
-                st.caption("Measure-Date window")
-                # for default slider bounds, use first measure if any
-                first_series = base[measures[0]] if measures else base["Create Date"]
-                coh_from, coh_to = date_range_slider(name + " · Cohort", first_series, f"{name}_coh")
+    # Splits & leaderboards
+    with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
+        srow = st.columns([3,2,2])
+        split_dims = srow[0].multiselect(f"[{name}] Split by", ["JetLearn Deal Source", "Country"], default=[], key=f"{name}_split")
+        show_top_countries = srow[1].toggle("Top 5 Countries", value=True, key=f"{name}_top_ctry")
+        show_top_sources   = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
+        show_combo_pairs   = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
 
-        # Splits & leaderboards (reveal on demand)
-        with st.expander(f"[{name}] Splits & leaderboards (optional)", expanded=False):
-            srow = st.columns([3,2,2])
-            split_dims = srow[0].multiselect(f"[{name}] Split by", ["JetLearn Deal Source", "Country"], default=[], key=f"{name}_split")
-            show_top_countries = srow[1].toggle("Top 5 Countries", value=True, key=f"{name}_top_ctry")
-            show_top_sources   = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
-            show_combo_pairs   = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
+    return dict(
+        name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
+        mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
+        split_dims=split_dims, show_top_countries=show_top_countries,
+        show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
+        pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
+        ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel,
+        compact=compact
+    )
 
-        return dict(
-            name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
-            mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
-            split_dims=split_dims, show_top_countries=show_top_countries,
-            show_top_sources=show_top_sources, show_combo_pairs=show_combo_pairs,
-            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
-            ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel,
-            compact=compact
-        )
-
+# ------------------------ Compute ------------------------
 def compute_outputs(meta):
     base = meta["base"]; measures = meta["measures"]
     mtd = meta["mtd"]; cohort = meta["cohort"]
@@ -306,61 +346,49 @@ def compute_outputs(meta):
     show_top_sources   = meta["show_top_sources"]
     show_combo_pairs   = meta["show_combo_pairs"]
 
-    metrics_rows = []
-    tables = {}
-    charts = {}
+    metrics_rows, tables, charts = [], {}, {}
 
-    # ---------- MTD ----------
+    # ----- MTD -----
     if mtd and mtd_from and mtd_to and len(measures)>0:
         in_create_window = base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub_mtd = base[in_create_window].copy()
-
-        # Flags per measure
         mtd_flag_cols = []
         for m in measures:
             col_flag = f"__MTD__{m}"
             sub_mtd[col_flag] = ((sub_mtd[m].notna()) & (sub_mtd[f"{m}_Month"] == sub_mtd["Create_Month"])).astype(int)
             mtd_flag_cols.append(col_flag)
-            metrics_rows.append({"Scope":"MTD", "Metric":f"Count on '{m}'", "Window":f"{mtd_from} → {mtd_to}",
-                                 "Value": int(sub_mtd[col_flag].sum())})
-        metrics_rows.append({"Scope":"MTD", "Metric":"Create Count in window", "Window":f"{mtd_from} → {mtd_to}",
-                             "Value": int(len(sub_mtd))})
+            metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub_mtd[col_flag].sum())})
+        metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub_mtd))})
 
-        # Splits
         if split_dims:
-            agg_dict = {flag: "sum" for flag in mtd_flag_cols}
-            agg_dict["_CreateCount"] = "sum"
+            agg_dict = {flag:"sum" for flag in mtd_flag_cols}
             sub_mtd["_CreateCount"] = 1
+            agg_dict["_CreateCount"] = "sum"
             grp = sub_mtd.groupby(split_dims, dropna=False).agg(agg_dict).reset_index()
-            rename_map = {f"__MTD__{m}": f"MTD: {m}" for m in measures}
-            grp = grp.rename(columns={"_CreateCount":"Create Count in window", **rename_map})
+            grp = grp.rename(columns={"_CreateCount":"Create Count in window", **{f"__MTD__{m}":f"MTD: {m}" for m in measures}})
             grp = grp.sort_values(by=f"MTD: {measures[0]}", ascending=False)
             tables[f"MTD split by {', '.join(split_dims)}"] = grp
 
-        # Leaderboards
         if show_top_countries and "Country" in sub_mtd.columns:
-            agg_dict = {f"__MTD__{m}":"sum" for m in measures}
-            g2 = sub_mtd.groupby("Country", dropna=False).agg(agg_dict).reset_index()
-            g2 = g2.rename(columns={f"__MTD__{m}": f"MTD: {m}" for m in measures})
+            g2 = sub_mtd.groupby("Country", dropna=False)[mtd_flag_cols].sum().reset_index()
+            g2 = g2.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             g2 = g2.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             tables["Top 5 Countries — MTD"] = g2
 
         if show_top_sources and "JetLearn Deal Source" in sub_mtd.columns:
-            agg_dict = {f"__MTD__{m}":"sum" for m in measures}
-            g3 = sub_mtd.groupby("JetLearn Deal Source", dropna=False).agg(agg_dict).reset_index()
-            g3 = g3.rename(columns={f"__MTD__{m}": f"MTD: {m}" for m in measures})
+            g3 = sub_mtd.groupby("JetLearn Deal Source", dropna=False)[mtd_flag_cols].sum().reset_index()
+            g3 = g3.rename(columns={f"__MTD__{m}":f"MTD: {m}" for m in measures})
             g3 = g3.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — MTD"] = g3
 
-        # Trend — one line per measure across Create_Month
-        trend = sub_mtd.groupby("Create_Month")[[f"__MTD__{m}" for m in measures]].sum().reset_index()
-        trend = trend.rename(columns={f"__MTD__{m}": f"{m}" for m in measures})
+        trend = sub_mtd.groupby("Create_Month")[mtd_flag_cols].sum().reset_index()
+        trend = trend.rename(columns={f"__MTD__{m}": m for m in measures})
         trend["Create_Month"] = trend["Create_Month"].astype(str)
         long = trend.melt(id_vars="Create_Month", var_name="Measure", value_name="Count")
-        charts["MTD Trend"] = altair_themed_line(long, "Create_Month:O", "Count:Q", color="Measure:N",
-                                                 tooltip=["Create_Month","Measure","Count"])
+        charts["MTD Trend"] = alt_line(long, "Create_Month:O", "Count:Q", color="Measure:N",
+                                       tooltip=["Create_Month","Measure","Count"])
 
-    # ---------- Cohort ----------
+    # ----- Cohort -----
     if cohort and coh_from and coh_to and len(measures)>0:
         tmp = base.copy()
         coh_flag_cols = []
@@ -368,39 +396,31 @@ def compute_outputs(meta):
             col_flag = f"__COH__{m}"
             tmp[col_flag] = tmp[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both").astype(int)
             coh_flag_cols.append(col_flag)
-            metrics_rows.append({"Scope":"Cohort", "Metric":f"Count on '{m}'", "Window":f"{coh_from} → {coh_to}",
-                                 "Value": int(tmp[col_flag].sum())})
+            metrics_rows.append({"Scope":"Cohort","Metric":f"Count on '{m}'","Window":f"{coh_from} → {coh_to}","Value":int(tmp[col_flag].sum())})
         in_create_cohort = base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
-        metrics_rows.append({"Scope":"Cohort", "Metric":"Create Count in Cohort window",
-                             "Window":f"{coh_from} → {coh_to}", "Value": int(in_create_cohort.sum())})
+        metrics_rows.append({"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_create_cohort.sum())})
 
-        # Splits
         if split_dims:
-            agg_dict = {flag: "sum" for flag in coh_flag_cols}
-            agg_dict["_CreateInCohort"] = "sum"
+            agg_dict = {flag:"sum" for flag in coh_flag_cols}
             tmp["_CreateInCohort"] = in_create_cohort.astype(int)
+            agg_dict["_CreateInCohort"] = "sum"
             grp2 = tmp.groupby(split_dims, dropna=False).agg(agg_dict).reset_index()
-            grp2 = grp2.rename(columns={"_CreateInCohort":"Create Count in Cohort window",
-                                        **{f"__COH__{m}": f"Cohort: {m}" for m in measures}})
+            grp2 = grp2.rename(columns={"_CreateInCohort":"Create Count in Cohort window", **{f"__COH__{m}":f"Cohort: {m}" for m in measures}})
             grp2 = grp2.sort_values(by=f"Cohort: {measures[0]}", ascending=False)
             tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
 
-        # Leaderboards
         if show_top_countries and "Country" in base.columns:
-            agg_dict = {f"__COH__{m}":"sum" for m in measures}
-            g2 = tmp.groupby("Country", dropna=False).agg(agg_dict).reset_index()
-            g2 = g2.rename(columns={f"__COH__{m}": f"Cohort: {m}" for m in measures})
+            g2 = tmp.groupby("Country", dropna=False)[coh_flag_cols].sum().reset_index()
+            g2 = g2.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             g2 = g2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             tables["Top 5 Countries — Cohort"] = g2
 
         if show_top_sources and "JetLearn Deal Source" in base.columns:
-            agg_dict = {f"__COH__{m}":"sum" for m in measures}
-            g3 = tmp.groupby("JetLearn Deal Source", dropna=False).agg(agg_dict).reset_index()
-            g3 = g3.rename(columns={f"__COH__{m}": f"Cohort: {m}" for m in measures})
+            g3 = tmp.groupby("JetLearn Deal Source", dropna=False)[coh_flag_cols].sum().reset_index()
+            g3 = g3.rename(columns={f"__COH__{m}":f"Cohort: {m}" for m in measures})
             g3 = g3.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
             tables["Top 3 Deal Sources — Cohort"] = g3
 
-        # Trend — per measure by measure month
         trend_frames = []
         for m in measures:
             mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -411,8 +431,8 @@ def compute_outputs(meta):
             trend_frames.append(t)
         if trend_frames:
             trend_coh = pd.concat(trend_frames, ignore_index=True)
-            charts["Cohort Trend"] = altair_themed_line(trend_coh, "Measure_Month:O", "Count:Q", color="Measure:N",
-                                                        tooltip=["Measure_Month","Measure","Count"])
+            charts["Cohort Trend"] = alt_line(trend_coh, "Measure_Month:O", "Count:Q", color="Measure:N",
+                                              tooltip=["Measure_Month","Measure","Count"])
 
     return metrics_rows, tables, charts
 
@@ -452,17 +472,15 @@ def mk_caption(meta):
     )
 
 # ------------------------ Panels (A/B) ------------------------
-# Compact mode stacks vertically on mobile
 left, right = st.columns(2, gap="large")
 with left:
     metaA = panel_controls("A", df, date_like_cols)
 with (st if metaA["compact"] else right):
     metaB = panel_controls("B", df, date_like_cols)
 
-# ------------------------ Actions / Reveal toggles ------------------------
+# ------------------------ Reveal toggles ------------------------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 st.markdown("<div class='section-title'>Results</div>", unsafe_allow_html=True)
-
 r1, r2, r3, r4 = st.columns([2,2,2,2])
 show_kpis     = r1.toggle("Show KPIs", value=True)
 show_splits   = r2.toggle("Show Splits & Leaderboards", value=False)
@@ -493,7 +511,7 @@ if show_splits:
     tabA, tabB = st.tabs(["Scenario A", "Scenario B"])
     with tabA:
         if not tablesA:
-            st.info("No split/leaderboard tables — toggle Splits & Leaderboards in Scenario A and run again.")
+            st.info("No tables — enable splits/leaderboards in Scenario A.")
         else:
             for name, frame in tablesA.items():
                 st.subheader("A · " + name)
@@ -502,7 +520,7 @@ if show_splits:
                                    file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
     with tabB:
         if not tablesB:
-            st.info("No split/leaderboard tables — toggle Splits & Leaderboards in Scenario B and run again.")
+            st.info("No tables — enable splits/leaderboards in Scenario B.")
         else:
             for name, frame in tablesB.items():
                 st.subheader("B · " + name)
@@ -532,17 +550,16 @@ if show_trends:
 # ------------------------ Smart Compare ------------------------
 if show_compare:
     st.markdown("### 🧠 Smart Compare (A vs B)")
-    if 'dfA' in locals() and 'dfB' in locals() and not pd.DataFrame(metricsA).empty and not pd.DataFrame(metricsB).empty:
-        cmp = build_compare_delta(pd.DataFrame(metricsA), pd.DataFrame(metricsB))
+    dA, dB = pd.DataFrame(metricsA), pd.DataFrame(metricsB)
+    if not dA.empty and not dB.empty:
+        cmp = build_compare_delta(dA, dB)
         if cmp.empty:
             st.info("Adjust scenarios to produce comparable KPIs.")
         else:
             st.dataframe(cmp, use_container_width=True)
             try:
-                # Quick small-multiples when both scenarios use same measures
-                sameA = [m for m in metaA["measures"]]
-                sameB = [m for m in metaB["measures"]]
-                if set(sameA) == set(sameB):
+                # Small-multiples if same measure sets
+                if set(metaA["measures"]) == set(metaB["measures"]):
                     sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
                     if not sub.empty:
                         sub["Measure"] = sub["Metric"].str.extract(r"Count on '(.+)'")
