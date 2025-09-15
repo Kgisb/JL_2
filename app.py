@@ -132,7 +132,7 @@ with ds:
         default_path = st.text_input("…or CSV path", value="Master_sheet_DB_10percent.csv")
     try:
         df, date_like_cols = load_and_prepare(uploaded.getvalue() if uploaded else None, default_path if not uploaded else None)
-        st.success("Data loaded", icon="✅")
+        st.success("Data loaded", icon="✅")  # <— this is the correct function; no st.su*
     except Exception as e:
         st.error(str(e))
         raise
@@ -417,4 +417,19 @@ with tabB:
             st.subheader("MTD Trend (B)")
             st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
         if "Cohort Trend" in chartsB:
-            st.su
+            st.subheader("Cohort Trend (B)")
+            st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
+
+def mk_caption(meta):
+    return (
+        f"Measure: {meta['measure_col']} · "
+        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
+        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
+        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
+        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
+    )
+
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+st.caption("**Scenario A** — " + mk_caption(metaA))
+st.caption("**Scenario B** — " + mk_caption(metaB))
+st.caption("Excluded globally: 1.2 Invalid Deal")
