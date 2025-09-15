@@ -1,6 +1,6 @@
-# app_compare_pro_minimal_search_v3_fixed2.py
+# app_compare_pro_minimal_search_v3_fixed3.py
 # Minimal A/B analyzer with streamlined "All → type to filter" multiselect UX
-# FIX: don't programmatically set widget state during render (prevents StreamlitAPIException)
+# FIX: never set a widget's session_state key during normal render; only via buttons + rerun
 
 import streamlit as st
 import pandas as pd
@@ -159,59 +159,61 @@ def summarize(values, all_flag, max_items=2):
     return ", ".join(vals[:max_items]) + (f" +{len(vals)-max_items} more" if len(vals)>max_items else "")
 
 def smart_multiselect(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
-    """When 'All' is unticked, show ONE native multiselect with type-ahead."""
+    """
+    When 'All' is unticked, show ONE native multiselect with type-ahead.
+    IMPORTANT: don't write to widget keys inside render; only on buttons + rerun.
+    """
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
-    all_key  = f"{key_prefix}_all"
-    sel_key  = f"{key_prefix}_sel"
-    ms_key   = f"{key_prefix}_ms"
 
-    # Init (don't mutate later except via user/UI actions)
+    all_key  = f"{key_prefix}_all"     # checkbox key
+    sel_key  = f"{key_prefix}_sel"     # our stored selection (not a widget)
+    ms_key   = f"{key_prefix}_ms"      # multiselect widget key
+
+    # Initial state (only non-widget keys may be set safely)
     if all_key not in st.session_state: st.session_state[all_key] = True
     if sel_key not in st.session_state: st.session_state[sel_key] = options.copy()
-    if ms_key  not in st.session_state: st.session_state[ms_key]  = st.session_state[sel_key]
+    if ms_key  not in st.session_state: st.session_state[ms_key]  = st.session_state[sel_key]  # prefill once
 
+    # Snapshot current state (do not mutate ms_key in normal flow)
     all_flag = bool(st.session_state[all_key])
-    selected = coerce_list(st.session_state[sel_key])
-    summary  = summarize(selected, all_flag)
+    stored_sel = coerce_list(st.session_state.get(sel_key, []))
 
+    # Effective selection used for filtering & defaults:
+    effective_selected = options if all_flag else coerce_list(st.session_state.get(ms_key, stored_sel))
+
+    summary  = summarize(effective_selected, all_flag)
     ctx = st.popover(f"{label}: {summary}") if hasattr(st, "popover") else st.expander(f"{label}: {summary}", expanded=False)
     with ctx:
         colA, colB = st.columns([1,3])
         with colA:
-            # User controls 'All'
             st.checkbox("All", value=all_flag, key=all_key)
-            # If user just turned All ON, mirror to selections for UX
-            if st.session_state[all_key] and len(st.session_state[sel_key]) != len(options):
-                st.session_state[sel_key] = options.copy()
-                st.session_state[ms_key]  = options.copy()
         with colB:
             if not st.session_state[all_key]:
                 st.multiselect(
-                    " ", options=options, default=coerce_list(st.session_state.get(ms_key, selected)),
+                    " ", options=options, default=effective_selected,
                     key=ms_key, placeholder=f"Type to search {label.lower()}…",
                     label_visibility="collapsed"
                 )
                 act1, act2 = st.columns([1,1])
                 with act1:
                     if st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True):
+                        # It's safe to write & rerun on button press
                         st.session_state[sel_key] = options.copy()
                         st.session_state[ms_key]  = options.copy()
-                        st.rerun()
+                        st.experimental_rerun()
                 with act2:
                     if st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True):
                         st.session_state[sel_key] = []
                         st.session_state[ms_key]  = []
-                        st.rerun()
+                        st.experimental_rerun()
             else:
                 st.caption("All values selected")
 
-    # Sync back from multiselect (do NOT auto-toggle the checkbox here)
+    # Sync back (no writes to ms_key unless via buttons)
     if not st.session_state[all_key]:
-        st.session_state[sel_key] = coerce_list(st.session_state.get(ms_key, st.session_state[sel_key]))
-    # When All is on, keep sel list as full options for clarity, but don't flip the checkbox.
+        st.session_state[sel_key] = coerce_list(st.session_state.get(ms_key, effective_selected))
     else:
         st.session_state[sel_key] = options.copy()
-        st.session_state[ms_key]  = options.copy()
 
     return st.session_state[all_key], st.session_state[sel_key], f"{label}: {summarize(st.session_state[sel_key], st.session_state[all_key])}"
 
@@ -230,7 +232,7 @@ def filters_toolbar(name: str, df: pd.DataFrame):
                 st.session_state[f"{prefix}_all"] = True
                 st.session_state[f"{prefix}_sel"] = opts
                 st.session_state[f"{prefix}_ms"]  = opts
-            st.rerun()
+            st.experimental_rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
