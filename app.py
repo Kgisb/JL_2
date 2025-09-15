@@ -131,10 +131,11 @@ with st.container():
         st.write("")
         st.write("")
         if st.button("Clone A → B", help="Copy Scenario A selections into Scenario B"):
-            for k, v in st.session_state.items():
+            # copy A_* state to B_* safely
+            for k in list(st.session_state.keys()):
                 if str(k).startswith("A_"):
-                    st.session_state[str(k).replace("A_","B_",1)] = v
-            st.experimental_rerun()
+                    st.session_state[str(k).replace("A_","B_",1)] = st.session_state[k]
+            st.rerun()  # updated for modern Streamlit
     st.markdown('</div>', unsafe_allow_html=True)
 
 ds = st.expander("Data source", expanded=True)
@@ -377,134 +378,4 @@ def compute_outputs(meta):
         trend_coh = trend_coh.groupby("Measure_Month")["Measure_Month"].count().reset_index(name="Cohort Count")
         trend_coh["Measure_Month"] = trend_coh["Measure_Month"].astype(str)
         charts["Cohort Trend"] = alt.Chart(trend_coh).mark_line(point=True).encode(
-            x="Measure_Month:O", y="Cohort Count:Q", tooltip=["Measure_Month","Cohort Count"]
-        ).properties(height=260)
-
-    return metrics_rows, tables, charts
-
-def kpi_grid(dfk, label_prefix=""):
-    if dfk.empty:
-        st.info("No KPIs yet.")
-        return
-    cols = st.columns(4)
-    for i, row in dfk.iterrows():
-        with cols[i % 4]:
-            st.markdown(f"""
-            <div class="kpi">
-              <div class="label">{label_prefix}{row['Scope']} — {row['Metric']}</div>
-              <div class="value">{row['Value']:,}</div>
-              <div class="delta">{row['Window']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-def build_compare_delta(dfA, dfB):
-    """Return a tidy df with rows aligned by Scope+Metric so we can show deltas."""
-    if dfA.empty or dfB.empty:
-        return pd.DataFrame()
-    key = ["Scope","Metric"]
-    a = dfA[key + ["Value"]].rename(columns={"Value":"A"})
-    b = dfB[key + ["Value"]].rename(columns={"Value":"B"})
-    out = pd.merge(a, b, on=key, how="inner")
-    out["Δ"] = out["B"] - out["A"]
-    out["Δ%"] = (out["Δ"] / out["A"].replace(0, pd.NA) * 100).round(1)
-    return out
-
-# -------- Build panels --------
-cA, cB = st.columns(2, gap="large")
-with cA:
-    metaA = panel_controls("A", df, date_like_cols)
-with cB:
-    metaB = panel_controls("B", df, date_like_cols)
-
-# -------- Compute --------
-with st.spinner("Calculating results..."):
-    metricsA, tablesA, chartsA = compute_outputs(metaA)
-    metricsB, tablesB, chartsB = compute_outputs(metaB)
-
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-
-# -------- KPIs --------
-st.markdown("### 📌 KPI Overview")
-kc1, kc2 = st.columns(2)
-with kc1:
-    st.markdown("**Scenario A**")
-    dfA = pd.DataFrame(metricsA)
-    kpi_grid(dfA, "A · ")
-with kc2:
-    st.markdown("**Scenario B**")
-    dfB = pd.DataFrame(metricsB)
-    kpi_grid(dfB, "B · ")
-
-# -------- Smart compare --------
-if 'dfA' in locals() and 'dfB' in locals() and not dfA.empty and not dfB.empty:
-    st.markdown("### 🧠 Smart Compare (A vs B)")
-    cmp = build_compare_delta(dfA, dfB)
-    if cmp.empty:
-        st.info("Adjust scenarios to produce comparable KPIs.")
-    else:
-        st.dataframe(cmp, use_container_width=True)
-        # If same measure, show grouped bar of 'Count on ...'
-        msk = cmp["Metric"].str.startswith("Count on '")
-        if msk.any() and (metaA["measure_col"] == metaB["measure_col"]):
-            tidy = cmp[msk].copy()
-            a_long = tidy.rename(columns={"A":"Value"})[["Scope","Metric","Value"]]
-            a_long["Scenario"] = "A"
-            b_long = tidy.rename(columns={"B":"Value"})[["Scope","Metric","Value"]]
-            b_long["Scenario"] = "B"
-            long = pd.concat([a_long, b_long], ignore_index=True)
-            chart = alt.Chart(long).mark_bar().encode(
-                x=alt.X("Scope:N", title=None),
-                y=alt.Y("Value:Q"),
-                color=alt.Color("Scenario:N"),
-                column=alt.Column("Scenario:N", header=alt.Header(title=None, labelAngle=0)),
-                tooltip=["Scenario","Scope","Value"]
-            ).properties(height=260)
-            st.altair_chart(chart, use_container_width=True)
-else:
-    st.info("Tip: turn on MTD and/or Cohort in both scenarios to enable Smart Compare.")
-
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-
-# -------- Details tabs --------
-tabA, tabB = st.tabs(["📋 Scenario A Details", "📋 Scenario B Details"])
-with tabA:
-    if not tablesA and not chartsA:
-        st.info("No details for Scenario A — adjust filters.")
-    else:
-        for name, frame in tablesA.items():
-            st.subheader(name + " (A)")
-            st.dataframe(frame, use_container_width=True)
-        if "MTD Trend" in chartsA:
-            st.subheader("MTD Trend (A)")
-            st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
-        if "Cohort Trend" in chartsA:
-            st.subheader("Cohort Trend (A)")
-            st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
-
-with tabB:
-    if not tablesB and not chartsB:
-        st.info("No details for Scenario B — adjust filters.")
-    else:
-        for name, frame in tablesB.items():
-            st.subheader(name + " (B)")
-            st.dataframe(frame, use_container_width=True)
-        if "MTD Trend" in chartsB:
-            st.subheader("MTD Trend (B)")
-            st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
-        if "Cohort Trend" in chartsB:
-            st.subheader("Cohort Trend (B)")
-            st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
-
-# -------- Footer --------
-def mk_caption(meta):
-    return (
-        f"Measure: {meta['measure_col']} · "
-        f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(meta['pipe_sel']) or 'None'} · "
-        f"Deal Source: {'All' if meta['src_all'] else ', '.join(meta['src_sel']) or 'None'} · "
-        f"Country: {'All' if meta['ctry_all'] else ', '.join(meta['ctry_sel']) or 'None'} · "
-        f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(meta['cslr_sel']) or 'None'}"
-    )
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption("**Scenario A** — " + mk_caption(metaA))
-st.caption("**Scenario B** — " + mk_caption(metaB))
-st.caption("Excluded globally: 1.2 Invalid Deal")
+            x="Measure_Month:O",_
