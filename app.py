@@ -1,7 +1,8 @@
-# app_compare_pro_tabs_counsellor_grain_clonefix.py
+# app_compare_pro_tabs_counsellor_grain_clonefix2.py
 # A/B analyzer — Tabs UI, global "All→type-to-search" filters, multi-measure,
 # presets with Day/Week/Month granularity, splits incl. Counsellor, trends.
-# ✅ FIX: Clone A→B / B→A via safe callbacks + early clone processing.
+# ✅ FIX: All session_state writes happen inside callbacks (Select all/Clear/Reset/Clear-all),
+# plus early clone pass (A→B / B→A) before widgets render.
 
 import streamlit as st
 import pandas as pd
@@ -10,7 +11,7 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ---------- Page ----------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Granularity + Clone Fix)",
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Granularity + Safe Clone)",
                    layout="wide", page_icon="📊")
 st.markdown("""
 <style>
@@ -42,25 +43,21 @@ def _request_clone(direction: str):
 def _perform_clone_if_requested():
     """
     Apply cloning BEFORE any widget declarations to respect Streamlit's rules.
-    Copies A_* → B_* or B_* → A_* except ephemeral button keys.
+    Copies A_* → B_* or B_* → A_*; skips ephemeral keys.
     """
     direction = st.session_state.get("__clone_request__")
     if not direction:
         return
     src_prefix, dst_prefix = ("A_", "B_") if direction == "A2B" else ("B_", "A_")
-    # Take a snapshot of keys to avoid dict mutation during iteration
     keys = list(st.session_state.keys())
     for k in keys:
         if not k.startswith(src_prefix):
             continue
-        # Skip ephemeral action keys for safety
         if k.endswith("_select_all") or k.endswith("_clear"):
             continue
         v = st.session_state[k]
         dst_key = k.replace(src_prefix, dst_prefix, 1)
-        # Only assign simple serializable values (lists, bools, str, numbers, dates)
         st.session_state[dst_key] = v
-    # Clear the request and rerun once to render with cloned state
     st.session_state["__clone_request__"] = None
     st.rerun()
 
@@ -135,11 +132,11 @@ def date_range_from_preset(label, series: pd.Series, key_prefix: str):
                          index=["Day","Week","Month"].index(default_grain),
                          key=f"{key_prefix}_grain")
 
-    if choice == "Today":            f,t = today_bounds()
+    if choice == "Today":               f,t = today_bounds()
     elif choice == "This month so far": f,t = this_month_so_far_bounds()
-    elif choice == "Last month":     f,t = last_month_bounds()
-    elif choice == "Last quarter":   f,t = last_quarter_bounds()
-    elif choice == "This year":      f,t = this_year_so_far_bounds()
+    elif choice == "Last month":        f,t = last_month_bounds()
+    elif choice == "Last quarter":      f,t = last_quarter_bounds()
+    elif choice == "This year":         f,t = this_year_so_far_bounds()
     else:
         dmin,dmax = safe_minmax_date(series)
         rng = st.date_input("Custom range", (dmin,dmax), key=f"{key_prefix}_custom")
@@ -156,6 +153,24 @@ def alt_line(df, x, y, color=None, tooltip=None, height=260):
     if color: enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
     return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
 
+# ---------- Safe callbacks for filter controls ----------
+def _select_all_cb(ms_key: str, all_key: str, options: list):
+    st.session_state[ms_key] = options
+    st.session_state[all_key] = True
+
+def _clear_cb(ms_key: str, all_key: str):
+    st.session_state[ms_key] = []
+    st.session_state[all_key] = False
+
+def _reset_filters_cb(mapping: list):
+    # mapping: list of (all_key, ms_key, options)
+    for all_key, ms_key, options in mapping:
+        st.session_state[all_key] = True
+        st.session_state[ms_key]  = options
+
+def _reset_all_cb():
+    st.session_state.clear()
+
 # ---------- Top Nav ----------
 with st.container():
     st.markdown('<div class="nav">', unsafe_allow_html=True)
@@ -170,7 +185,7 @@ with st.container():
         with col_ba:
             st.button("Clone B → A", key="clone_ba_btn", on_click=_request_clone, args=("B2A",))
         with col_reset:
-            if st.button("Reset", key="reset_all"): st.session_state.clear(); st.rerun()
+            st.button("Reset", key="reset_all", on_click=_reset_all_cb)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------- Data ----------
@@ -195,7 +210,7 @@ if not date_like_cols:
     st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
 
-# ---------- Global filters (smart) ----------
+# ---------- Global filters (smart, callback-safe) ----------
 def _summary(values, all_flag, max_items=2):
     vals = coerce_list(values)
     if all_flag: return "All"
@@ -218,7 +233,9 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
     ctx = st.popover(header) if hasattr(st, "popover") else st.expander(header, expanded=False)
     with ctx:
         left, right = st.columns([1, 3])
-        with left: st.checkbox("All", value=all_flag, key=all_key)
+        with left:
+            # toggling the checkbox writes its own key safely
+            st.checkbox("All", value=all_flag, key=all_key)
         with right:
             disabled = st.session_state[all_key]
             st.multiselect(label, options=options, default=selected, key=ms_key,
@@ -226,11 +243,17 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
                            label_visibility="collapsed", disabled=disabled)
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True):
-                    st.session_state[ms_key]  = options.copy(); st.session_state[all_key] = True; st.rerun()
+                st.button("Select all",
+                          key=f"{key_prefix}_select_all",
+                          use_container_width=True,
+                          on_click=_select_all_cb,
+                          args=(ms_key, all_key, options))
             with c2:
-                if st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True):
-                    st.session_state[ms_key]  = []; st.session_state[all_key] = False; st.rerun()
+                st.button("Clear",
+                          key=f"{key_prefix}_clear",
+                          use_container_width=True,
+                          on_click=_clear_cb,
+                          args=(ms_key, all_key))
 
     all_flag = bool(st.session_state[all_key])
     selected = coerce_list(st.session_state.get(ms_key, []))
@@ -245,17 +268,18 @@ def filters_toolbar(name: str, df: pd.DataFrame):
     with c3: ctry_all, ctry_sel, s3 = unified_multifilter("Country", df, "Country", f"{name}_ctry")
     with c4: cslr_all, cslr_sel, s4 = unified_multifilter("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
     with c5:
-        if st.button("Clear", key=f"{name}_clear", use_container_width=True):
-            for prefix, col in [
-                (f"{name}_pipe","Pipeline"),
-                (f"{name}_src","JetLearn Deal Source"),
-                (f"{name}_ctry","Country"),
-                (f"{name}_cslr","Student/Academic Counsellor"),
-            ]:
-                opts = sorted([v for v in df[col].dropna().astype(str).unique()])
-                st.session_state[f"{prefix}_all"] = True
-                st.session_state[f"{prefix}_ms"]  = opts
-            st.rerun()
+        # Build mapping now; set via callback safely
+        mapping = []
+        for prefix, col in [
+            (f"{name}_pipe","Pipeline"),
+            (f"{name}_src","JetLearn Deal Source"),
+            (f"{name}_ctry","Country"),
+            (f"{name}_cslr","Student/Academic Counsellor"),
+        ]:
+            opts = sorted([v for v in df[col].dropna().astype(str).unique()])
+            mapping.append((f"{prefix}_all", f"{prefix}_ms", opts))
+        st.button("Clear", key=f"{name}_clear", use_container_width=True,
+                  on_click=_reset_filters_cb, args=(mapping,))
     st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Filters — " + " · ".join([s1, s2, s3, s4]))
 
@@ -317,7 +341,7 @@ def panel_controls(name: str, df: pd.DataFrame, date_like_cols):
         show_top_countries   = srow[1].toggle("Top 5 Countries", value=True,  key=f"{name}_top_ctry")
         show_top_sources     = srow[2].toggle("Top 3 Deal Sources", value=True, key=f"{name}_top_src")
         show_top_counsellors = srow[3].toggle("Top 5 Counsellors", value=False, key=f"{name}_top_cslr")
-        show_combo_pairs   = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
+        show_combo_pairs     = st.toggle("Country × Deal Source (Top 10)", value=False, key=f"{name}_pair")
 
     return dict(name=name, base=base, measures=measures, mtd=mtd, cohort=cohort,
                 mtd_from=mtd_from, mtd_to=mtd_to, coh_from=coh_from, coh_to=coh_to,
