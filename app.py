@@ -1,13 +1,13 @@
-# app.py — Drawer UI + A/B Compare + Predictability (with robust 'Pipeline' handling)
+# app.py — Drawer UI + A/B Compare + Predictability (robust headers, safe models)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 from io import BytesIO
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 
-# --- ML (Predictability)
+# ML
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -18,6 +18,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 # --------------------------- PAGE / THEME ---------------------------
 st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability",
                    layout="wide", page_icon="📊")
+
 st.markdown("""
 <style>
 :root{
@@ -42,9 +43,8 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country",
-                 "Student/Academic Counsellor","Deal Stage","Create Date"]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
+REQUIRED_COLS_BASE = ["JetLearn Deal Source","Country","Student/Academic Counsellor","Deal Stage","Create Date"]
 
 # --------------------------- CLONE REQUEST HANDLING ---------------------------
 def _request_clone(direction: str):
@@ -71,6 +71,33 @@ def robust_read_csv(file_or_path):
         except Exception: pass
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
+def ensure_named_column(df: pd.DataFrame, target: str, aliases: list[str], create_unknown: bool = True) -> pd.DataFrame:
+    """
+    Ensure column `target` exists; rename from aliases (case/space tolerant) or create safe fallback.
+    """
+    if target in df.columns:
+        return df
+
+    norm_map = {c: c.strip().lower() for c in df.columns}
+    candidate_keys = {target.strip().lower(), *[a.strip().lower() for a in aliases]}
+
+    hit = None
+    for col, low in norm_map.items():
+        if low in candidate_keys:
+            hit = col
+            break
+
+    if hit is not None:
+        return df.rename(columns={hit: target})
+
+    if create_unknown:
+        if any(k in target.lower() for k in ["date","time","timestamp"]):
+            df[target] = pd.NaT
+        else:
+            df[target] = "Unknown"
+        st.warning(f"‘{target}’ column not found; created a fallback `{target}`. Please align your CSV header.")
+    return df
+
 def detect_measure_date_columns(df: pd.DataFrame):
     date_like=[]
     for col in df.columns:
@@ -82,24 +109,6 @@ def detect_measure_date_columns(df: pd.DataFrame):
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
-
-def ensure_program_column(df: pd.DataFrame, target="Pipeline") -> pd.DataFrame:
-    """Guarantee a 'Pipeline' column exists (case/space tolerant; synonyms)."""
-    if target in df.columns:
-        return df
-    norm = {c: c.strip().lower() for c in df.columns}
-    aliases = ["pipeline", "program", "programme", "course", "track"]
-    hit = None
-    for col, low in norm.items():
-        if low in aliases:
-            hit = col; break
-    if hit is not None:
-        df = df.rename(columns={hit: target})
-        return df
-    df[target] = "Unknown"
-    st.warning("‘Pipeline’ column not found; created a fallback ‘Unknown’ Pipeline. "
-               "Rename your CSV column to ‘Pipeline’ for best results.")
-    return df
 
 # --------------------------- SMALL UTILITIES ---------------------------
 def coerce_list(x): 
@@ -210,32 +219,29 @@ if st.session_state["uploaded_bytes"]:
 else:
     df = robust_read_csv(st.session_state["csv_path"])
 
-# Trim / normalize column names
 df.columns=[c.strip() for c in df.columns]
 
-# Core validations
-missing=[c for c in REQUIRED_COLS if c not in df.columns]
-# we'll allow missing 'Pipeline' here because we will ensure it below
-missing = [m for m in missing if m != "Pipeline"]
-if missing:
-    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
-    st.stop()
+# Normalize/ensure critical columns (robust to synonyms & typos)
+df = ensure_named_column(df, "Deal Stage", ["deal stage","stage"])
+df = ensure_named_column(df, "Create Date", ["create date","created date","created on","deal create date","created_at","created at"])
+df = ensure_named_column(df, "Pipeline", ["pipeline","program","programme","course","track"])
+df = ensure_named_column(df, "JetLearn Deal Source", ["jetlearn deal source","deal source","source","lead source"])
+df = ensure_named_column(df, "Country", ["country"])
+df = ensure_named_column(df, "Student/Academic Counsellor",
+                         ["student/academic counsellor","student academic counsellor","counsellor","counselor","academic counsellor"])
 
-# Clean and normalize
+# Filter invalid deals & prep dates
 df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 df["Create Date"]=pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
 df["Create_Month"]=df["Create Date"].dt.to_period("M")
 
-# Guarantee a usable Pipeline column (fixes your earlier warning)
-df = ensure_program_column(df, target="Pipeline")
-
-# Detect other date-like columns (e.g., Payment Received Date)
+# Discover other usable date columns (e.g., Payment Received Date)
 date_like_cols=detect_measure_date_columns(df)
 if not date_like_cols:
-    st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
+    st.error("No usable date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
 
-# --------------------------- GLOBAL FILTER WIDGETS ---------------------------
+# --------------------------- FILTER WIDGETS ---------------------------
 def _summary(values, all_flag, max_items=2):
     vals=coerce_list(values)
     if all_flag: return "All"
@@ -369,6 +375,7 @@ def compute_outputs(meta):
     show_combo_pairs=meta["show_combo_pairs"]
     metrics_rows, tables, charts = [], {}, {}
 
+    # MTD
     if mtd and mtd_from and mtd_to and measures:
         in_cre=base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub=base[in_cre].copy()
@@ -411,6 +418,7 @@ def compute_outputs(meta):
             long=t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
             charts["MTD Trend"]=alt_line(long,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
 
+    # Cohort
     if cohort and coh_from and coh_to and measures:
         tmp=base.copy(); ch_flags=[]
         for m in measures:
@@ -505,10 +513,20 @@ def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
     return sub
 
 def build_daily_counts(df: pd.DataFrame, measure_col: str):
-    """Aggregate daily counts per JetLearn Deal Source (treat NaT as 0)."""
+    """
+    Aggregate daily counts per JetLearn Deal Source (treat NaT as 0),
+    robust if columns are missing.
+    """
+    if "JetLearn Deal Source" not in df.columns:
+        df["JetLearn Deal Source"] = "Unknown"
+
     if measure_col not in df.columns:
         return pd.DataFrame(columns=["ds","JetLearn Deal Source","y"])
+
     data = df.dropna(subset=[measure_col]).copy()
+    if data.empty:
+        return pd.DataFrame(columns=["ds","JetLearn Deal Source","y"])
+
     data["ds"] = pd.to_datetime(data[measure_col]).dt.date
     grp = (data.groupby(["ds","JetLearn Deal Source"])
                 .size()
@@ -526,8 +544,7 @@ def add_time_features(frame: pd.DataFrame):
     return f
 
 def add_lags_and_rolls(frame: pd.DataFrame, group_col="JetLearn Deal Source"):
-    """Create lag/rolling features per source."""
-    f = frame.sort_values(["JetLearn Deal Source","ds"]).copy()
+    f = frame.sort_values([group_col,"ds"]).copy()
     f["y_lag7"] = f.groupby(group_col)["y"].shift(7)
     f["y_lag14"] = f.groupby(group_col)["y"].shift(14)
     f["y_roll7"] = f.groupby(group_col)["y"].rolling(7, min_periods=1).mean().reset_index(0,drop=True)
@@ -535,9 +552,9 @@ def add_lags_and_rolls(frame: pd.DataFrame, group_col="JetLearn Deal Source"):
     return f
 
 def train_forecast_model(df_counts: pd.DataFrame):
-    """Fit a simple GBM with one-hot on source; time-aware split."""
+    """Fit a GBM with one-hot on source; time-aware split; return model, features, metrics."""
     if df_counts.empty or df_counts["ds"].nunique() < 40:
-        return None, None, None  # not enough history
+        return None, None, None
 
     X = add_time_features(df_counts)
     X = add_lags_and_rolls(X)
@@ -545,7 +562,6 @@ def train_forecast_model(df_counts: pd.DataFrame):
     if X.empty:
         return None, None, None
 
-    # Features and target
     features = ["dow","month","dom","week","year","y_lag7","y_lag14","y_roll7","y_roll28","JetLearn Deal Source"]
     target = "y"
     cat_cols = ["JetLearn Deal Source"]
@@ -562,7 +578,6 @@ def train_forecast_model(df_counts: pd.DataFrame):
         ("gbm", GradientBoostingRegressor(random_state=42))
     ])
 
-    # Time-aware split (last 20% for test)
     X = X.sort_values("ds")
     split_idx = int(len(X) * 0.8)
     train, test = X.iloc[:split_idx], X.iloc[split_idx:]
@@ -578,7 +593,6 @@ def train_forecast_model(df_counts: pd.DataFrame):
     return model, features, metrics
 
 def make_future_frame(horizon: str):
-    """Create future dates for forecasting horizon."""
     today = pd.Timestamp.today().date()
     if horizon == "Today":
         dates = [today]
@@ -602,13 +616,11 @@ def predict_by_source(model, feature_cols, sources, future_dates):
         f = future_dates.copy()
         f["JetLearn Deal Source"] = s
         f = add_time_features(f)
-        # add naive lag/roll placeholders (use seasonal averages if needed -> zeros here)
         for c in ["y_lag7","y_lag14","y_roll7","y_roll28"]:
-            f[c] = np.nan  # will be treated as missing -> we fill with 0
-        f = f.fillna(0)
+            f[c] = 0.0  # unknown future lags -> 0 (model learns baseline seasonality via calendar + OHE)
         yhat = model.predict(f[feature_cols]).clip(min=0)
         out = f[["ds","JetLearn Deal Source"]].copy()
-        out["yhat"] = yhat
+        out["yhat"] = np.round(yhat, 2)
         frames.append(out)
     if frames:
         return pd.concat(frames, ignore_index=True)
@@ -627,18 +639,18 @@ if st.session_state.get("filters_open", True):
             st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=_store_upload, args=("__uploader__",))
             st.text_input("CSV path", key="csv_path")
 
-# --------------------------- ANALYZE (A/B) ---------------------------
-def mk_caption(meta):
-    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
-
 # --------------------------- MAIN TABS ---------------------------
 main_tabs = st.tabs(["Analyze", "Predictability"])
 
+# --------------------------- ANALYZE TAB ---------------------------
 with main_tabs[0]:
+    def mk_caption(meta):
+        return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+                f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
+                f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
+                f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
+                f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
+
     metaA = assemble_meta("A", df)
     with st.spinner("Crunching scenario A…"):
         metricsA, tablesA, chartsA = compute_outputs(metaA)
@@ -716,7 +728,8 @@ with main_tabs[0]:
 # --------------------------- PREDICTABILITY TAB ---------------------------
 with main_tabs[1]:
     st.markdown("### 🔮 Predictability (JetLearn Deal Source totals)")
-    st.caption("Train a simple model on historical **daily** counts (per deal source), then forecast by horizon. "
+    st.caption("Trains on historical **daily counts** per deal source from your chosen event date column. "
+               "Time-aware split with metrics; fallback to 7-day mean if not enough data. "
                "Program filter uses the **Pipeline** column (robust to naming variants).")
 
     # Controls
@@ -724,52 +737,46 @@ with main_tabs[1]:
     with pc1:
         program_choice = st.selectbox("Program", ["AI-Coding", "Math", "Both"], index=2)
     with pc2:
-        # Choose the date column representing an "enrollment" / event (default Payment Received Date if present)
         default_measure = "Payment Received Date" if "Payment Received Date" in date_like_cols else date_like_cols[0]
         pred_measure = st.selectbox("Event date column to count", date_like_cols, index=date_like_cols.index(default_measure))
     with pc3:
         horizon = st.selectbox("Forecast horizon", ["Today","Tomorrow","This month (rest)","Next month"], index=2)
 
     run_btn = st.button("Run prediction", type="primary")
+
     if run_btn:
-        # Apply program subset safely
+        # Subset by program (Pipeline)
         df_prog = subset_for_program(df, program_choice)
 
-        # Build daily counts by deal source
+        # Daily counts by source for selected measure
         daily = build_daily_counts(df_prog, pred_measure)
         if daily.empty:
             st.warning("Not enough data in the chosen event column to model. Try a different measure.")
         else:
-            # Train model
             with st.spinner("Training model & backtesting..."):
                 model, feats, back_metrics = train_forecast_model(daily)
 
-            # If model is None, fallback to naive average (last 7 days)
             if model is None:
                 st.info("Not enough history to train a model. Falling back to a 7-day average baseline.")
-                # naive per source
-                naive = daily.groupby("JetLearn Deal Source").tail(7).groupby("JetLearn Deal Source")["y"].mean().reset_index()
-                naive = naive.rename(columns={"y":"naive_mean"})
+                naive = (daily.groupby("JetLearn Deal Source").tail(7)
+                              .groupby("JetLearn Deal Source")["y"].mean()
+                              .reset_index().rename(columns={"y":"naive_mean"}))
                 future_dates = make_future_frame(horizon)
                 if future_dates.empty:
                     st.info("No future dates formed for the selected horizon.")
                 else:
-                    # Expand across sources
                     sources = sorted(daily["JetLearn Deal Source"].unique())
                     out = pd.MultiIndex.from_product([future_dates["ds"], sources], names=["ds","JetLearn Deal Source"]).to_frame(index=False)
                     out = out.merge(naive, on="JetLearn Deal Source", how="left").fillna(0)
                     out["yhat"] = out["naive_mean"].clip(lower=0).round(2)
-                    # Present
                     st.markdown("#### Forecast (Naive baseline)")
                     st.dataframe(out[["ds","JetLearn Deal Source","yhat"]], use_container_width=True)
                     total = out.groupby("ds")["yhat"].sum().reset_index()
                     ch = alt.Chart(total).mark_bar().encode(x="ds:T", y="yhat:Q", tooltip=["ds","yhat"])
                     st.altair_chart(ch, use_container_width=True)
             else:
-                # Show backtest metrics
                 st.markdown("#### Backtest (time-aware split)")
                 st.write(pd.DataFrame([back_metrics]))
-                # Forecast with GBM
                 future_dates = make_future_frame(horizon)
                 sources = sorted(daily["JetLearn Deal Source"].unique())
                 fc = predict_by_source(model, feats, sources, future_dates)
@@ -786,11 +793,3 @@ with main_tabs[1]:
                         x="ds:T", y="yhat:Q", tooltip=["ds","yhat"]
                     ).properties(height=260)
                     st.altair_chart(ch, use_container_width=True)
-
-    with st.expander("Notes", expanded=False):
-        st.markdown("""
-- **Counts** are daily occurrences in the chosen event date column (e.g. *Payment Received Date*), grouped by **JetLearn Deal Source**.
-- The model uses calendar features (DOW, week, month), plus simple lags/rolling means; it’s trained with a time-aware split.
-- If there isn’t enough history, the app falls back to a **7-day mean** per source.
-- ‘Program’ is read from the **Pipeline** column; common synonyms (Program/Programme/Course/Track) are auto-detected.
-        """)
