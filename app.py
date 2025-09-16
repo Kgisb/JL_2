@@ -1,21 +1,23 @@
-# app.py — Drawer UI + Analytics + Predictability (Pipeline-aware)
+# app.py — Drawer UI + A/B Compare + Predictability (with robust 'Pipeline' handling)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 from io import BytesIO
 from datetime import date, timedelta, datetime
-from typing import List, Tuple, Dict, Optional
 
-# ML
+# --- ML (Predictability)
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import Pipeline as SkPipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline as SKPipeline
 from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import GradientBoostingRegressor
 
-# -------------------- Page & Styles --------------------
-st.set_page_config(page_title="JetLearn MIS — MTD/Cohort & Predictability", layout="wide", page_icon="✨")
+# --------------------------- PAGE / THEME ---------------------------
+st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability",
+                   layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{
@@ -40,98 +42,11 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
+REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country",
+                 "Student/Academic Counsellor","Deal Stage","Create Date"]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
-REQUIRED_COLS = ["Pipeline", "JetLearn Deal Source", "Country",
-                 "Student/Academic Counsellor", "Deal Stage", "Create Date"]
 
-PROGRAM_COL = "Pipeline"  # predictability "program" comes from Pipeline
-
-# -------------------- Utilities --------------------
-def robust_read_csv(file_or_path):
-    for enc in ["utf-8","utf-8-sig","cp1252","latin1"]:
-        try: return pd.read_csv(file_or_path, encoding=enc)
-        except Exception: pass
-    raise RuntimeError("Could not read the CSV with tried encodings.")
-
-def detect_measure_date_columns(df: pd.DataFrame) -> List[str]:
-    date_like=[]
-    for col in df.columns:
-        if col=="Create Date": continue
-        low = col.lower()
-        if any(k in low for k in ["date","time","timestamp"]):
-            parsed = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-            if parsed.notna().sum()>0:
-                df[col]=parsed; date_like.append(col)
-    # prefer Payment Received Date first if exists
-    if "Payment Received Date" in date_like:
-        date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
-    return date_like
-
-def coerce_list(x):
-    if x is None: return []
-    if isinstance(x, (list, tuple, set)): return list(x)
-    return [x]
-
-def in_filter(series: pd.Series, all_checked: bool, selected_values):
-    if all_checked: return pd.Series(True, index=series.index)
-    sel = [str(v) for v in coerce_list(selected_values)]
-    if len(sel)==0: return pd.Series(False, index=series.index)
-    return series.astype(str).isin(sel)
-
-def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
-    if s.isna().all(): return fallback
-    return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
-
-def today_bounds(): t=pd.Timestamp.today().date(); return t,t
-def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
-def last_month_bounds():
-    first_this = pd.Timestamp.today().date().replace(day=1)
-    last_prev = first_this - timedelta(days=1)
-    first_prev = last_prev.replace(day=1)
-    return first_prev, last_prev
-def quarter_start(y,q): return date(y,3*(q-1)+1,1)
-def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedelta(days=1)
-def last_quarter_bounds():
-    t=pd.Timestamp.today().date(); q=(t.month-1)//3+1
-    y,lq=(t.year-1,4) if q==1 else (t.year,q-1)
-    return quarter_start(y,lq), quarter_end(y,lq)
-def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
-
-def alt_line(df,x,y,color=None,tooltip=None,height=260):
-    enc=dict(x=alt.X(x,title=None), y=alt.Y(y,title=None), tooltip=tooltip or [])
-    if color: enc["color"]=alt.Color(color, scale=alt.Scale(range=PALETTE))
-    return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
-
-def to_csv_bytes(df: pd.DataFrame)->bytes: return df.to_csv(index=False).encode("utf-8")
-
-# -------------------- Program/Pipeline mapping for Predictability --------------------
-def _is_ai_coding(text: str) -> bool:
-    t = str(text).strip().lower()
-    return (t == "ai-coding") or ("ai" in t) or ("coding" in t)
-
-def _is_math(text: str) -> bool:
-    t = str(text).strip().lower()
-    return (t == "math") or ("vedic" in t) or ("math" in t)
-
-def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
-    if program_choice == "Both" or PROGRAM_COL not in df.columns:
-        if PROGRAM_COL not in df.columns:
-            st.info(f"ℹ️ Using all records because `{PROGRAM_COL}` column wasn’t found.")
-        return df
-    s = df[PROGRAM_COL].astype(str)
-    if program_choice == "AI-Coding":
-        mask = s.apply(_is_ai_coding)
-    elif program_choice == "Math":
-        mask = s.apply(_is_math)
-    else:
-        mask = pd.Series(True, index=df.index)
-    sub = df[mask].copy()
-    if sub.empty:
-        st.warning(f"⚠️ No rows matched **{program_choice}** in `{PROGRAM_COL}`. Using all rows instead.")
-        return df
-    return sub
-
-# -------------------- Clone helpers --------------------
+# --------------------------- CLONE REQUEST HANDLING ---------------------------
 def _request_clone(direction: str):
     st.session_state["__clone_request__"] = direction
     if direction == "A2B":
@@ -147,56 +62,180 @@ def _perform_clone_if_requested():
         st.session_state[k.replace(src_prefix, dst_prefix, 1)] = st.session_state[k]
     st.session_state["__clone_request__"] = None
     st.rerun()
+_perform_clone_if_requested()
 
-# -------------------- State defaults --------------------
+# --------------------------- HELPERS (I/O & CLEANING) ---------------------------
+def robust_read_csv(file_or_path):
+    for enc in ["utf-8","utf-8-sig","cp1252","latin1"]:
+        try: return pd.read_csv(file_or_path, encoding=enc)
+        except Exception: pass
+    raise RuntimeError("Could not read the CSV with tried encodings.")
+
+def detect_measure_date_columns(df: pd.DataFrame):
+    date_like=[]
+    for col in df.columns:
+        if col=="Create Date": continue
+        if any(k in col.lower() for k in ["date","time","timestamp"]):
+            parsed = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+            if parsed.notna().sum()>0:
+                df[col]=parsed; date_like.append(col)
+    if "Payment Received Date" in date_like:
+        date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
+    return date_like
+
+def ensure_program_column(df: pd.DataFrame, target="Pipeline") -> pd.DataFrame:
+    """Guarantee a 'Pipeline' column exists (case/space tolerant; synonyms)."""
+    if target in df.columns:
+        return df
+    norm = {c: c.strip().lower() for c in df.columns}
+    aliases = ["pipeline", "program", "programme", "course", "track"]
+    hit = None
+    for col, low in norm.items():
+        if low in aliases:
+            hit = col; break
+    if hit is not None:
+        df = df.rename(columns={hit: target})
+        return df
+    df[target] = "Unknown"
+    st.warning("‘Pipeline’ column not found; created a fallback ‘Unknown’ Pipeline. "
+               "Rename your CSV column to ‘Pipeline’ for best results.")
+    return df
+
+# --------------------------- SMALL UTILITIES ---------------------------
+def coerce_list(x): 
+    if x is None: return []
+    if isinstance(x,(list,tuple,set)): return list(x)
+    return [x]
+
+def in_filter(series: pd.Series, all_checked: bool, selected_values):
+    if all_checked: return pd.Series(True, index=series.index)
+    sel = [str(v) for v in coerce_list(selected_values)]
+    if len(sel)==0: return pd.Series(False, index=series.index)
+    return series.astype(str).isin(sel)
+
+def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
+    if s.isna().all(): return fallback
+    return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
+def today_bounds(): t=pd.Timestamp.today().date(); return t,t
+def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
+def last_month_bounds():
+    first_this = pd.Timestamp.today().date().replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    first_prev = last_prev.replace(day=1)
+    return first_prev, last_prev
+def quarter_start(y,q): return date(y,3*(q-1)+1,1)
+def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedelta(days=1)
+def last_quarter_bounds():
+    t=pd.Timestamp.today().date(); q=(t.month-1)//3+1
+    y,lq=(t.year-1,4) if q==1 else (t.year,q-1)
+    return quarter_start(y,lq), quarter_end(y,lq)
+def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
+
+def date_range_from_preset(label, series: pd.Series, key_prefix: str):
+    presets=["Today","This month so far","Last month","Last quarter","This year","Custom"]
+    c1,c2 = st.columns([3,2])
+    with c1:
+        choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
+    with c2:
+        default_grain = {"Today":"Day","This month so far":"Day","Last month":"Month",
+                         "Last quarter":"Month","This year":"Month","Custom":"Month"}[choice]
+        st.radio("Granularity", ["Day","Week","Month"], horizontal=True,
+                 index=["Day","Week","Month"].index(default_grain), key=f"{key_prefix}_grain")
+    if choice=="Today": f,t=today_bounds()
+    elif choice=="This month so far": f,t=this_month_so_far_bounds()
+    elif choice=="Last month": f,t=last_month_bounds()
+    elif choice=="Last quarter": f,t=last_quarter_bounds()
+    elif choice=="This year": f,t=this_year_so_far_bounds()
+    else:
+        dmin,dmax=safe_minmax_date(series)
+        rng=st.date_input("Custom range",(dmin,dmax),key=f"{key_prefix}_custom")
+        f,t=(rng[0],rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin,dmax)
+    if f>t: st.error("'From' is after 'To'. Please adjust.")
+    return f,t
+
+def alt_line(df,x,y,color=None,tooltip=None,height=260):
+    enc=dict(x=alt.X(x,title=None), y=alt.Y(y,title=None), tooltip=tooltip or [])
+    if color: enc["color"]=alt.Color(color, scale=alt.Scale(range=PALETTE))
+    return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
+
+def to_csv_bytes(df: pd.DataFrame)->bytes: return df.to_csv(index=False).encode("utf-8")
+
+def group_label_from_series(s: pd.Series, grain_key: str):
+    grain=st.session_state.get(grain_key,"Month")
+    if grain=="Day":  return pd.to_datetime(s).dt.date.astype(str)
+    if grain=="Week":
+        iso=pd.to_datetime(s).dt.isocalendar()
+        return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
+    return pd.to_datetime(s).dt.to_period("M").astype(str)
+
+# --------------------------- STATE / TOPBAR ---------------------------
 if "filters_open" not in st.session_state: st.session_state["filters_open"]=True
 if "show_b" not in st.session_state: st.session_state["show_b"]=False
 if "csv_path" not in st.session_state: st.session_state["csv_path"]="Master_sheet_DB_10percent.csv"
 if "uploaded_bytes" not in st.session_state: st.session_state["uploaded_bytes"]=None
-_perform_clone_if_requested()
 
-# -------------------- Top bar --------------------
+def _toggle_filters_toggle(): st.session_state["filters_open"]=not st.session_state.get("filters_open",True)
+def _enable_b(): st.session_state["show_b"]=True
+def _disable_b(): st.session_state["show_b"]=False
+def _select_all_cb(ms_key, all_key, options):
+    st.session_state[ms_key]=options; st.session_state[all_key]=True
+def _clear_cb(ms_key, all_key):
+    st.session_state[ms_key]=[]; st.session_state[all_key]=False
+def _reset_all_cb(): st.session_state.clear()
+def _store_upload(key):
+    up=st.session_state.get(key)
+    if up is not None:
+        st.session_state["uploaded_bytes"]=up.getvalue(); st.rerun()
+
 with st.container():
     st.markdown('<div class="topbar">', unsafe_allow_html=True)
-    c1,c2,c3,c4 = st.columns([5,2.2,2.5,2.5])
-    with c1: st.markdown('<div class="title">☰ JetLearn MIS — MTD/Cohort & Predictability</div>', unsafe_allow_html=True)
-    with c2:
-        st.button("☰ Filters", key="toggle_filters",
-                  on_click=lambda: st.session_state.update(filters_open=not st.session_state.get("filters_open",True)),
-                  use_container_width=True)
+    c1,c2,c3,c4 = st.columns([6,2,2,3])
+    with c1: st.markdown('<div class="title">☰ MTD vs Cohort — Drawer UI + Predictability</div>', unsafe_allow_html=True)
+    with c2: st.button("☰ Filters", key="toggle_filters", on_click=_toggle_filters_toggle, use_container_width=True)
     with c3:
         if st.session_state["show_b"]:
-            st.button("Disable B", key="disable_b",
-                      on_click=lambda: st.session_state.update(show_b=False),
-                      use_container_width=True)
+            st.button("Disable B", key="disable_b", on_click=_disable_b, use_container_width=True)
         else:
-            st.button("Enable B", key="enable_b",
-                      on_click=lambda: st.session_state.update(show_b=True),
-                      use_container_width=True)
+            st.button("Enable B", key="enable_b", on_click=_enable_b, use_container_width=True)
     with c4:
         cb1,cb2,cb3 = st.columns([1,1,1])
         with cb1: st.button("A→B", key="clone_ab_btn", on_click=_request_clone, args=("A2B",), use_container_width=True)
         with cb2: st.button("B→A", key="clone_ba_btn", on_click=_request_clone, args=("B2A",), use_container_width=True)
-        with cb3: st.button("Reset", key="reset_all", on_click=lambda: st.session_state.clear(), use_container_width=True)
+        with cb3: st.button("Reset", key="reset_all", on_click=_reset_all_cb, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# -------------------- Data --------------------
+# --------------------------- LOAD DATA ---------------------------
 if st.session_state["uploaded_bytes"]:
     df = robust_read_csv(BytesIO(st.session_state["uploaded_bytes"]))
 else:
     df = robust_read_csv(st.session_state["csv_path"])
+
+# Trim / normalize column names
 df.columns=[c.strip() for c in df.columns]
+
+# Core validations
 missing=[c for c in REQUIRED_COLS if c not in df.columns]
+# we'll allow missing 'Pipeline' here because we will ensure it below
+missing = [m for m in missing if m != "Pipeline"]
 if missing:
-    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}"); st.stop()
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
+    st.stop()
+
+# Clean and normalize
 df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 df["Create Date"]=pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
 df["Create_Month"]=df["Create Date"].dt.to_period("M")
+
+# Guarantee a usable Pipeline column (fixes your earlier warning)
+df = ensure_program_column(df, target="Pipeline")
+
+# Detect other date-like columns (e.g., Payment Received Date)
 date_like_cols=detect_measure_date_columns(df)
 if not date_like_cols:
-    st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
+    st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
+    st.stop()
 
-# -------------------- Filter widgets --------------------
+# --------------------------- GLOBAL FILTER WIDGETS ---------------------------
 def _summary(values, all_flag, max_items=2):
     vals=coerce_list(values)
     if all_flag: return "All"
@@ -227,52 +266,13 @@ def unified_multifilter(label, df, colname, key_prefix):
                            label_visibility="collapsed", disabled=disabled)
             c1,c2 = st.columns(2)
             with c1: st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True,
-                               on_click=lambda: (st.session_state.__setitem__(ms_key, options),
-                                                 st.session_state.__setitem__(all_key, True)))
+                               on_click=_select_all_cb, args=(ms_key, all_key, options))
             with c2: st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True,
-                               on_click=lambda: (st.session_state.__setitem__(ms_key, []),
-                                                 st.session_state.__setitem__(all_key, False)))
+                               on_click=_clear_cb, args=(ms_key, all_key))
     all_flag=bool(st.session_state[all_key])
     selected=[v for v in coerce_list(st.session_state.get(ms_key, [])) if v in options]
     effective = options if all_flag else selected
     return all_flag, effective, f"{label}: {_summary(effective, all_flag)}"
-
-def date_range_from_preset(label, series: pd.Series, key_prefix: str):
-    presets=["Today","This month so far","Last month","Last quarter","This year","Custom"]
-    c1,c2 = st.columns([3,2])
-    with c1:
-        choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
-    with c2:
-        default_grain = {"Today":"Day","This month so far":"Day","Last month":"Month",
-                         "Last quarter":"Month","This year":"Month","Custom":"Month"}[choice]
-        st.radio("Granularity", ["Day","Week","Month"], horizontal=True,
-                 index=["Day","Week","Month"].index(default_grain), key=f"{key_prefix}_grain")
-    if choice=="Today": f,t=today_bounds()
-    elif choice=="This month so far": f,t=this_month_so_far_bounds()
-    elif choice=="Last month": f,t=last_month_bounds()
-    elif choice=="Last quarter": f,t=last_quarter_bounds()
-    elif choice=="This year": f,t=this_year_so_far_bounds()
-    else:
-        dmin,dmax=safe_minmax_date(series)
-        rng=st.date_input("Custom range",(dmin,dmax),key=f"{key_prefix}_custom")
-        f,t=(rng[0],rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin,dmax)
-    if f>t: st.error("'From' is after 'To'. Please adjust.")
-    return f,t
-
-def group_label_from_series(s: pd.Series, grain_key: str):
-    grain=st.session_state.get(grain_key,"Month")
-    if grain=="Day":  return pd.to_datetime(s).dt.date.astype(str)
-    if grain=="Week":
-        iso=pd.to_datetime(s).dt.isocalendar()
-        return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
-    return pd.to_datetime(s).dt.to_period("M").astype(str)
-
-def ensure_month_cols(base: pd.DataFrame, measures: List[str]):
-    for m in measures:
-        col=f"{m}_Month"
-        if m in base.columns and col not in base.columns:
-            base[col]=base[m].dt.to_period("M")
-    return base
 
 def scenario_filters_block(name: str, df: pd.DataFrame):
     st.markdown(f"**Scenario {name}** <span class='badge'>independent</span>", unsafe_allow_html=True)
@@ -309,7 +309,14 @@ def scenario_filters_block(name: str, df: pd.DataFrame):
                    key=f"{name}_split", default=st.session_state.get(f"{name}_split", []))
     st.toggle(f"[{name}] Country × Deal Source (Top 10)", value=st.session_state.get(f"{name}_pair", False), key=f"{name}_pair")
 
-def assemble_meta(name: str, df: pd.DataFrame) -> Dict:
+def ensure_month_cols(base: pd.DataFrame, measures):
+    for m in measures:
+        col=f"{m}_Month"
+        if m in base.columns and col not in base.columns:
+            base[col]=base[m].dt.to_period("M")
+    return base
+
+def assemble_meta(name: str, df: pd.DataFrame):
     pipe_all=st.session_state.get(f"{name}_pipe_all", True); pipe_sel=st.session_state.get(f"{name}_pipe_ms", [])
     src_all=st.session_state.get(f"{name}_src_all", True);  src_sel=st.session_state.get(f"{name}_src_ms", [])
     ctry_all=st.session_state.get(f"{name}_ctry_all", True); ctry_sel=st.session_state.get(f"{name}_ctry_ms", [])
@@ -350,7 +357,7 @@ def assemble_meta(name: str, df: pd.DataFrame) -> Dict:
         ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel
     )
 
-def compute_outputs(meta: Dict):
+def compute_outputs(meta):
     base=meta["base"]; measures=meta["measures"]
     mtd=meta["mtd"]; cohort=meta["cohort"]
     mtd_from, mtd_to = meta["mtd_from"], meta["mtd_to"]
@@ -362,7 +369,6 @@ def compute_outputs(meta: Dict):
     show_combo_pairs=meta["show_combo_pairs"]
     metrics_rows, tables, charts = [], {}, {}
 
-    # MTD
     if mtd and mtd_from and mtd_to and measures:
         in_cre=base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub=base[in_cre].copy()
@@ -405,7 +411,6 @@ def compute_outputs(meta: Dict):
             long=t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
             charts["MTD Trend"]=alt_line(long,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
 
-    # Cohort
     if cohort and coh_from and coh_to and measures:
         tmp=base.copy(); ch_flags=[]
         for m in measures:
@@ -477,19 +482,139 @@ def build_compare_delta(dfA, dfB):
     out["Δ%"]=((out["Δ"].astype(float)/denom)*100).round(1)
     return out
 
-def mk_caption(meta):
-    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
+# --------------------------- PREDICTABILITY HELPERS ---------------------------
+def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
+    """Filter by Pipeline values for AI-Coding / Math / Both, tolerant to variants."""
+    if "Pipeline" not in df.columns:
+        return df
+    if program_choice == "Both":
+        return df
 
-# -------------------- Sidebar drawer --------------------
-def store_upload(key):
-    up=st.session_state.get(key)
-    if up is not None:
-        st.session_state["uploaded_bytes"]=up.getvalue(); st.rerun()
+    s = df["Pipeline"].astype(str).str.strip().str.lower()
+    if program_choice == "AI-Coding":
+        mask = (s.eq("ai-coding") | s.str.contains(r"\bai\b") | s.str.contains("coding"))
+    elif program_choice == "Math":
+        mask = (s.eq("math") | s.str.contains("math") | s.str.contains("vedic"))
+    else:
+        mask = pd.Series(True, index=df.index)
 
+    sub = df[mask].copy()
+    if sub.empty:
+        st.warning(f"No rows matched **{program_choice}** in Pipeline. Showing all records instead.")
+        return df
+    return sub
+
+def build_daily_counts(df: pd.DataFrame, measure_col: str):
+    """Aggregate daily counts per JetLearn Deal Source (treat NaT as 0)."""
+    if measure_col not in df.columns:
+        return pd.DataFrame(columns=["ds","JetLearn Deal Source","y"])
+    data = df.dropna(subset=[measure_col]).copy()
+    data["ds"] = pd.to_datetime(data[measure_col]).dt.date
+    grp = (data.groupby(["ds","JetLearn Deal Source"])
+                .size()
+                .reset_index(name="y"))
+    return grp
+
+def add_time_features(frame: pd.DataFrame):
+    f = frame.copy()
+    f["ds"] = pd.to_datetime(f["ds"])
+    f["dow"] = f["ds"].dt.dayofweek
+    f["month"] = f["ds"].dt.month
+    f["dom"] = f["ds"].dt.day
+    f["week"] = f["ds"].dt.isocalendar().week.astype(int)
+    f["year"] = f["ds"].dt.year
+    return f
+
+def add_lags_and_rolls(frame: pd.DataFrame, group_col="JetLearn Deal Source"):
+    """Create lag/rolling features per source."""
+    f = frame.sort_values(["JetLearn Deal Source","ds"]).copy()
+    f["y_lag7"] = f.groupby(group_col)["y"].shift(7)
+    f["y_lag14"] = f.groupby(group_col)["y"].shift(14)
+    f["y_roll7"] = f.groupby(group_col)["y"].rolling(7, min_periods=1).mean().reset_index(0,drop=True)
+    f["y_roll28"] = f.groupby(group_col)["y"].rolling(28, min_periods=1).mean().reset_index(0,drop=True)
+    return f
+
+def train_forecast_model(df_counts: pd.DataFrame):
+    """Fit a simple GBM with one-hot on source; time-aware split."""
+    if df_counts.empty or df_counts["ds"].nunique() < 40:
+        return None, None, None  # not enough history
+
+    X = add_time_features(df_counts)
+    X = add_lags_and_rolls(X)
+    X = X.dropna().reset_index(drop=True)
+    if X.empty:
+        return None, None, None
+
+    # Features and target
+    features = ["dow","month","dom","week","year","y_lag7","y_lag14","y_roll7","y_roll28","JetLearn Deal Source"]
+    target = "y"
+    cat_cols = ["JetLearn Deal Source"]
+
+    ct = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
+        ],
+        remainder="passthrough"
+    )
+
+    model = SKPipeline(steps=[
+        ("prep", ct),
+        ("gbm", GradientBoostingRegressor(random_state=42))
+    ])
+
+    # Time-aware split (last 20% for test)
+    X = X.sort_values("ds")
+    split_idx = int(len(X) * 0.8)
+    train, test = X.iloc[:split_idx], X.iloc[split_idx:]
+    if train.empty or test.empty:
+        return None, None, None
+
+    model.fit(train[features], train[target])
+    pred = model.predict(test[features]).clip(min=0)
+    mae = mean_absolute_error(test[target], pred)
+    mape = float(np.mean(np.abs((test[target].values - pred) / np.maximum(1, test[target].values))) * 100)
+
+    metrics = {"MAE": round(mae, 2), "MAPE%": round(mape, 1), "train_n": len(train), "test_n": len(test)}
+    return model, features, metrics
+
+def make_future_frame(horizon: str):
+    """Create future dates for forecasting horizon."""
+    today = pd.Timestamp.today().date()
+    if horizon == "Today":
+        dates = [today]
+    elif horizon == "Tomorrow":
+        dates = [today + timedelta(days=1)]
+    elif horizon == "This month (rest)":
+        start = today
+        end = (date(today.year + (today.month==12), 1 if today.month==12 else today.month+1, 1) - timedelta(days=1))
+        dates = pd.date_range(start, end, freq="D").date.tolist()
+    elif horizon == "Next month":
+        start = date(today.year + (today.month==12), 1 if today.month==12 else today.month+1, 1)
+        end = date(start.year + (start.month==12), 1 if start.month==12 else start.month+1, 1) - timedelta(days=1)
+        dates = pd.date_range(start, end, freq="D").date.tolist()
+    else:
+        dates = [today]
+    return pd.DataFrame({"ds": dates})
+
+def predict_by_source(model, feature_cols, sources, future_dates):
+    frames=[]
+    for s in sources:
+        f = future_dates.copy()
+        f["JetLearn Deal Source"] = s
+        f = add_time_features(f)
+        # add naive lag/roll placeholders (use seasonal averages if needed -> zeros here)
+        for c in ["y_lag7","y_lag14","y_roll7","y_roll28"]:
+            f[c] = np.nan  # will be treated as missing -> we fill with 0
+        f = f.fillna(0)
+        yhat = model.predict(f[feature_cols]).clip(min=0)
+        out = f[["ds","JetLearn Deal Source"]].copy()
+        out["yhat"] = yhat
+        frames.append(out)
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=["ds","JetLearn Deal Source","yhat"])
+
+# --------------------------- SIDEBAR (Drawer) ---------------------------
 if st.session_state.get("filters_open", True):
     with st.sidebar:
         with st.expander("Scenario A controls", expanded=True):
@@ -499,383 +624,173 @@ if st.session_state.get("filters_open", True):
                 scenario_filters_block("B", df)
         with st.expander("Data source (optional)", expanded=False):
             st.caption("Upload a CSV or provide a file path. If both are given, upload takes precedence.")
-            st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=store_upload, args=("__uploader__",))
+            st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=_store_upload, args=("__uploader__",))
             st.text_input("CSV path", key="csv_path")
 
-# -------------------- Compute A/B --------------------
-metaA = assemble_meta("A", df)
-with st.spinner("Crunching scenario A…"):
-    metricsA, tablesA, chartsA = compute_outputs(metaA)
+# --------------------------- ANALYZE (A/B) ---------------------------
+def mk_caption(meta):
+    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
+            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
+            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
+            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 
-if st.session_state["show_b"]:
-    metaB = assemble_meta("B", df)
-    with st.spinner("Crunching scenario B…"):
-        metricsB, tablesB, chartsB = compute_outputs(metaB)
+# --------------------------- MAIN TABS ---------------------------
+main_tabs = st.tabs(["Analyze", "Predictability"])
 
-# -------------------- Tabs --------------------
-if st.session_state["show_b"]:
-    tabA, tabB, tabC, tabP = st.tabs(["Scenario A", "Scenario B", "Compare", "Predictability"])
-else:
-    tabA, tabP = st.tabs(["Scenario A", "Predictability"])
+with main_tabs[0]:
+    metaA = assemble_meta("A", df)
+    with st.spinner("Crunching scenario A…"):
+        metricsA, tablesA, chartsA = compute_outputs(metaA)
 
-with tabA:
-    st.markdown("<div class='section-title'>📌 KPI Overview — A</div>", unsafe_allow_html=True)
-    dfA=pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
-    st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — A</div>", unsafe_allow_html=True)
-    if not tablesA: st.info("No tables — open Filters and enable splits/leaderboards.")
+    if st.session_state["show_b"]:
+        metaB = assemble_meta("B", df)
+        with st.spinner("Crunching scenario B…"):
+            metricsB, tablesB, chartsB = compute_outputs(metaB)
+
+    if st.session_state["show_b"]:
+        tabA, tabB, tabC = st.tabs(["Scenario A", "Scenario B", "Compare"])
     else:
-        for name,frame in tablesA.items():
-            st.subheader(name); st.dataframe(frame, use_container_width=True)
-            st.download_button("Download CSV — "+name, to_csv_bytes(frame),
-                               file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
-    st.markdown("<div class='section-title'>📈 Trends — A</div>", unsafe_allow_html=True)
-    if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
-    if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
+        tabA, = st.tabs(["Scenario A"])
 
-if st.session_state["show_b"]:
-    with tabB:
-        st.markdown("<div class='section-title'>📌 KPI Overview — B</div>", unsafe_allow_html=True)
-        dfB=pd.DataFrame(metricsB); kpi_grid(dfB, "B · ")
-        st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — B</div>", unsafe_allow_html=True)
-        if not tablesB: st.info("No tables — open Filters and enable splits/leaderboards.")
+    with tabA:
+        st.markdown("<div class='section-title'>📌 KPI Overview — A</div>", unsafe_allow_html=True)
+        dfA=pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
+        st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — A</div>", unsafe_allow_html=True)
+        if not tablesA: st.info("No tables — open Filters and enable splits/leaderboards.")
         else:
-            for name,frame in tablesB.items():
+            for name,frame in tablesA.items():
                 st.subheader(name); st.dataframe(frame, use_container_width=True)
                 st.download_button("Download CSV — "+name, to_csv_bytes(frame),
-                                   file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
-        st.markdown("<div class='section-title'>📈 Trends — B</div>", unsafe_allow_html=True)
-        if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
-        if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
+                                   file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
+        st.markdown("<div class='section-title'>📈 Trends — A</div>", unsafe_allow_html=True)
+        if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
+        if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
+        st.caption("**Scenario A** — " + mk_caption(metaA))
+        st.caption("Excluded globally: 1.2 Invalid Deal")
 
-    with tabC:
-        st.markdown("<div class='section-title'>🧠 Smart Compare (A vs B)</div>", unsafe_allow_html=True)
-        dfA=pd.DataFrame(metricsA); dfB=pd.DataFrame(metricsB)
-        if dfA.empty or dfB.empty: st.info("Turn on KPIs for both scenarios to enable compare.")
-        else:
-            cmp=build_compare_delta(dfA, dfB)
-            if cmp.empty: st.info("Adjust scenarios to produce comparable KPIs.")
+    if st.session_state["show_b"]:
+        with tabB:
+            st.markdown("<div class='section-title'>📌 KPI Overview — B</div>", unsafe_allow_html=True)
+            dfB=pd.DataFrame(metricsB); kpi_grid(dfB, "B · ")
+            st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — B</div>", unsafe_allow_html=True)
+            if not tablesB: st.info("No tables — open Filters and enable splits/leaderboards.")
             else:
-                st.dataframe(cmp, use_container_width=True)
-                try:
-                    if set(metaA["measures"]) == set(metaB["measures"]):
-                        sub=cmp[cmp["Metric"].str.startswith("Count on '")].copy()
-                        if not sub.empty:
-                            sub["Measure"]=sub["Metric"].str.extract(r"Count on '(.+)'")
-                            a_long=sub.rename(columns={"A":"Value"})[["Measure","Scope","Value"]]; a_long["Scenario"]="A"
-                            b_long=sub.rename(columns={"B":"Value"})[["Measure","Scope","Value"]]; b_long["Scenario"]="B"
-                            long=pd.concat([a_long,b_long], ignore_index=True)
-                            ch=alt.Chart(long).mark_bar().encode(
-                                x=alt.X("Scope:N", title=None), y=alt.Y("Value:Q"),
-                                color=alt.Color("Scenario:N", scale=alt.Scale(range=PALETTE[:2])),
-                                column=alt.Column("Measure:N", header=alt.Header(title=None, labelAngle=0)),
-                                tooltip=["Measure","Scenario","Scope","Value"]
-                            ).properties(height=260)
-                            st.altair_chart(ch, use_container_width=True)
-                except Exception:
-                    pass
+                for name,frame in tablesB.items():
+                    st.subheader(name); st.dataframe(frame, use_container_width=True)
+                    st.download_button("Download CSV — "+name, to_csv_bytes(frame),
+                                       file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
+            st.markdown("<div class='section-title'>📈 Trends — B</div>", unsafe_allow_html=True)
+            if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
+            if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
+            st.caption("**Scenario B** — " + mk_caption(metaB))
+            st.caption("Excluded globally: 1.2 Invalid Deal")
 
-# -------------------- Predictability Tab --------------------
-def _resample_counts(df_in: pd.DataFrame, date_col: str, grain: str, by_source: bool):
-    # grain -> Pandas rule
-    rule = "D" if grain=="Day" else ("W-MON" if grain=="Week" else "MS")
-    cols = [date_col]
-    if by_source: cols += ["JetLearn Deal Source"]
-    s = df_in[cols].dropna(subset=[date_col]).copy()
-    s["_dt"] = pd.to_datetime(s[date_col])
-    if by_source:
-        g = (s.groupby([pd.Grouper(key="_dt", freq=rule), "JetLearn Deal Source"])
-               .size().reset_index(name="y"))
-        # complete each source's timeline
-        frames=[]
-        for src, sub in g.groupby("JetLearn Deal Source"):
-            full_idx = pd.date_range(sub["_dt"].min(), sub["_dt"].max(), freq=rule)
-            sub = sub.set_index("_dt").reindex(full_idx).fillna(0).rename_axis("_dt").reset_index()
-            sub["JetLearn Deal Source"]=src
-            frames.append(sub)
-        g = pd.concat(frames, ignore_index=True)
-    else:
-        g = (s.groupby(pd.Grouper(key="_dt", freq=rule))
-               .size().reset_index(name="y"))
-        full_idx = pd.date_range(g["_dt"].min(), g["_dt"].max(), freq=rule)
-        g = g.set_index("_dt").reindex(full_idx).fillna(0).rename_axis("_dt").reset_index()
-    g["y"] = g["y"].astype(float)
-    return g, rule
-
-def _lag_features(frame: pd.DataFrame, grain: str) -> pd.DataFrame:
-    # simple supervised lags + time features
-    lags = [1,2,3]
-    if grain=="Day": lags += [7,14,28]
-    dfX = frame.copy()
-    for L in lags:
-        dfX[f"lag_{L}"] = dfX["y"].shift(L)
-    # time features
-    dt = pd.to_datetime(dfX["_dt"])
-    dfX["month"] = dt.dt.month
-    if grain=="Day":
-        dfX["dow"]   = dt.dt.dayofweek
-        dfX["week"]  = dt.dt.isocalendar().week.astype(int)
-    elif grain=="Week":
-        dfX["week"]  = dt.dt.isocalendar().week.astype(int)
-    dfX = dfX.dropna().reset_index(drop=True)
-    return dfX
-
-def _walk_forward_backtest(dfX: pd.DataFrame, n_splits: int = 5) -> Tuple[float,float,float,float]:
-    # rolling CV (de-biased)
-    if len(dfX) < 40:  # small data guard
-        n_splits = max(2, min(4, len(dfX)//10))
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    maes, mapes = [], []
-    X = dfX.drop(columns=["y","_dt"])
-    y = dfX["y"].values
-    for train_idx, test_idx in tscv.split(X):
-        Xtr, Xte = X.iloc[train_idx], X.iloc[test_idx]
-        ytr, yte = y[train_idx], y[test_idx]
-        pipe = SkPipeline([
-            ("sc", StandardScaler(with_mean=False)),
-            ("rf", RandomForestRegressor(n_estimators=300, random_state=42))
-        ])
-        pipe.fit(Xtr, ytr)
-        pred = np.maximum(0, pipe.predict(Xte))  # non-negative
-        maes.append(mean_absolute_error(yte, pred))
-        denom = np.where(yte==0, np.nan, yte)
-        mape = np.nanmean(np.abs((pred - yte)/denom))*100
-        mapes.append(mape)
-    mae = float(np.nanmean(maes))
-    mape = float(np.nanmean(mapes))
-    # 95% CI via fold errors
-    mae_ci = 1.96*np.nanstd(maes, ddof=1)/np.sqrt(len(maes)) if len(maes)>1 else 0.0
-    mape_ci = 1.96*np.nanstd(mapes, ddof=1)/np.sqrt(len(mapes)) if len(mapes)>1 else 0.0
-    return mae, mae_ci, mape, mape_ci
-
-def _fit_and_forecast(dfX: pd.DataFrame, horizon: int) -> np.ndarray:
-    Xfull = dfX.drop(columns=["y","_dt"]).copy()
-    yfull = dfX["y"].values
-    pipe = SkPipeline([
-        ("sc", StandardScaler(with_mean=False)),
-        ("rf", RandomForestRegressor(n_estimators=300, random_state=42))
-    ])
-    pipe.fit(Xfull, yfull)
-    # recursive (use last rows to build lags)
-    df_for = dfX.copy()
-    preds = []
-    for _ in range(horizon):
-        # build next-row features from last known row
-        last = df_for.iloc[-1:].copy()
-        new = last.copy()
-        # shift lags
-        for col in [c for c in df_for.columns if c.startswith("lag_")]:
-            L = int(col.split("_")[1])
-            # lag_L (new) = lag_{L-1} (last) or y for L==1
-            if L==1:
-                new[col] = last["y"].values
+        with tabC:
+            st.markdown("<div class='section-title'>🧠 Smart Compare (A vs B)</div>", unsafe_allow_html=True)
+            dfA=pd.DataFrame(metricsA); dfB=pd.DataFrame(metricsB)
+            if dfA.empty or dfB.empty: st.info("Turn on KPIs for both scenarios to enable compare.")
             else:
-                prev = f"lag_{L-1}"
-                new[col] = last[prev].values
-        # time step forward (month/week/dow approximations)
-        new["_dt"] = pd.to_datetime(last["_dt"].values[0]) + (pd.Timedelta(days=1))
-        new["month"] = int(pd.to_datetime(new["_dt"]).dt.month)
-        if "dow" in new.columns:
-            new["dow"] = int((int(last["dow"]) + 1) % 7)
-        if "week" in new.columns:
-            new["week"] = int(pd.to_datetime(new["_dt"]).dt.isocalendar().week)
-        Xnew = new.drop(columns=["y","_dt"])
-        yhat = float(pipe.predict(Xnew)[0])
-        yhat = max(0.0, yhat)
-        new["y"] = yhat
-        preds.append(yhat)
-        df_for = pd.concat([df_for, new], ignore_index=True)
-    return np.array(preds, dtype=float)
+                cmp=build_compare_delta(dfA, dfB)
+                if cmp.empty: st.info("Adjust scenarios to produce comparable KPIs.")
+                else:
+                    st.dataframe(cmp, use_container_width=True)
+                    try:
+                        if set(metaA["measures"]) == set(metaB["measures"]):
+                            sub=cmp[cmp["Metric"].str.startswith("Count on '")].copy()
+                            if not sub.empty:
+                                sub["Measure"]=sub["Metric"].str.extract(r"Count on '(.+)'")
+                                a_long=sub.rename(columns={"A":"Value"})[["Measure","Scope","Value"]]; a_long["Scenario"]="A"
+                                b_long=sub.rename(columns={"B":"Value"})[["Measure","Scope","Value"]]; b_long["Scenario"]="B"
+                                long=pd.concat([a_long,b_long], ignore_index=True)
+                                ch=alt.Chart(long).mark_bar().encode(
+                                    x=alt.X("Scope:N", title=None), y=alt.Y("Value:Q"),
+                                    color=alt.Color("Scenario:N", scale=alt.Scale(range=PALETTE[:2])),
+                                    column=alt.Column("Measure:N", header=alt.Header(title=None, labelAngle=0)),
+                                    tooltip=["Measure","Scenario","Scope","Value"]
+                                ).properties(height=260)
+                                st.altair_chart(ch, use_container_width=True)
+                    except Exception:
+                        pass
 
-def _preset_to_horizon(grain: str, choice: str) -> Tuple[pd.Timestamp, int, List[str]]:
-    today = pd.Timestamp.today().normalize()
-    if grain=="Day":
-        if choice=="Today":    start, periods, idx = today, 1, [str(today.date())]
-        elif choice=="Tomorrow": 
-            d = today + pd.Timedelta(days=1); start, periods, idx = d, 1, [str(d.date())]
-        elif choice=="This Month":
-            start = today.replace(day=today.day)  # next steps will fill
-            last_day = (today.replace(day=1) + pd.offsets.MonthEnd(1))
-            days = (last_day - today).days + 1
-            periods = days; idx = [str((today + pd.Timedelta(days=i)).date()) for i in range(days)]
-        elif choice=="Next Month":
-            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
-            last_next = (first_next + pd.offsets.MonthEnd(1))
-            days = (last_next - first_next).days + 1
-            periods = days; idx = [str((first_next + pd.Timedelta(days=i)).date()) for i in range(days)]
-        else:  # Custom handled outside
-            start, periods, idx = today, 1, [str(today.date())]
-    elif grain=="Week":
-        # Forecast 1 period for This/Next month as weekly sums
-        if choice in ("Today","Tomorrow"): choice="This Month"
-        if choice=="This Month":
-            start = today
-            last_day = (today.replace(day=1) + pd.offsets.MonthEnd(1))
-            weeks = int(np.ceil((last_day - today).days/7))+1
-            periods = max(1, weeks)
-            idx = [f"{(today + pd.Timedelta(weeks=i)).date()}" for i in range(periods)]
-        else:  # Next Month
-            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
-            weeks = 4
-            periods = weeks
-            idx = [f"{(first_next + pd.Timedelta(weeks=i)).date()}" for i in range(periods)]
-    else:  # Month grain
-        if choice in ("Today","Tomorrow"): choice="This Month"
-        if choice=="This Month":
-            start = today.replace(day=1)
-            periods = 1; idx=[str(start.date())]
-        else: # Next Month
-            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
-            start = first_next
-            periods = 1; idx=[str(first_next.date())]
-    return pd.to_datetime(start), int(periods), idx
+# --------------------------- PREDICTABILITY TAB ---------------------------
+with main_tabs[1]:
+    st.markdown("### 🔮 Predictability (JetLearn Deal Source totals)")
+    st.caption("Train a simple model on historical **daily** counts (per deal source), then forecast by horizon. "
+               "Program filter uses the **Pipeline** column (robust to naming variants).")
 
-with tabP:
-    st.markdown("### 🔮 Predictability")
-    with st.expander("Settings", expanded=True):
-        # Base: use Scenario A global filters as context
-        base_pred = metaA["base"].copy()
-        # Measure to predict (default Payment Received Date if present)
+    # Controls
+    pc1, pc2, pc3 = st.columns([2,2,2])
+    with pc1:
+        program_choice = st.selectbox("Program", ["AI-Coding", "Math", "Both"], index=2)
+    with pc2:
+        # Choose the date column representing an "enrollment" / event (default Payment Received Date if present)
         default_measure = "Payment Received Date" if "Payment Received Date" in date_like_cols else date_like_cols[0]
-        target_measure = st.selectbox("Target date to predict (count of events)", options=date_like_cols,
-                                      index=date_like_cols.index(default_measure))
-        # Program filter via Pipeline
-        prog_choice = st.radio("Program (from Pipeline)", ["Both", "AI-Coding", "Math"], horizontal=True)
-        base_pred = subset_for_program(base_pred, prog_choice)
+        pred_measure = st.selectbox("Event date column to count", date_like_cols, index=date_like_cols.index(default_measure))
+    with pc3:
+        horizon = st.selectbox("Forecast horizon", ["Today","Tomorrow","This month (rest)","Next month"], index=2)
 
-        # Grain + horizon
-        grain = st.radio("Forecast granularity", ["Day","Week","Month"], horizontal=True, index=0)
-        horizon_choice = st.radio("Horizon preset", ["Today","Tomorrow","This Month","Next Month","Custom"], horizontal=True, index=2)
-        custom_range = None
-        if horizon_choice=="Custom":
-            dmin, dmax = safe_minmax_date(base_pred[target_measure].dropna())
-            custom_range = st.date_input("Custom forecast window (start → end)", (dmin, dmax))
-        split_by_source = st.toggle("Split by JetLearn Deal Source", value=True)
-        st.caption("Backtest uses walk-forward rolling windows with no look-ahead, scalers fit on train only, and non-negative predictions.")
+    run_btn = st.button("Run prediction", type="primary")
+    if run_btn:
+        # Apply program subset safely
+        df_prog = subset_for_program(df, program_choice)
 
-    # Build training series
-    tmp = base_pred.dropna(subset=[target_measure]).copy()
-    if tmp.empty:
-        st.warning("No rows for selected target. Pick another date column.")
-    else:
-        if split_by_source:
-            # per-source
-            series, rule = _resample_counts(tmp, target_measure, grain, by_source=True)
-            outputs = []
-            charts = []
-            metrics_list = []
-            for src, sub in series.groupby("JetLearn Deal Source"):
-                fX = _lag_features(sub[["_dt","y"]].copy(), grain)
-                if fX.empty or fX["y"].sum()==0:
-                    continue
-                mae, mae_ci, mape, mape_ci = _walk_forward_backtest(fX)
-                # Forecast horizon
-                if horizon_choice!="Custom":
-                    start_dt, periods, idx = _preset_to_horizon(grain, horizon_choice)
-                else:
-                    if isinstance(custom_range,(tuple,list)) and len(custom_range)==2:
-                        start_dt = pd.to_datetime(custom_range[0])
-                        end_dt   = pd.to_datetime(custom_range[1])
-                        if grain=="Day":
-                            periods = max(1, (end_dt - start_dt).days + 1)
-                        elif grain=="Week":
-                            periods = max(1, int(np.ceil((end_dt - start_dt).days/7)))
-                        else:
-                            # months between
-                            periods = max(1, (end_dt.year - start_dt.year)*12 + (end_dt.month - start_dt.month) + 1)
-                        idx = [str((start_dt + (pd.offsets.Day(i) if grain=="Day" else (pd.offsets.Week(i) if grain=="Week" else pd.offsets.MonthBegin(i)))).date())
-                               for i in range(periods)]
-                    else:
-                        start_dt, periods, idx = _preset_to_horizon(grain, "This Month")
-                preds = _fit_and_forecast(fX, periods)
-                df_src = pd.DataFrame({"When": idx, "Predicted Count": preds.astype(int)})
-                df_src.insert(0, "JetLearn Deal Source", src)
-                outputs.append(df_src)
-                metrics_list.append({"Source": src, "MAE": round(mae,2), "MAE±95%": round(mae_ci,2),
-                                     "MAPE%": round(mape,1), "MAPE±95%": round(mape_ci,1)})
-                # Chart
-                hist = sub.rename(columns={"_dt":"When", "y":"Count"}).copy()
-                hist["When"] = pd.to_datetime(hist["When"])
-                last_hist = hist.iloc[-min(len(hist), 100):]  # last window
-                fore = pd.DataFrame({"When": pd.to_datetime(idx), "Count": preds})
-                ch = alt.Chart(last_hist).mark_line().encode(
-                    x=alt.X("When:T", title=None), y=alt.Y("Count:Q", title="Count"),
-                    tooltip=[alt.Tooltip("When:T"), alt.Tooltip("Count:Q")]
-                ).properties(height=220)
-                ch2 = alt.Chart(fore).mark_line(color="#2563eb", strokeDash=[4,3]).encode(
-                    x="When:T", y="Count:Q", tooltip=["When:T","Count:Q"]
-                )
-                charts.append((src, ch + ch2))
-            if not outputs:
-                st.warning("No per-source data to forecast. Try turning off 'Split by source' or pick another target.")
-            else:
-                st.subheader("Per-source forecast")
-                out = pd.concat(outputs, ignore_index=True)
-                st.dataframe(out, use_container_width=True)
-                st.download_button("Download per-source forecast CSV", to_csv_bytes(out),
-                                   file_name="forecast_per_source.csv", mime="text/csv")
-                st.subheader("Per-source backtest metrics")
-                met = pd.DataFrame(metrics_list).sort_values("MAE")
-                st.dataframe(met, use_container_width=True)
-                st.subheader("Per-source charts")
-                for src, chart in charts:
-                    st.markdown(f"**{src}**")
-                    st.altair_chart(chart, use_container_width=True)
-                # Overall aggregate from per-source predictions
-                agg = out.groupby("When", as_index=False)["Predicted Count"].sum()
-                st.subheader("Overall predicted total")
-                st.dataframe(agg, use_container_width=True)
-                st.download_button("Download overall forecast CSV", to_csv_bytes(agg),
-                                   file_name="forecast_overall.csv", mime="text/csv")
+        # Build daily counts by deal source
+        daily = build_daily_counts(df_prog, pred_measure)
+        if daily.empty:
+            st.warning("Not enough data in the chosen event column to model. Try a different measure.")
         else:
-            # overall only
-            series, rule = _resample_counts(tmp, target_measure, grain, by_source=False)
-            fX = _lag_features(series[["_dt","y"]].copy(), grain)
-            if fX.empty or fX["y"].sum()==0:
-                st.warning("Not enough history to train. Try another target or grain.")
-            else:
-                mae, mae_ci, mape, mape_ci = _walk_forward_backtest(fX)
-                if horizon_choice!="Custom":
-                    start_dt, periods, idx = _preset_to_horizon(grain, horizon_choice)
-                else:
-                    dmin, dmax = safe_minmax_date(tmp[target_measure])
-                    rng = st.date_input("Custom forecast window (start → end)", (dmin, dmax), key="pred_custom")
-                    if isinstance(rng,(tuple,list)) and len(rng)==2:
-                        start_dt = pd.to_datetime(rng[0]); end_dt = pd.to_datetime(rng[1])
-                        if grain=="Day":
-                            periods = max(1, (end_dt - start_dt).days + 1)
-                        elif grain=="Week":
-                            periods = max(1, int(np.ceil((end_dt - start_dt).days/7)))
-                        else:
-                            periods = max(1, (end_dt.year - start_dt.year)*12 + (end_dt.month - start_dt.month) + 1)
-                        idx = [str((start_dt + (pd.offsets.Day(i) if grain=="Day" else (pd.offsets.Week(i) if grain=="Week" else pd.offsets.MonthBegin(i)))).date())
-                               for i in range(periods)]
-                    else:
-                        start_dt, periods, idx = _preset_to_horizon(grain, "This Month")
-                preds = _fit_and_forecast(fX, periods)
-                out = pd.DataFrame({"When": idx, "Predicted Count": preds.astype(int)})
-                st.subheader("Forecast (overall)")
-                st.dataframe(out, use_container_width=True)
-                st.download_button("Download forecast CSV", to_csv_bytes(out),
-                                   file_name="forecast_overall.csv", mime="text/csv")
-                st.markdown("**Backtest (de-biased)**")
-                st.write(f"MAE: **{mae:.2f} ± {mae_ci:.2f}**, MAPE: **{mape:.1f}% ± {mape_ci:.1f}%** (95% CI)")
-                # Chart
-                hist = series.rename(columns={"_dt":"When", "y":"Count"}).copy()
-                hist["When"] = pd.to_datetime(hist["When"])
-                last_hist = hist.iloc[-min(len(hist), 120):]
-                fore = pd.DataFrame({"When": pd.to_datetime(idx), "Count": preds})
-                ch = alt.Chart(last_hist).mark_line().encode(
-                    x=alt.X("When:T", title=None), y=alt.Y("Count:Q", title="Count"),
-                    tooltip=[alt.Tooltip("When:T"), alt.Tooltip("Count:Q")]
-                ).properties(height=260)
-                ch2 = alt.Chart(fore).mark_line(color="#2563eb", strokeDash=[4,3]).encode(
-                    x="When:T", y="Count:Q", tooltip=["When:T","Count:Q"]
-                )
-                st.altair_chart(ch + ch2, use_container_width=True)
+            # Train model
+            with st.spinner("Training model & backtesting..."):
+                model, feats, back_metrics = train_forecast_model(daily)
 
-# -------------------- Footers --------------------
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption("**Scenario A** — " + mk_caption(metaA))
-if st.session_state["show_b"]:
-    st.caption("**Scenario B** — " + mk_caption(assemble_meta("B", df)))
-st.caption("Excluded globally: 1.2 Invalid Deal")
+            # If model is None, fallback to naive average (last 7 days)
+            if model is None:
+                st.info("Not enough history to train a model. Falling back to a 7-day average baseline.")
+                # naive per source
+                naive = daily.groupby("JetLearn Deal Source").tail(7).groupby("JetLearn Deal Source")["y"].mean().reset_index()
+                naive = naive.rename(columns={"y":"naive_mean"})
+                future_dates = make_future_frame(horizon)
+                if future_dates.empty:
+                    st.info("No future dates formed for the selected horizon.")
+                else:
+                    # Expand across sources
+                    sources = sorted(daily["JetLearn Deal Source"].unique())
+                    out = pd.MultiIndex.from_product([future_dates["ds"], sources], names=["ds","JetLearn Deal Source"]).to_frame(index=False)
+                    out = out.merge(naive, on="JetLearn Deal Source", how="left").fillna(0)
+                    out["yhat"] = out["naive_mean"].clip(lower=0).round(2)
+                    # Present
+                    st.markdown("#### Forecast (Naive baseline)")
+                    st.dataframe(out[["ds","JetLearn Deal Source","yhat"]], use_container_width=True)
+                    total = out.groupby("ds")["yhat"].sum().reset_index()
+                    ch = alt.Chart(total).mark_bar().encode(x="ds:T", y="yhat:Q", tooltip=["ds","yhat"])
+                    st.altair_chart(ch, use_container_width=True)
+            else:
+                # Show backtest metrics
+                st.markdown("#### Backtest (time-aware split)")
+                st.write(pd.DataFrame([back_metrics]))
+                # Forecast with GBM
+                future_dates = make_future_frame(horizon)
+                sources = sorted(daily["JetLearn Deal Source"].unique())
+                fc = predict_by_source(model, feats, sources, future_dates)
+                if fc.empty:
+                    st.info("Could not produce forecast for the selected horizon.")
+                else:
+                    fc["yhat"] = fc["yhat"].round(2)
+                    st.markdown("#### Forecast by Deal Source")
+                    st.dataframe(fc, use_container_width=True)
+                    totals = fc.groupby("ds")["yhat"].sum().reset_index()
+                    st.markdown("#### Total Forecast")
+                    st.dataframe(totals, use_container_width=True)
+                    ch = alt.Chart(totals).mark_line(point=True).encode(
+                        x="ds:T", y="yhat:Q", tooltip=["ds","yhat"]
+                    ).properties(height=260)
+                    st.altair_chart(ch, use_container_width=True)
+
+    with st.expander("Notes", expanded=False):
+        st.markdown("""
+- **Counts** are daily occurrences in the chosen event date column (e.g. *Payment Received Date*), grouped by **JetLearn Deal Source**.
+- The model uses calendar features (DOW, week, month), plus simple lags/rolling means; it’s trained with a time-aware split.
+- If there isn’t enough history, the app falls back to a **7-day mean** per source.
+- ‘Program’ is read from the **Pipeline** column; common synonyms (Program/Programme/Course/Track) are auto-detected.
+        """)
