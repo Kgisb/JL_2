@@ -1,6 +1,6 @@
-# app_compare_pro_tabs_counsellor.py
-# A/B analyzer with Scenario B in its own tab + Compare tab
-# Adds Student/Academic Counsellor to "Split by" and leaderboards (Top 5 Counsellors)
+# app_compare_pro_tabs_counsellor_grain.py
+# A/B analyzer — Tabs UI, global "All→type-to-search" filters, multi-measure, presets,
+# ALWAYS-on granularity (Day/Week/Month) for all date presets, splits incl. Counsellor.
 
 import streamlit as st
 import pandas as pd
@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ---------- Page ----------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Tabs + Counsellor)", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Granularity)", layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{ --text:#0f172a; --muted:#6b7280; --blue-600:#2563eb; --blue-700:#1d4ed8; --border: rgba(15,23,42,.10); --card:#fff; }
@@ -74,29 +74,59 @@ def last_month_bounds():
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
 def quarter_start(y, q): return date(y, 3*(q-1)+1, 1)
+def quarter_end(y, q):
+    if q == 4: return date(y,12,31)
+    return quarter_start(y, q+1) - timedelta(days=1)
 def last_quarter_bounds():
     t = pd.Timestamp.today().date(); q = (t.month - 1)//3 + 1
     if q == 1: y, lq = t.year - 1, 4
     else:      y, lq = t.year, q - 1
-    start = quarter_start(y, lq)
-    next_start = quarter_start(y+1, 1) if lq == 4 else quarter_start(y, lq+1)
-    return start, (next_start - timedelta(days=1))
+    return quarter_start(y, lq), quarter_end(y, lq)
 def this_year_so_far_bounds(): t = pd.Timestamp.today().date(); return date(t.year,1,1), t
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
+    """
+    Always shows a granularity picker (Day/Week/Month) for *all* presets.
+    For 'Custom', also shows a date range picker.
+    """
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
-    choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
-    if choice == "Today": f,t = today_bounds(); return f,t,choice,"Day"
-    if choice == "This month so far": f,t = this_month_so_far_bounds(); return f,t,choice,"Day"
-    if choice == "Last month": f,t = last_month_bounds(); return f,t,choice,"Month"
-    if choice == "Last quarter": f,t = last_quarter_bounds(); return f,t,choice,"Month"
-    if choice == "This year": f,t = this_year_so_far_bounds(); return f,t,choice,"Month"
-    dmin,dmax = safe_minmax_date(series)
-    rng = st.date_input("Custom range", (dmin,dmax), key=f"{key_prefix}_custom")
-    grain = st.radio("Granularity", ["Day-wise","Week-wise","Month-wise"], horizontal=True, key=f"{key_prefix}_grain")
-    grain = {"Day-wise":"Day","Week-wise":"Week","Month-wise":"Month"}[grain]
-    if isinstance(rng,(tuple,list)) and len(rng)==2: return rng[0], rng[1], choice, grain
-    return dmin, dmax, choice, grain
+    # Defaults per preset to keep it smart but editable:
+    default_grain_map = {
+        "Today": "Day",
+        "This month so far": "Day",
+        "Last month": "Month",
+        "Last quarter": "Month",
+        "This year": "Month",
+        "Custom": "Month",
+    }
+    c1, c2 = st.columns([3,2])
+    with c1:
+        choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
+    with c2:
+        default_grain = default_grain_map.get(choice, "Month")
+        grain = st.radio("Granularity", ["Day","Week","Month"], horizontal=True,
+                         index=["Day","Week","Month"].index(default_grain),
+                         key=f"{key_prefix}_grain")
+
+    if choice == "Today":
+        f,t = today_bounds()
+    elif choice == "This month so far":
+        f,t = this_month_so_far_bounds()
+    elif choice == "Last month":
+        f,t = last_month_bounds()
+    elif choice == "Last quarter":
+        f,t = last_quarter_bounds()
+    elif choice == "This year":
+        f,t = this_year_so_far_bounds()
+    else:
+        dmin,dmax = safe_minmax_date(series)
+        rng = st.date_input("Custom range", (dmin,dmax), key=f"{key_prefix}_custom")
+        if isinstance(rng,(tuple,list)) and len(rng)==2: f,t = rng[0], rng[1]
+        else: f,t = dmin, dmax
+
+    if f > t:
+        st.error("'From' is after 'To'. Please adjust.")
+    return f, t, choice, grain
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes: return df.to_csv(index=False).encode("utf-8")
 
@@ -110,8 +140,8 @@ with st.container():
     st.markdown('<div class="nav">', unsafe_allow_html=True)
     c1,c2,c3 = st.columns([6,3,3])
     with c1:
-        st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Tabs UI)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub">Scenario B in a separate tab • All→untick→type to search • multi-measure • presets • splits</div>', unsafe_allow_html=True)
+        st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Granularity)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub">Scenario B in its own tab • All→untick→type to search • multi-measure • presets with granularity • splits</div>', unsafe_allow_html=True)
     with c2:
         if st.button("Clone A → B", key="clone_ab"):
             for k in list(st.session_state.keys()):
@@ -160,15 +190,8 @@ def _summary(values, all_flag, max_items=2):
     return s
 
 def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
-    """
-    - All toggle: when ON, treat as “all options”.
-    - Multiselect: native type-to-search; supports 1..N values.
-    - No widget-state writes during render (only via buttons + rerun).
-    """
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
-    all_key = f"{key_prefix}_all"
-    ms_key  = f"{key_prefix}_ms"
-
+    all_key = f"{key_prefix}_all"; ms_key  = f"{key_prefix}_ms"
     if all_key not in st.session_state: st.session_state[all_key] = True
     if ms_key  not in st.session_state: st.session_state[ms_key]  = options.copy()
 
@@ -180,28 +203,20 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
     ctx = st.popover(header) if hasattr(st, "popover") else st.expander(header, expanded=False)
     with ctx:
         left, right = st.columns([1, 3])
-        with left:
-            st.checkbox("All", value=all_flag, key=all_key)
+        with left: st.checkbox("All", value=all_flag, key=all_key)
         with right:
             disabled = st.session_state[all_key]
-            st.multiselect(
-                label, options=options, default=selected,
-                key=ms_key, placeholder=f"Type to search {label.lower()}…",
-                label_visibility="collapsed", disabled=disabled
-            )
+            st.multiselect(label, options=options, default=selected, key=ms_key,
+                           placeholder=f"Type to search {label.lower()}…",
+                           label_visibility="collapsed", disabled=disabled)
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True):
-                    st.session_state[ms_key]  = options.copy()
-                    st.session_state[all_key] = True
-                    st.rerun()
+                    st.session_state[ms_key]  = options.copy(); st.session_state[all_key] = True; st.rerun()
             with c2:
                 if st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True):
-                    st.session_state[ms_key]  = []
-                    st.session_state[all_key] = False
-                    st.rerun()
+                    st.session_state[ms_key]  = []; st.session_state[all_key] = False; st.rerun()
 
-    # Refresh effective after possible user changes
     all_flag = bool(st.session_state[all_key])
     selected = coerce_list(st.session_state.get(ms_key, []))
     effective = options if all_flag else selected
@@ -210,16 +225,10 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
 def filters_toolbar(name: str, df: pd.DataFrame):
     st.markdown('<div class="filters-bar">', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns([2,2,2,2,1])
-
-    with c1:
-        pipe_all, pipe_sel, s1 = unified_multifilter("Pipeline", df, "Pipeline", f"{name}_pipe")
-    with c2:
-        src_all,  src_sel,  s2 = unified_multifilter("Deal Source", df, "JetLearn Deal Source", f"{name}_src")
-    with c3:
-        ctry_all, ctry_sel, s3 = unified_multifilter("Country", df, "Country", f"{name}_ctry")
-    with c4:
-        cslr_all, cslr_sel, s4 = unified_multifilter("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
-
+    with c1: pipe_all, pipe_sel, s1 = unified_multifilter("Pipeline", df, "Pipeline", f"{name}_pipe")
+    with c2: src_all,  src_sel,  s2 = unified_multifilter("Deal Source", df, "JetLearn Deal Source", f"{name}_src")
+    with c3: ctry_all, ctry_sel, s3 = unified_multifilter("Country", df, "Country", f"{name}_ctry")
+    with c4: cslr_all, cslr_sel, s4 = unified_multifilter("Counsellor", df, "Student/Academic Counsellor", f"{name}_cslr")
     with c5:
         if st.button("Clear", key=f"{name}_clear", use_container_width=True):
             for prefix, col in [
@@ -507,7 +516,6 @@ with tabC:
         else:
             st.dataframe(cmp, use_container_width=True)
             try:
-                # If both scenarios measure the same set, show bar compare by measure
                 if set(metaA["measures"]) == set(metaB["measures"]):
                     sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
                     if not sub.empty:
