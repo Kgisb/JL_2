@@ -1,11 +1,4 @@
-# app_drawer_ui_v2.py
-# Minimal, world-class drawer UI:
-# - Top app bar with hamburger to open drawer (filters)
-# - Single "← Close drawer" inside sidebar (no duplicates)
-# - Data source (upload/path) tucked at bottom of drawer, collapsed
-# - Scenario B appears only when enabled (top-bar button). Otherwise only Scenario A tab.
-# - Safe session_state usage (clone via request flag; callbacks for state writes).
-
+# app_drawer_ui_v2.py (fixed: robust multiselect defaults + minimal drawer UI)
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -31,7 +24,6 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
   background:#111827; color:#e5e7eb; padding:6px 10px; border-radius:10px; cursor:pointer;
   border:1px solid #1f2937;
 }
-.topbar .btn.primary { background:#1d4ed8; border-color:#1e40af; color:#fff; }
 .section-title { font-weight:800; margin:.25rem 0 .6rem; color:var(--text); }
 .kpi { padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--card); }
 .kpi .label { color:var(--muted); font-size:.78rem; margin-bottom:4px; }
@@ -43,7 +35,6 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .sidebar-close { background:#fff; border:1px solid var(--border); color:#111; padding:6px 10px; border-radius:10px; cursor:pointer; width:100%; }
 .sidebar-caption { color:#111; font-weight:700; }
 .popcap { font-size:.78rem; color:var(--muted); margin-top:2px; }
-.filters-note { color:var(--muted); font-size:.82rem; margin:4px 0 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -54,7 +45,6 @@ PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0
 # ---------------- Clone helpers (safe) ----------------
 def _request_clone(direction: str):
     st.session_state["__clone_request__"] = direction
-    # If cloning to B, ensure B is visible
     if direction == "A2B":
         st.session_state["show_b"] = True
 
@@ -135,13 +125,14 @@ def date_range_from_preset(label, series: pd.Series, key_prefix: str):
     }
     c1, c2 = st.columns([3,2])
     with c1:
-        choice = st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
+        st.radio(label, presets, horizontal=True, key=f"{key_prefix}_preset")
     with c2:
-        default_grain = default_grain_map.get(choice, "Month")
+        default_grain = default_grain_map.get(st.session_state.get(f"{key_prefix}_preset","This month so far"), "Month")
         st.radio("Granularity", ["Day","Week","Month"], horizontal=True,
                  index=["Day","Week","Month"].index(default_grain),
                  key=f"{key_prefix}_grain")
 
+    choice = st.session_state.get(f"{key_prefix}_preset","This month so far")
     if choice == "Today":               f,t = today_bounds()
     elif choice == "This month so far": f,t = this_month_so_far_bounds()
     elif choice == "Last month":        f,t = last_month_bounds()
@@ -151,9 +142,7 @@ def date_range_from_preset(label, series: pd.Series, key_prefix: str):
         dmin,dmax = safe_minmax_date(series)
         rng = st.date_input("Custom range", (dmin,dmax), key=f"{key_prefix}_custom")
         f,t = (rng[0], rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin, dmax)
-
-    if f > t:
-        st.error("'From' is after 'To'. Please adjust.")
+    if f > t: st.error("'From' is after 'To'. Please adjust.")
     return f, t
 
 def alt_line(df, x, y, color=None, tooltip=None, height=260):
@@ -208,7 +197,7 @@ with st.container():
             st.button("Reset", key="reset_all", on_click=_reset_all_cb, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------- Data (load first so downstream UI works) ----------------
+# ---------------- Data ----------------
 if st.session_state["uploaded_bytes"]:
     df = robust_read_csv(BytesIO(st.session_state["uploaded_bytes"]))
 else:
@@ -226,7 +215,7 @@ date_like_cols = detect_measure_date_columns(df)
 if not date_like_cols:
     st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
 
-# ---------------- Smart multiselect ----------------
+# ---------------- Smart multiselect (SANITIZED) ----------------
 def _summary(values, all_flag, max_items=2):
     vals = coerce_list(values)
     if all_flag: return "All"
@@ -238,8 +227,22 @@ def _summary(values, all_flag, max_items=2):
 def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     all_key = f"{key_prefix}_all"; ms_key  = f"{key_prefix}_ms"
+
+    # Initialize missing keys
     if all_key not in st.session_state: st.session_state[all_key] = True
     if ms_key  not in st.session_state: st.session_state[ms_key]  = options.copy()
+
+    # ---- SANITIZE existing state BEFORE rendering the widget ----
+    # 1) If "All" is true, ensure list mirrors current options
+    if bool(st.session_state[all_key]):
+        if st.session_state.get(ms_key) != options:
+            st.session_state[ms_key] = options.copy()
+    else:
+        # 2) If "All" is false, drop any stale values not in options
+        cur = coerce_list(st.session_state.get(ms_key, []))
+        cleaned = [v for v in cur if v in options]
+        if cur != cleaned:
+            st.session_state[ms_key] = cleaned
 
     all_flag = bool(st.session_state[all_key])
     selected = coerce_list(st.session_state.get(ms_key, []))
@@ -279,10 +282,16 @@ def scenario_filters_block(name: str, df: pd.DataFrame):
 
     # measures & mode
     mrow = st.columns([3, 2])
+    # sanitize measures: keep only valid columns
+    raw_meas = st.session_state.get(f"{name}_measures", [date_like_cols[0]])
+    valid_meas = [m for m in raw_meas if m in df.columns]
+    if not valid_meas: valid_meas = [date_like_cols[0]]
+    st.session_state[f"{name}_measures"] = valid_meas
+
     with mrow[0]:
         st.multiselect(f"[{name}] Measure date(s)", options=date_like_cols,
                        key=f"{name}_measures",
-                       default=st.session_state.get(f"{name}_measures", [date_like_cols[0]]))
+                       default=valid_meas)
     with mrow[1]:
         st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode",
                  index=["MTD","Cohort","Both"].index(st.session_state.get(f"{name}_mode","Both")))
@@ -294,7 +303,7 @@ def scenario_filters_block(name: str, df: pd.DataFrame):
         date_range_from_preset(f"[{name}] MTD Range", df["Create Date"], f"{name}_mtd")
     if mode in ("Cohort","Both"):
         st.caption("Measure-Date window (Cohort)")
-        meas = st.session_state.get(f"{name}_measures", [])
+        meas = st.session_state.get(f"{name}_measures", valid_meas)
         series = df[meas[0]] if meas else df["Create Date"]
         date_range_from_preset(f"[{name}] Cohort Range", series, f"{name}_coh")
 
@@ -334,7 +343,12 @@ def assemble_meta(name: str, df: pd.DataFrame):
         in_filter(df["Student/Academic Counsellor"], cslr_all, cslr_sel)
     )
     base = df[mask].copy()
-    measures = st.session_state.get(f"{name}_measures", [])
+
+    # sanitize measures again
+    measures = [m for m in st.session_state.get(f"{name}_measures", []) if m in df.columns]
+    if not measures and len(date_like_cols)>0:
+        measures = [date_like_cols[0]]
+
     mode = st.session_state.get(f"{name}_mode", "Both")
     mtd = mode in ("MTD","Both"); cohort = mode in ("Cohort","Both")
 
@@ -418,7 +432,11 @@ def compute_outputs(meta):
                 ).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
                 tables["Top Country × Deal Source — MTD"] = both
 
-            trend = sub.copy(); trend["Bucket"] = group_label_from_series(trend["Create Date"], f"{meta['name']}_mtd_grain")
+            # trend by create date buckets
+            trend = sub.copy()
+            grain_key = f"{meta['name']}_mtd_grain"
+            if grain_key not in st.session_state: st.session_state[grain_key] = "Month"
+            trend["Bucket"] = group_label_from_series(trend["Create Date"], grain_key)
             t = trend.groupby("Bucket")[flags].sum().reset_index().rename(columns={f: m for f,m in zip(flags, measures)})
             long = t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
             charts["MTD Trend"] = alt_line(long, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
@@ -438,167 +456,4 @@ def compute_outputs(meta):
             if split_dims:
                 tmp["_CreateInCohort"] = in_cre_coh.astype(int)
                 grp2 = tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
-                grp2 = grp2.rename(columns={"_CreateInCohort":"Create Count in Cohort window", **{f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)}})
-                grp2 = grp2.sort_values(by=f"Cohort: {measures[0]}", ascending=False)
-                tables[f"Cohort split by {', '.join(split_dims)}"] = grp2
-            if show_top_countries and "Country" in base.columns:
-                g = tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
-                tables["Top 5 Countries — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-            if show_top_sources and "JetLearn Deal Source" in base.columns:
-                g = tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
-                tables["Top 3 Deal Sources — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
-            if show_top_counsellors and "Student/Academic Counsellor" in base.columns:
-                g = tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index().rename(columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)})
-                tables["Top 5 Counsellors — Cohort"] = g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-            if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
-                both2 = tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index().rename(
-                    columns={f: f"Cohort: {m}" for f,m in zip(ch_flags, measures)}
-                ).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
-                tables["Top Country × Deal Source — Cohort"] = both2
-
-            frames=[]
-            for m in measures:
-                mask = base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
-                sel = base.loc[mask, [m]].copy()
-                if sel.empty: continue
-                sel["Bucket"] = group_label_from_series(sel[m], f"{meta['name']}_coh_grain")
-                t = sel.groupby("Bucket")[m].count().reset_index(name="Count"); t["Measure"]=m; frames.append(t)
-            if frames:
-                trend = pd.concat(frames, ignore_index=True)
-                charts["Cohort Trend"] = alt_line(trend, "Bucket:O", "Count:Q", color="Measure:N", tooltip=["Bucket","Measure","Count"])
-
-    return metrics_rows, tables, charts
-
-def kpi_grid(dfk, label_prefix=""):
-    if dfk.empty: st.info("No KPIs yet."); return
-    cols = st.columns(4)
-    for i,row in dfk.iterrows():
-        with cols[i%4]:
-            st.markdown(f"""
-<div class="kpi">
-  <div class="label">{label_prefix}{row['Scope']} — {row['Metric']}</div>
-  <div class="value">{row['Value']:,}</div>
-  <div class="delta">{row['Window']}</div>
-</div>
-""", unsafe_allow_html=True)
-
-def build_compare_delta(dfA, dfB):
-    if dfA.empty or dfB.empty: return pd.DataFrame()
-    key = ["Scope","Metric"]
-    a = dfA[key+["Value"]].copy().rename(columns={"Value":"A"}); a["A"]=pd.to_numeric(a["A"], errors="coerce")
-    b = dfB[key+["Value"]].copy().rename(columns={"Value":"B"}); b["B"]=pd.to_numeric(b["B"], errors="coerce")
-    out = pd.merge(a,b,on=key,how="inner")
-    out["Δ"] = pd.to_numeric(out["B"] - out["A"], errors="coerce")
-    denom = out["A"].astype(float); denom = denom.where(~(denom.isna() | (denom==0)))
-    out["Δ%"] = ((out["Δ"].astype(float) / denom) * 100).round(1)
-    return out
-
-def mk_caption(meta):
-    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
-
-# ---------------- Sidebar content (render only when open) ----------------
-if st.session_state.get("filters_open", True):
-    with st.sidebar:
-        st.markdown("<div class='sidebar-head'><span class='sidebar-caption'>Filters</span></div>", unsafe_allow_html=True)
-        st.button("← Close drawer", use_container_width=True,
-                  on_click=_toggle_filters, args=(False,), key="close_filters_btn")
-
-        with st.expander("Scenario A controls", expanded=True):
-            scenario_filters_block("A", df)
-
-        if st.session_state["show_b"]:
-            with st.expander("Scenario B controls", expanded=False):
-                scenario_filters_block("B", df)
-
-        # Less prominent data source (collapsed at bottom)
-        with st.expander("Data source (optional)", expanded=False):
-            st.caption("Upload a CSV or provide a file path. If both are given, upload takes precedence.")
-            st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=_store_upload, args=("__uploader__",))
-            st.text_input("CSV path", key="csv_path")
-
-# ---------------- Compute scenarios ----------------
-metaA = assemble_meta("A", df)
-with st.spinner("Crunching scenario A…"):
-    metricsA, tablesA, chartsA = compute_outputs(metaA)
-
-if st.session_state["show_b"]:
-    metaB = assemble_meta("B", df)
-    with st.spinner("Crunching scenario B…"):
-        metricsB, tablesB, chartsB = compute_outputs(metaB)
-
-# ---------------- Tabs (Scenario B only when enabled) ----------------
-if st.session_state["show_b"]:
-    tabA, tabB, tabC = st.tabs(["Scenario A", "Scenario B", "Compare"])
-else:
-    tabA, = st.tabs(["Scenario A"])
-
-with tabA:
-    st.markdown("<div class='section-title'>📌 KPI Overview — A</div>", unsafe_allow_html=True)
-    dfA = pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
-    st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — A</div>", unsafe_allow_html=True)
-    if not tablesA: st.info("No tables — open Filters and enable splits/leaderboards.")
-    else:
-        for name,frame in tablesA.items():
-            st.subheader(name); st.dataframe(frame, use_container_width=True)
-            st.download_button("Download CSV — " + name, to_csv_bytes(frame),
-                               file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
-    st.markdown("<div class='section-title'>📈 Trends — A</div>", unsafe_allow_html=True)
-    if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
-    if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
-
-if st.session_state["show_b"]:
-    with tabB:
-        st.markdown("<div class='section-title'>📌 KPI Overview — B</div>", unsafe_allow_html=True)
-        dfB = pd.DataFrame(metricsB); kpi_grid(dfB, "B · ")
-        st.markdown("<div class='section-title'>🧩 Splits & Leaderboards — B</div>", unsafe_allow_html=True)
-        if not tablesB: st.info("No tables — open Filters and enable splits/leaderboards.")
-        else:
-            for name,frame in tablesB.items():
-                st.subheader(name); st.dataframe(frame, use_container_width=True)
-                st.download_button("Download CSV — " + name, to_csv_bytes(frame),
-                                   file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
-        st.markdown("<div class='section-title'>📈 Trends — B</div>", unsafe_allow_html=True)
-        if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
-        if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
-
-    with tabC:
-        st.markdown("<div class='section-title'>🧠 Smart Compare (A vs B)</div>", unsafe_allow_html=True)
-        dfA = pd.DataFrame(metricsA); dfB = pd.DataFrame(metricsB)
-        if dfA.empty or dfB.empty:
-            st.info("Turn on KPIs for both scenarios to enable compare.")
-        else:
-            cmp = build_compare_delta(dfA, dfB)
-            if cmp.empty:
-                st.info("Adjust scenarios to produce comparable KPIs.")
-            else:
-                st.dataframe(cmp, use_container_width=True)
-                # bar chart by measure when comparable
-                try:
-                    # If both scenarios share the same measure set, visualize counts
-                    if set(metaA["measures"]) == set(metaB["measures"]):
-                        sub = cmp[cmp["Metric"].str.startswith("Count on '")].copy()
-                        if not sub.empty:
-                            sub["Measure"] = sub["Metric"].str.extract(r"Count on '(.+)'")
-                            a_long = sub.rename(columns={"A":"Value"})[["Measure","Scope","Value"]]; a_long["Scenario"]="A"
-                            b_long = sub.rename(columns={"B":"Value"})[["Measure","Scope","Value"]]; b_long["Scenario"]="B"
-                            long = pd.concat([a_long,b_long], ignore_index=True)
-                            ch = alt.Chart(long).mark_bar().encode(
-                                x=alt.X("Scope:N", title=None), y=alt.Y("Value:Q"),
-                                color=alt.Color("Scenario:N", scale=alt.Scale(range=PALETTE[:2])),
-                                column=alt.Column("Measure:N", header=alt.Header(title=None, labelAngle=0)),
-                                tooltip=["Measure","Scenario","Scope","Value"]
-                            ).properties(height=260)
-                            st.altair_chart(ch, use_container_width=True)
-                except Exception:
-                    pass
-
-# ---------------- Footer ----------------
-st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption("**Scenario A** — " + mk_caption(assemble_meta("A", df)))
-if st.session_state["show_b"]:
-    st.caption("**Scenario B** — " + mk_caption(assemble_meta("B", df)))
-st.caption("Excluded globally: 1.2 Invalid Deal")
+                grp2 = grp2.rename(columns={"_CreateInCohort":"Create Count in Cohort window", **{f
