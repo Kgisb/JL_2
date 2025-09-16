@@ -1,17 +1,18 @@
-# app_drawer_ui_v7.py
-# Drawer UI (like v5) + Predictability tab (source-wise enrolment forecasts)
-# Single-file app: Scenario A/B + Compare + Predictability
+# app_drawer_ui_v8.py
+# Drawer UI (v5 baseline) + upgraded Predictability with backtesting & model selection
+# A/B scenarios + Compare + Predictability (auto-selects best model per source)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 from io import BytesIO
-from datetime import date, timedelta, datetime
-from sklearn.ensemble import RandomForestRegressor
+from datetime import date, timedelta
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge
 
 # ---------------- Page & Style ----------------
-st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability (v8)", layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{
@@ -41,7 +42,7 @@ REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country",
                  "Student/Academic Counsellor","Deal Stage","Create Date"]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
 
-# ---------------- Clone helpers (safe pattern) ----------------
+# ---------------- Clone helpers ----------------
 def _request_clone(direction: str):
     st.session_state["__clone_request__"] = direction
     if direction == "A2B":
@@ -49,18 +50,14 @@ def _request_clone(direction: str):
 
 def _perform_clone_if_requested():
     direction = st.session_state.get("__clone_request__")
-    if not direction:
-        return
+    if not direction: return
     src_prefix, dst_prefix = ("A_", "B_") if direction == "A2B" else ("B_", "A_")
     for k in list(st.session_state.keys()):
-        if not k.startswith(src_prefix):
-            continue
-        if k.endswith("_select_all") or k.endswith("_clear"):
-            continue
+        if not k.startswith(src_prefix): continue
+        if k.endswith("_select_all") or k.endswith("_clear"): continue
         st.session_state[k.replace(src_prefix, dst_prefix, 1)] = st.session_state[k]
     st.session_state["__clone_request__"] = None
     st.rerun()
-
 _perform_clone_if_requested()
 
 # ---------------- Utilities ----------------
@@ -85,12 +82,10 @@ def detect_measure_date_columns(df: pd.DataFrame):
 def detect_program_column(df: pd.DataFrame):
     candidates = ["Program","Course","Product","Track","Program Name","Course Name","Package","Interest","Program Interested"]
     for c in candidates:
-        if c in df.columns:
-            return c
+        if c in df.columns: return c
     for c in df.columns:
-        cl = c.lower()
-        if "program" in cl or "course" in cl:
-            return c
+        cl=c.lower()
+        if "program" in cl or "course" in cl: return c
     return None
 
 def coerce_list(x):
@@ -108,7 +103,7 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     if s.isna().all(): return fallback
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
-# Presets (v5)
+# Presets for A/B
 def today_bounds(): t=pd.Timestamp.today().date(); return t,t
 def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
 def last_month_bounds():
@@ -127,7 +122,7 @@ def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year
 # Predictability-presets
 def this_week_bounds():
     t = pd.Timestamp.today().date()
-    start = t - timedelta(days=t.weekday())  # Monday
+    start = t - timedelta(days=t.weekday())
     return start, start + timedelta(days=6)
 def next_week_bounds():
     s, _ = this_week_bounds()
@@ -322,14 +317,6 @@ def ensure_month_cols(base: pd.DataFrame, measures):
             base[col]=base[m].dt.to_period("M")
     return base
 
-def group_label_from_series(s: pd.Series, grain_key: str):
-    grain=st.session_state.get(grain_key,"Month")
-    if grain=="Day":  return pd.to_datetime(s).dt.date.astype(str)
-    if grain=="Week":
-        iso=pd.to_datetime(s).dt.isocalendar()
-        return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
-    return pd.to_datetime(s).dt.to_period("M").astype(str)
-
 def assemble_meta(name: str, df: pd.DataFrame):
     pipe_all=st.session_state.get(f"{name}_pipe_all", True); pipe_sel=st.session_state.get(f"{name}_pipe_ms", [])
     src_all=st.session_state.get(f"{name}_src_all", True);  src_sel=st.session_state.get(f"{name}_src_ms", [])
@@ -383,7 +370,6 @@ def compute_outputs(meta):
     show_combo_pairs=meta["show_combo_pairs"]
     metrics_rows, tables, charts = [], {}, {}
 
-    # ---------- MTD ----------
     if mtd and mtd_from and mtd_to and measures:
         in_cre=base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub=base[in_cre].copy()
@@ -395,53 +381,38 @@ def compute_outputs(meta):
             flags.append(flg)
             metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub[flg].sum())})
         metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub))})
-
         if flags:
             if split_dims:
                 sub["_CreateCount"]=1
                 grp=sub.groupby(split_dims, dropna=False)[flags+["_CreateCount"]].sum().reset_index()
-                # rename map built safely
                 rename_map={"_CreateCount":"Create Count in window"}
                 for f, m in zip(flags, measures):
                     rename_map[f] = f"MTD: {m}"
                 grp=grp.rename(columns=rename_map).sort_values(by=f"MTD: {measures[0]}", ascending=False)
                 tables[f"MTD split by {', '.join(split_dims)}"]=grp
-
             if show_top_countries and "Country" in sub.columns:
                 g=sub.groupby("Country", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures):
-                    g = g.rename(columns={f: f"MTD: {m}"})
+                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
                 tables["Top 5 Countries — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
-
             if show_top_sources and "JetLearn Deal Source" in sub.columns:
                 g=sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures):
-                    g = g.rename(columns={f: f"MTD: {m}"})
+                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
                 tables["Top 3 Deal Sources — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
-
             if show_top_counsellors and "Student/Academic Counsellor" in sub.columns:
                 g=sub.groupby("Student/Academic Counsellor", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures):
-                    g = g.rename(columns={f: f"MTD: {m}"})
+                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
                 tables["Top 5 Counsellors — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
-
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub.columns):
                 both=sub.groupby(["Country","JetLearn Deal Source"], dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures):
-                    both = both.rename(columns={f: f"MTD: {m}"})
+                for f, m in zip(flags, measures): both=both.rename(columns={f:f"MTD: {m}"})
                 tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
-
-            # Trend by Create-Date bucket
             trend=sub.copy()
             trend["Bucket"]=group_label_from_series(trend["Create Date"], f"{meta['name']}_mtd_grain")
             t=trend.groupby("Bucket")[flags].sum().reset_index()
-            # rename each flag to measure name
-            for f, m in zip(flags, measures):
-                t = t.rename(columns={f: m})
+            for f, m in zip(flags, measures): t=t.rename(columns={f:m})
             long=t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
             charts["MTD Trend"]=alt_line(long,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
 
-    # ---------- Cohort ----------
     if cohort and coh_from and coh_to and measures:
         tmp=base.copy(); ch_flags=[]
         for m in measures:
@@ -452,42 +423,30 @@ def compute_outputs(meta):
             metrics_rows.append({"Scope":"Cohort","Metric":f"Count on '{m}'","Window":f"{coh_from} → {coh_to}","Value":int(tmp[flg].sum())})
         in_cre_coh=base["Create Date"].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
         metrics_rows.append({"Scope":"Cohort","Metric":"Create Count in Cohort window","Window":f"{coh_from} → {coh_to}","Value":int(in_cre_coh.sum())})
-
         if ch_flags:
             if split_dims:
                 tmp["_CreateInCohort"]=in_cre_coh.astype(int)
                 grp2=tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
                 rename_map2={"_CreateInCohort":"Create Count in Cohort window"}
-                for f, m in zip(ch_flags, measures):
-                    rename_map2[f] = f"Cohort: {m}"
+                for f, m in zip(ch_flags, measures): rename_map2[f]=f"Cohort: {m}"
                 grp2=grp2.rename(columns=rename_map2).sort_values(by=f"Cohort: {measures[0]}", ascending=False)
                 tables[f"Cohort split by {', '.join(split_dims)}"]=grp2
-
             if show_top_countries and "Country" in base.columns:
                 g=tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures):
-                    g = g.rename(columns={f: f"Cohort: {m}"})
+                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
                 tables["Top 5 Countries — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-
             if show_top_sources and "JetLearn Deal Source" in base.columns:
                 g=tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures):
-                    g = g.rename(columns={f: f"Cohort: {m}"})
+                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
                 tables["Top 3 Deal Sources — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
-
             if show_top_counsellors and "Student/Academic Counsellor" in base.columns:
                 g=tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures):
-                    g = g.rename(columns={f: f"Cohort: {m}"})
+                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
                 tables["Top 5 Counsellors — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
                 both2=tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures):
-                    both2 = both2.rename(columns={f: f"Cohort: {m}"})
+                for f, m in zip(ch_flags, measures): both2=both2.rename(columns={f:f"Cohort: {m}"})
                 tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
-
-            # Cohort trend per measure
             frames=[]
             for m in measures:
                 mask=base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -498,7 +457,6 @@ def compute_outputs(meta):
             if frames:
                 trend=pd.concat(frames, ignore_index=True)
                 charts["Cohort Trend"]=alt_line(trend,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
-
     return metrics_rows, tables, charts
 
 def kpi_grid(dfk, label_prefix=""):
@@ -532,28 +490,22 @@ def mk_caption(meta):
             f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
             f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 
-# ---------------- Predictability helpers ----------------
+# ---------------- Predictability (Upgraded ML) ----------------
 @st.cache_data(show_spinner=False)
 def build_enrolment_daily(df: pd.DataFrame, program_col: str|None):
-    """
-    Returns a daily time series per 'JetLearn Deal Source' with enrolment counts (by Payment Received Date).
-    If 'Payment Received Date' absent, uses the first non-Create date-like column.
-    """
+    """Daily enrolments by JetLearn Deal Source from Payment Received Date (fallback: first other date-like)."""
     if "Payment Received Date" in df.columns:
         measure = "Payment Received Date"
     else:
         dcols = [c for c in df.columns if c != "Create Date" and ("date" in c.lower() or "time" in c.lower())]
         measure = dcols[0] if dcols else "Create Date"
-
     work = df.copy()
     work[measure] = pd.to_datetime(work[measure], errors="coerce")
     work = work.dropna(subset=[measure])
     work["d"] = work[measure].dt.date
-
     cols = ["d", "JetLearn Deal Source"]
     if program_col and program_col in work.columns:
         cols.append(program_col)
-
     g = work.groupby(cols, dropna=False).size().reset_index(name="y")
     return g, measure
 
@@ -568,58 +520,155 @@ def expand_calendar(start: date, end: date) -> pd.DataFrame:
     out["trend"]= np.arange(len(out))
     return out
 
-def make_lag_feats(df_daily: pd.DataFrame, lags=(1,7), roll=7):
-    df = df_daily.sort_values("d").copy()
-    for L in lags:
-        df[f"lag{L}"] = df["y"].shift(L)
-    df[f"roll{roll}"] = df["y"].rolling(roll, min_periods=1).mean()
-    return df
-
-def train_or_naive(ts: pd.DataFrame):
-    if len(ts) < 21:
-        return None
-    cal = expand_calendar(ts["d"].min(), ts["d"].max())
-    x = pd.merge(cal, ts[["d","y"]], on="d", how="left").fillna({"y":0})
-    x = make_lag_feats(x)
-    X = x[["trend","dow","dom","mon","doy","woy","lag1","lag7","roll7"]].fillna(0)
+def make_feats(full_cal: pd.DataFrame, hist: pd.DataFrame):
+    x = pd.merge(full_cal, hist.rename(columns={"y":"y_hist"}), on="d", how="left")
+    x["y"] = x["y_hist"].fillna(0.0)
+    x = x.drop(columns=["y_hist"])
+    # lags & rolling mean
+    x["lag1"]  = x["y"].shift(1)
+    x["lag7"]  = x["y"].shift(7)
+    x["roll7"] = x["y"].rolling(7, min_periods=1).mean()
+    # fill features
+    X = x[["trend","dow","dom","mon","doy","woy","lag1","lag7","roll7"]].fillna(0.0)
     y = x["y"].values
-    if np.allclose(y, y.mean()):
-        return None
-    model = RandomForestRegressor(
-        n_estimators=200, max_depth=8, random_state=42, n_jobs=-1, min_samples_leaf=2
-    )
-    model.fit(X, y)
-    yhat = model.predict(X)
-    resid = y - yhat
-    sigma = float(np.sqrt(np.nanmean(resid**2))) if len(resid) else 0.0
-    return dict(model=model, sigma=sigma)
+    return x, X, y
 
-def predict_horizon(model_pack, hist_ts: pd.DataFrame, start: date, end: date):
-    horizon = expand_calendar(start, end)
-    full_cal_start = min(hist_ts["d"].min(), start)
-    cal = expand_calendar(full_cal_start, end)
-    hist = hist_ts.rename(columns={"y":"y_hist"})
-    cal = pd.merge(cal, hist[["d","y_hist"]], on="d", how="left")
-    cal["y"] = cal["y_hist"].fillna(0)
-    cal = cal.drop(columns=["y_hist"])
-    cal = make_lag_feats(cal)
-    Xf = cal[["trend","dow","dom","mon","doy","woy","lag1","lag7","roll7"]].fillna(0)
-    if model_pack is None:
-        hist_recent = hist_ts.tail(28)
-        mu = float(hist_recent["y"].mean()) if not hist_recent.empty else 0.0
-        sigma = float(hist_recent["y"].std(ddof=1)) if len(hist_recent)>1 else 0.0
-        cal["yhat"] = mu
-        cal["sigma"] = sigma
+def fit_model(X, y, name: str):
+    if name == "Linear":
+        mdl = LinearRegression()
+    elif name == "Ridge":
+        mdl = Ridge(alpha=1.0, random_state=None)
+    elif name == "RandomForest":
+        mdl = RandomForestRegressor(n_estimators=300, max_depth=8, random_state=42, n_jobs=-1, min_samples_leaf=2)
+    elif name == "GBDT":
+        mdl = GradientBoostingRegressor(random_state=42, max_depth=3, n_estimators=300, learning_rate=0.05)
     else:
-        model = model_pack["model"]; sigma = model_pack.get("sigma", 0.0)
-        cal["yhat"] = model.predict(Xf)
-        cal["sigma"] = sigma
-    out = cal[cal["d"].between(start, end)].copy()
-    out["yhat_lo"] = (out["yhat"] - 1.64*out["sigma"]).clip(lower=0)
-    out["yhat_hi"] = (out["yhat"] + 1.64*out["sigma"]).clip(lower=0)
-    return out[["d","yhat","yhat_lo","yhat_hi"]]
+        return None
+    mdl.fit(X, y)
+    return mdl
 
-# ---------------- Sidebar (drawer) ----------------
+def naive_mean_forecaster(y_hist: np.ndarray, days:int):
+    mu = float(pd.Series(y_hist).tail(28).mean() if len(y_hist)>0 else 0.0)
+    sigma = float(pd.Series(y_hist).tail(28).std(ddof=1) if len(y_hist)>1 else 0.0)
+    return np.full(days, mu), sigma
+
+def walk_forward_backtest(ts: pd.DataFrame, model_name: str, fold_size:int=14, n_folds:int=3):
+    """
+    Rolling-origin backtest. Each fold trains on all data up to split point and
+    predicts next 'fold_size' days. Returns metrics & residual stats.
+    """
+    ts = ts.sort_values("d").reset_index(drop=True)
+    if len(ts) < max(28, fold_size*(n_folds+1)):
+        return None  # not enough data
+
+    start_idx = len(ts) - fold_size*n_folds
+    folds = []
+    errors = []
+    preds_all = []
+    acts_all  = []
+    for f in range(n_folds):
+        end_train = start_idx + f*fold_size
+        train = ts.iloc[:end_train].copy()
+        test  = ts.iloc[end_train:end_train+fold_size].copy()
+        # calendar covering train + test
+        cal = expand_calendar(train["d"].min(), test["d"].max())
+        _, X_full, y_full = make_feats(cal, train.rename(columns={"y":"y"}))
+        # indexes for test part
+        X_train = X_full.iloc[:len(cal)-fold_size]
+        y_train = y_full[:len(cal)-fold_size]
+        X_test  = X_full.iloc[len(cal)-fold_size:]
+        # predict
+        if model_name == "Naive":
+            yhat, sigma = naive_mean_forecaster(y_train, fold_size)
+        else:
+            mdl = fit_model(X_train, y_train, model_name)
+            if mdl is None:
+                yhat, sigma = naive_mean_forecaster(y_train, fold_size)
+            else:
+                yhat = mdl.predict(X_test)
+                # residual sigma from train fit
+                y_fit = mdl.predict(X_train)
+                sigma = float(np.sqrt(np.mean((y_train - y_fit)**2))) if len(y_train)>0 else 0.0
+        y_true = test["y"].values.astype(float)
+        preds_all.append(yhat); acts_all.append(y_true)
+        err = y_true - yhat
+        errors.append(err)
+        folds.append(dict(y_true=y_true, yhat=yhat, sigma=sigma))
+
+    y_true_all = np.concatenate(acts_all)
+    y_pred_all = np.concatenate(preds_all)
+    abs_err = np.abs(y_true_all - y_pred_all)
+    mae  = float(abs_err.mean())
+    mape = float(np.mean(abs_err / np.maximum(1e-9, y_true_all)))  # guard zero
+    wape = float(abs_err.sum() / np.maximum(1e-9, y_true_all.sum()))
+    bias = float((y_pred_all.sum() - y_true_all.sum()) / np.maximum(1e-9, y_true_all.sum()))
+    sigma_resid = float(np.sqrt(np.mean(np.concatenate(errors)**2)))
+    return dict(MAE=mae, MAPE=mape, WAPE=wape, Bias=bias, Sigma=sigma_resid)
+
+def train_best_model(ts: pd.DataFrame, candidates=("GBDT","RandomForest","Ridge","Linear","Naive")):
+    """
+    Backtests all candidates, picks best by MAPE, then fits final on full history.
+    Returns (best_name, metrics, final_model_or_None, sigma, bias_for_calibration)
+    """
+    # evaluate
+    results = {}
+    for name in candidates:
+        bt = walk_forward_backtest(ts, name, fold_size=14, n_folds=3)
+        if bt is not None:
+            results[name] = bt
+    if not results:
+        # fallback if insufficient data
+        name = "Naive"
+        bt = dict(MAE=np.nan, MAPE=np.nan, WAPE=np.nan, Bias=0.0, Sigma=0.0)
+        final = None; sigma=0.0; bias=0.0
+        return name, bt, final, sigma, bias
+
+    # pick best by MAPE (lowest)
+    best = min(results.items(), key=lambda kv: (np.inf if np.isnan(kv[1]["MAPE"]) else kv[1]["MAPE"]))
+    best_name, best_metrics = best
+
+    # fit final
+    cal = expand_calendar(ts["d"].min(), ts["d"].max())
+    _, X_full, y_full = make_feats(cal, ts.rename(columns={"y":"y"}))
+    if best_name == "Naive":
+        final = None
+        sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
+    else:
+        final = fit_model(X_full, y_full, best_name)
+        if final is None:
+            sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
+        else:
+            y_fit = final.predict(X_full)
+            sigma = float(np.sqrt(np.mean((y_full - y_fit)**2))) if len(y_full)>0 else 0.0
+
+    # bias from backtest to de-bias forecasts
+    bias = best_metrics.get("Bias", 0.0)
+    return best_name, best_metrics, final, sigma, bias
+
+def predict_with_model(ts: pd.DataFrame, model_name: str, final_model, start: date, end: date, sigma: float, de_bias: float=0.0):
+    cal_hist = expand_calendar(ts["d"].min(), end)
+    _, X_full, y_full = make_feats(cal_hist, ts.rename(columns={"y":"y"}))
+    # horizon rows
+    cal_h = expand_calendar(start, end)
+    horizon_days = len(cal_h)
+    X_pred = X_full.iloc[-horizon_days:]
+    # predict
+    if model_name == "Naive" or final_model is None:
+        yhat, sigma_est = naive_mean_forecaster(y_full, horizon_days)
+        sigma_use = sigma if sigma>0 else sigma_est
+        yhat = yhat
+    else:
+        yhat = final_model.predict(X_pred)
+        sigma_use = sigma
+    # de-bias: if bias > 0 means over-forecast; reduce by factor (1+bias)
+    if np.isfinite(de_bias) and de_bias != 0.0:
+        yhat = yhat / (1.0 + de_bias)
+    lo = np.clip(yhat - 1.64*sigma_use, 0, None)
+    hi = np.clip(yhat + 1.64*sigma_use, 0, None)
+    out = pd.DataFrame({"d": cal_h["d"], "yhat": yhat, "yhat_lo": lo, "yhat_hi": hi})
+    return out
+
+# ---------------- Sidebar drawer ----------------
 if st.session_state.get("filters_open", True):
     with st.sidebar:
         with st.expander("Scenario A controls", expanded=True):
@@ -636,7 +685,6 @@ if st.session_state.get("filters_open", True):
 metaA = assemble_meta("A", df)
 with st.spinner("Crunching scenario A…"):
     metricsA, tablesA, chartsA = compute_outputs(metaA)
-
 if st.session_state["show_b"]:
     metaB = assemble_meta("B", df)
     with st.spinner("Crunching scenario B…"):
@@ -648,7 +696,6 @@ if st.session_state["show_b"]:
     tabs += ["Scenario B", "Compare"]
 tabs += ["Predictability"]
 t_objs = st.tabs(tabs)
-
 tabA = t_objs[0]
 tabB = t_objs[1] if st.session_state["show_b"] else None
 tabC = t_objs[2] if st.session_state["show_b"] else None
@@ -712,15 +759,17 @@ if st.session_state["show_b"]:
                 except Exception:
                     pass
 
-# ---------------- Predictability Tab ----------------
+# ---------------- Predictability Tab (Upgraded) ----------------
 with tabPred:
-    st.markdown("<div class='section-title'>🔮 Predictability — Source-wise Enrolment Forecast</div>", unsafe_allow_html=True)
-    st.caption("Forecasts **enrolments** by **JetLearn Deal Source** using *Payment Received Date* (or nearest available date-like column).")
+    st.markdown("<div class='section-title'>🔮 Predictability — Source-wise Enrolment Forecast (with Backtesting)</div>", unsafe_allow_html=True)
+    st.caption("Forecasts **enrolments** by **JetLearn Deal Source** from *Payment Received Date* (or nearest date-like). "
+               "Uses rolling-origin backtests to choose the best model per source and reports accuracy metrics.")
 
-    colH, colP = st.columns([2,2])
+    colH, colP, colM = st.columns([2,2,3])
     with colH:
         horizon = st.selectbox("Horizon", ["Today","Tomorrow","This Week","Next Week","This Month","Next Month","Custom"])
     with colP:
+        # Program filter
         if program_col:
             prog_choice = st.selectbox("Program", ["Both","AI-Coding","Math","Custom filter…"], index=0)
             prog_custom = None
@@ -730,6 +779,10 @@ with tabPred:
         else:
             prog_choice = "Both"
             st.info("No program column found — treating **Both** as all records.", icon="ℹ️")
+    with colM:
+        model_pref = st.selectbox("Model preference", ["Auto (best MAPE)","GBDT","RandomForest","Ridge","Linear","Naive"], index=0)
+        do_backtest = st.toggle("Show backtest details", value=True)
+        de_bias_on  = st.toggle("De-bias forecasts using backtest bias", value=True)
 
     # Horizon dates
     if horizon == "Today":
@@ -748,10 +801,7 @@ with tabPred:
     else:
         dmin, dmax = safe_minmax_date(df["Create Date"])
         rng = st.date_input("Custom forecast range", (dmin, dmax))
-        if isinstance(rng, (tuple, list)) and len(rng)==2:
-            H_from, H_to = rng[0], rng[1]
-        else:
-            H_from, H_to = dmin, dmax
+        H_from, H_to = (rng[0], rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin,dmax)
 
     with st.spinner("Preparing time series…"):
         daily, used_measure = build_enrolment_daily(df, program_col)
@@ -769,64 +819,128 @@ with tabPred:
         sources = sorted(daily["JetLearn Deal Source"].dropna().astype(str).unique())
 
     st.caption(f"Using enrolment signal from **{used_measure}**.")
-
-    # Forecast per source
     rows = []
     daily_forecasts = {}
-    with st.spinner("Forecasting…"):
+    bt_rows = []
+
+    with st.spinner("Backtesting & forecasting per source…"):
         for src in sources:
             ts = (daily[daily["JetLearn Deal Source"].astype(str)==src]
                     .groupby("d")["y"].sum().reset_index())
-            if ts.empty:
+            if ts.empty or len(ts)<21:
                 continue
-            mdl = train_or_naive(ts)
-            pred = predict_horizon(mdl, ts, H_from, H_to)
-            pred_sum = float(pred["yhat"].sum())
-            lo = float(pred["yhat_lo"].sum())
-            hi = float(pred["yhat_hi"].sum())
+
+            if model_pref.startswith("Auto"):
+                best_name, metrics, final_model, sigma, bias = train_best_model(ts)
+            else:
+                # Evaluate the chosen model too (so we still have metrics)
+                metrics = walk_forward_backtest(ts, "Naive", fold_size=14, n_folds=3) or dict(MAE=np.nan, MAPE=np.nan, WAPE=np.nan, Bias=0.0, Sigma=0.0)
+                # Train on full for selected model
+                cal = expand_calendar(ts["d"].min(), ts["d"].max())
+                _, X_full, y_full = make_feats(cal, ts.rename(columns={"y":"y"}))
+                if model_pref == "Naive":
+                    best_name, final_model = "Naive", None
+                    sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
+                    bias = 0.0
+                else:
+                    mdl = fit_model(X_full, y_full, model_pref)
+                    if mdl is None:
+                        best_name, final_model = "Naive", None
+                        sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
+                        bias = 0.0
+                    else:
+                        best_name, final_model = model_pref, mdl
+                        y_fit = mdl.predict(X_full)
+                        sigma = float(np.sqrt(np.mean((y_full - y_fit)**2))) if len(y_full)>0 else 0.0
+                        # Also compute model's own backtest metrics
+                        mt = walk_forward_backtest(ts, model_pref, fold_size=14, n_folds=3)
+                        if mt is not None:
+                            metrics = mt
+                        bias = metrics.get("Bias", 0.0)
+
+            # Forecast
+            pred_df = predict_with_model(ts, best_name, final_model, H_from, H_to, sigma=sigma, de_bias=bias if de_bias_on else 0.0)
+            pred_sum = float(pred_df["yhat"].sum())
+            lo = float(pred_df["yhat_lo"].sum())
+            hi = float(pred_df["yhat_hi"].sum())
+            acc = (1.0 - (metrics["MAPE"] if np.isfinite(metrics["MAPE"]) else np.nan))*100.0
+
             rows.append({
                 "JetLearn Deal Source": src,
-                "Predicted Enrolments": round(pred_sum, 1),
-                "Lower (90%)": round(lo, 1),
-                "Upper (90%)": round(hi, 1),
-                "Model": "RF+lags" if mdl is not None else "Naive avg"
+                "Model": best_name,
+                "Accuracy % (1-MAPE)": None if np.isnan(acc) else round(acc,1),
+                "MAE": None if np.isnan(metrics["MAE"]) else round(metrics["MAE"],2),
+                "Bias %": round(metrics["Bias"]*100.0,1) if np.isfinite(metrics["Bias"]) else None,
+                "Predicted": round(pred_sum,1),
+                "Lower (90%)": round(lo,1),
+                "Upper (90%)": round(hi,1),
             })
-            daily_forecasts[src] = pred.assign(source=src)
+            if do_backtest:
+                bt_rows.append({
+                    "JetLearn Deal Source": src,
+                    "Model": best_name,
+                    "MAPE": None if np.isnan(metrics["MAPE"]) else round(metrics["MAPE"]*100.0,1),
+                    "WAPE": None if np.isnan(metrics["WAPE"]) else round(metrics["WAPE"]*100.0,1),
+                    "MAE": None if np.isnan(metrics["MAE"]) else round(metrics["MAE"],2),
+                    "Bias %": round(metrics["Bias"]*100.0,1) if np.isfinite(metrics["Bias"]) else None,
+                    "Sigma (RMSE of resid)": round(metrics["Sigma"],2)
+                })
+            daily_forecasts[src] = pred_df.assign(source=src)
 
     if not rows:
-        st.warning("Not enough historical enrolments to produce a forecast.")
+        st.warning("Not enough historical enrolments to produce a robust forecast.")
     else:
-        pred_table = pd.DataFrame(rows).sort_values("Predicted Enrolments", ascending=False)
-        total_row = pd.DataFrame([{
+        pred_table = pd.DataFrame(rows).sort_values("Predicted", ascending=False)
+        # Totals
+        tot = {
             "JetLearn Deal Source": "TOTAL",
-            "Predicted Enrolments": pred_table["Predicted Enrolments"].sum().round(1),
-            "Lower (90%)": pred_table["Lower (90%)"].sum().round(1),
-            "Upper (90%)": pred_table["Upper (90%)"].sum().round(1),
-            "Model": "—"
-        }])
+            "Model": "—",
+            "Accuracy % (1-MAPE)": None,
+            "MAE": None,
+            "Bias %": None,
+            "Predicted": round(pred_table["Predicted"].sum(),1),
+            "Lower (90%)": round(pred_table["Lower (90%)"].sum(),1),
+            "Upper (90%)": round(pred_table["Upper (90%)"].sum(),1),
+        }
+        # Weighted MAPE across sources (by actuals is better; we don't have future actuals—so weight by predicted)
+        valid_acc = pred_table.dropna(subset=["Accuracy % (1-MAPE)"])
+        if not valid_acc.empty:
+            weights = valid_acc["Predicted"].replace(0, np.nan)
+            w_acc = np.nansum(valid_acc["Accuracy % (1-MAPE)"]*weights)/np.nansum(weights)
+            tot["Accuracy % (1-MAPE)"] = round(w_acc,1)
+        # Render table
         st.subheader(f"Forecast for {H_from} → {H_to}")
-        st.dataframe(pd.concat([total_row, pred_table], ignore_index=True), use_container_width=True)
+        st.dataframe(pd.concat([pd.DataFrame([tot]), pred_table], ignore_index=True), use_container_width=True)
 
-        # Bar chart
-        chart_df = pred_table.rename(columns={"Predicted Enrolments":"yhat"})
+        # Bar chart for predictions
+        chart_df = pred_table.rename(columns={"Predicted":"yhat"})
         st.altair_chart(
             alt_bar(chart_df, x="JetLearn Deal Source:N", y="yhat:Q",
-                    tooltip=["JetLearn Deal Source","yhat","Lower (90%)","Upper (90%)","Model"]),
+                    tooltip=["JetLearn Deal Source","yhat","Lower (90%)","Upper (90%)","Model","Accuracy % (1-MAPE)"]),
             use_container_width=True
         )
 
-        # Optional daily view
+        if do_backtest and bt_rows:
+            st.markdown("**Backtest metrics (rolling-origin)**")
+            bt_df = pd.DataFrame(bt_rows).sort_values("MAPE", ascending=True)
+            st.dataframe(bt_df, use_container_width=True)
+
         with st.expander("Daily forecast details"):
             long_df = pd.concat(daily_forecasts.values(), ignore_index=True) if daily_forecasts else pd.DataFrame()
             if not long_df.empty:
-                long_df["d"] = pd.to_datetime(long_df["d"])
                 st.dataframe(long_df.sort_values(["source","d"]), use_container_width=True)
                 st.download_button("Download daily forecast (CSV)", to_csv_bytes(long_df),
                                    file_name="daily_forecast.csv", mime="text/csv")
 
 # ---------------- Footer ----------------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-st.caption("**Scenario A** — " + mk_caption(metaA))
+def mk_caption(meta):
+    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
+            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
+            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
+            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
+            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
+st.caption("**Scenario A** — " + mk_caption(assemble_meta("A", df)))
 if st.session_state["show_b"]:
-    st.caption("**Scenario B** — " + mk_caption(metaB))
+    st.caption("**Scenario B** — " + mk_caption(assemble_meta("B", df)))
 st.caption("Excluded globally: 1.2 Invalid Deal")
