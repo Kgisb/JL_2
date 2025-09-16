@@ -1,18 +1,21 @@
-# app_drawer_ui_v8.py
-# Drawer UI (v5 baseline) + upgraded Predictability with backtesting & model selection
-# A/B scenarios + Compare + Predictability (auto-selects best model per source)
-
+# app.py — Drawer UI + Analytics + Predictability (Pipeline-aware)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 from io import BytesIO
-from datetime import date, timedelta
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, Ridge
+from datetime import date, timedelta, datetime
+from typing import List, Tuple, Dict, Optional
 
-# ---------------- Page & Style ----------------
-st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability (v8)", layout="wide", page_icon="📊")
+# ML
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+
+# -------------------- Page & Styles --------------------
+st.set_page_config(page_title="JetLearn MIS — MTD/Cohort & Predictability", layout="wide", page_icon="✨")
 st.markdown("""
 <style>
 :root{
@@ -37,60 +40,36 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Constants ----------------
-REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country",
-                 "Student/Academic Counsellor","Deal Stage","Create Date"]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
+REQUIRED_COLS = ["Pipeline", "JetLearn Deal Source", "Country",
+                 "Student/Academic Counsellor", "Deal Stage", "Create Date"]
 
-# ---------------- Clone helpers ----------------
-def _request_clone(direction: str):
-    st.session_state["__clone_request__"] = direction
-    if direction == "A2B":
-        st.session_state["show_b"] = True
+PROGRAM_COL = "Pipeline"  # predictability "program" comes from Pipeline
 
-def _perform_clone_if_requested():
-    direction = st.session_state.get("__clone_request__")
-    if not direction: return
-    src_prefix, dst_prefix = ("A_", "B_") if direction == "A2B" else ("B_", "A_")
-    for k in list(st.session_state.keys()):
-        if not k.startswith(src_prefix): continue
-        if k.endswith("_select_all") or k.endswith("_clear"): continue
-        st.session_state[k.replace(src_prefix, dst_prefix, 1)] = st.session_state[k]
-    st.session_state["__clone_request__"] = None
-    st.rerun()
-_perform_clone_if_requested()
-
-# ---------------- Utilities ----------------
+# -------------------- Utilities --------------------
 def robust_read_csv(file_or_path):
     for enc in ["utf-8","utf-8-sig","cp1252","latin1"]:
         try: return pd.read_csv(file_or_path, encoding=enc)
         except Exception: pass
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
-def detect_measure_date_columns(df: pd.DataFrame):
+def detect_measure_date_columns(df: pd.DataFrame) -> List[str]:
     date_like=[]
     for col in df.columns:
         if col=="Create Date": continue
-        if any(k in col.lower() for k in ["date","time","timestamp"]):
+        low = col.lower()
+        if any(k in low for k in ["date","time","timestamp"]):
             parsed = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
             if parsed.notna().sum()>0:
                 df[col]=parsed; date_like.append(col)
+    # prefer Payment Received Date first if exists
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
 
-def detect_program_column(df: pd.DataFrame):
-    candidates = ["Program","Course","Product","Track","Program Name","Course Name","Package","Interest","Program Interested"]
-    for c in candidates:
-        if c in df.columns: return c
-    for c in df.columns:
-        cl=c.lower()
-        if "program" in cl or "course" in cl: return c
-    return None
-
 def coerce_list(x):
     if x is None: return []
-    if isinstance(x,(list,tuple,set)): return list(x)
+    if isinstance(x, (list, tuple, set)): return list(x)
     return [x]
 
 def in_filter(series: pd.Series, all_checked: bool, selected_values):
@@ -103,7 +82,6 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     if s.isna().all(): return fallback
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
-# Presets for A/B
 def today_bounds(): t=pd.Timestamp.today().date(); return t,t
 def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
 def last_month_bounds():
@@ -119,25 +97,145 @@ def last_quarter_bounds():
     return quarter_start(y,lq), quarter_end(y,lq)
 def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
 
-# Predictability-presets
-def this_week_bounds():
-    t = pd.Timestamp.today().date()
-    start = t - timedelta(days=t.weekday())
-    return start, start + timedelta(days=6)
-def next_week_bounds():
-    s, _ = this_week_bounds()
-    s = s + timedelta(days=7)
-    return s, s + timedelta(days=6)
-def this_month_bounds():
-    t = pd.Timestamp.today().date()
-    start = t.replace(day=1)
-    next_start = (start.replace(year=start.year+1, month=1) if start.month==12 else start.replace(month=start.month+1))
-    return start, next_start - timedelta(days=1)
-def next_month_bounds():
-    s, _ = this_month_bounds()
-    nm_start = (s.replace(year=s.year+1, month=1) if s.month==12 else s.replace(month=s.month+1))
-    nm_end = (nm_start.replace(year=nm_start.year+1, month=1) if nm_start.month==12 else nm_start.replace(month=nm_start.month+1)) - timedelta(days=1)
-    return nm_start, nm_end
+def alt_line(df,x,y,color=None,tooltip=None,height=260):
+    enc=dict(x=alt.X(x,title=None), y=alt.Y(y,title=None), tooltip=tooltip or [])
+    if color: enc["color"]=alt.Color(color, scale=alt.Scale(range=PALETTE))
+    return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
+
+def to_csv_bytes(df: pd.DataFrame)->bytes: return df.to_csv(index=False).encode("utf-8")
+
+# -------------------- Program/Pipeline mapping for Predictability --------------------
+def _is_ai_coding(text: str) -> bool:
+    t = str(text).strip().lower()
+    return (t == "ai-coding") or ("ai" in t) or ("coding" in t)
+
+def _is_math(text: str) -> bool:
+    t = str(text).strip().lower()
+    return (t == "math") or ("vedic" in t) or ("math" in t)
+
+def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
+    if program_choice == "Both" or PROGRAM_COL not in df.columns:
+        if PROGRAM_COL not in df.columns:
+            st.info(f"ℹ️ Using all records because `{PROGRAM_COL}` column wasn’t found.")
+        return df
+    s = df[PROGRAM_COL].astype(str)
+    if program_choice == "AI-Coding":
+        mask = s.apply(_is_ai_coding)
+    elif program_choice == "Math":
+        mask = s.apply(_is_math)
+    else:
+        mask = pd.Series(True, index=df.index)
+    sub = df[mask].copy()
+    if sub.empty:
+        st.warning(f"⚠️ No rows matched **{program_choice}** in `{PROGRAM_COL}`. Using all rows instead.")
+        return df
+    return sub
+
+# -------------------- Clone helpers --------------------
+def _request_clone(direction: str):
+    st.session_state["__clone_request__"] = direction
+    if direction == "A2B":
+        st.session_state["show_b"] = True
+
+def _perform_clone_if_requested():
+    direction = st.session_state.get("__clone_request__")
+    if not direction: return
+    src_prefix, dst_prefix = ("A_", "B_") if direction == "A2B" else ("B_", "A_")
+    for k in list(st.session_state.keys()):
+        if not k.startswith(src_prefix): continue
+        if k.endswith("_select_all") or k.endswith("_clear"): continue
+        st.session_state[k.replace(src_prefix, dst_prefix, 1)] = st.session_state[k]
+    st.session_state["__clone_request__"] = None
+    st.rerun()
+
+# -------------------- State defaults --------------------
+if "filters_open" not in st.session_state: st.session_state["filters_open"]=True
+if "show_b" not in st.session_state: st.session_state["show_b"]=False
+if "csv_path" not in st.session_state: st.session_state["csv_path"]="Master_sheet_DB_10percent.csv"
+if "uploaded_bytes" not in st.session_state: st.session_state["uploaded_bytes"]=None
+_perform_clone_if_requested()
+
+# -------------------- Top bar --------------------
+with st.container():
+    st.markdown('<div class="topbar">', unsafe_allow_html=True)
+    c1,c2,c3,c4 = st.columns([5,2.2,2.5,2.5])
+    with c1: st.markdown('<div class="title">☰ JetLearn MIS — MTD/Cohort & Predictability</div>', unsafe_allow_html=True)
+    with c2:
+        st.button("☰ Filters", key="toggle_filters",
+                  on_click=lambda: st.session_state.update(filters_open=not st.session_state.get("filters_open",True)),
+                  use_container_width=True)
+    with c3:
+        if st.session_state["show_b"]:
+            st.button("Disable B", key="disable_b",
+                      on_click=lambda: st.session_state.update(show_b=False),
+                      use_container_width=True)
+        else:
+            st.button("Enable B", key="enable_b",
+                      on_click=lambda: st.session_state.update(show_b=True),
+                      use_container_width=True)
+    with c4:
+        cb1,cb2,cb3 = st.columns([1,1,1])
+        with cb1: st.button("A→B", key="clone_ab_btn", on_click=_request_clone, args=("A2B",), use_container_width=True)
+        with cb2: st.button("B→A", key="clone_ba_btn", on_click=_request_clone, args=("B2A",), use_container_width=True)
+        with cb3: st.button("Reset", key="reset_all", on_click=lambda: st.session_state.clear(), use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------- Data --------------------
+if st.session_state["uploaded_bytes"]:
+    df = robust_read_csv(BytesIO(st.session_state["uploaded_bytes"]))
+else:
+    df = robust_read_csv(st.session_state["csv_path"])
+df.columns=[c.strip() for c in df.columns]
+missing=[c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}"); st.stop()
+df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
+df["Create Date"]=pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
+df["Create_Month"]=df["Create Date"].dt.to_period("M")
+date_like_cols=detect_measure_date_columns(df)
+if not date_like_cols:
+    st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
+
+# -------------------- Filter widgets --------------------
+def _summary(values, all_flag, max_items=2):
+    vals=coerce_list(values)
+    if all_flag: return "All"
+    if not vals: return "None"
+    s=", ".join(map(str, vals[:max_items]))
+    if len(vals)>max_items: s+=f" +{len(vals)-max_items} more"
+    return s
+
+def unified_multifilter(label, df, colname, key_prefix):
+    options=sorted([v for v in df[colname].dropna().astype(str).unique()])
+    all_key=f"{key_prefix}_all"; ms_key=f"{key_prefix}_ms"
+    if all_key not in st.session_state: st.session_state[all_key]=True
+    if ms_key not in st.session_state: st.session_state[ms_key]=options.copy()
+    stored=coerce_list(st.session_state.get(ms_key, []))
+    selected=[v for v in stored if v in options]
+    if selected!=stored: st.session_state[ms_key]=selected
+    all_flag=bool(st.session_state[all_key])
+    effective = options if all_flag else selected
+    header=f"{label}: {_summary(effective, all_flag)}"
+    ctx = st.popover(header) if hasattr(st,"popover") else st.expander(header, expanded=False)
+    with ctx:
+        left,right = st.columns([1,3])
+        with left: st.checkbox("All", value=all_flag, key=all_key)
+        with right:
+            disabled=st.session_state[all_key]
+            st.multiselect(label, options=options, default=selected, key=ms_key,
+                           placeholder=f"Type to search {label.lower()}…",
+                           label_visibility="collapsed", disabled=disabled)
+            c1,c2 = st.columns(2)
+            with c1: st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True,
+                               on_click=lambda: (st.session_state.__setitem__(ms_key, options),
+                                                 st.session_state.__setitem__(all_key, True)))
+            with c2: st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True,
+                               on_click=lambda: (st.session_state.__setitem__(ms_key, []),
+                                                 st.session_state.__setitem__(all_key, False)))
+    all_flag=bool(st.session_state[all_key])
+    selected=[v for v in coerce_list(st.session_state.get(ms_key, [])) if v in options]
+    effective = options if all_flag else selected
+    return all_flag, effective, f"{label}: {_summary(effective, all_flag)}"
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
     presets=["Today","This month so far","Last month","Last quarter","This year","Custom"]
@@ -169,111 +267,12 @@ def group_label_from_series(s: pd.Series, grain_key: str):
         return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
-def alt_line(df,x,y,color=None,tooltip=None,height=260):
-    enc=dict(x=alt.X(x,title=None), y=alt.Y(y,title=None), tooltip=tooltip or [])
-    if color: enc["color"]=alt.Color(color, scale=alt.Scale(range=PALETTE))
-    return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
-
-def alt_bar(df, x, y, color=None, tooltip=None, height=280):
-    enc = dict(x=alt.X(x, title=None), y=alt.Y(y, title=None), tooltip=tooltip or [])
-    if color: enc["color"] = alt.Color(color, scale=alt.Scale(range=PALETTE))
-    return alt.Chart(df).mark_bar().encode(**enc).properties(height=height)
-
-def to_csv_bytes(df: pd.DataFrame)->bytes: return df.to_csv(index=False).encode("utf-8")
-
-# ---------------- State defaults ----------------
-if "filters_open" not in st.session_state: st.session_state["filters_open"]=True
-if "show_b" not in st.session_state: st.session_state["show_b"]=False
-if "csv_path" not in st.session_state: st.session_state["csv_path"]="Master_sheet_DB_10percent.csv"
-if "uploaded_bytes" not in st.session_state: st.session_state["uploaded_bytes"]=None
-
-def _toggle_filters_toggle():
-    st.session_state["filters_open"]=not st.session_state.get("filters_open",True)
-def _enable_b(): st.session_state["show_b"]=True
-def _disable_b(): st.session_state["show_b"]=False
-def _select_all_cb(ms_key, all_key, options):
-    st.session_state[ms_key]=options; st.session_state[all_key]=True
-def _clear_cb(ms_key, all_key):
-    st.session_state[ms_key]=[]; st.session_state[all_key]=False
-def _reset_all_cb(): st.session_state.clear()
-def _store_upload(key):
-    up=st.session_state.get(key)
-    if up is not None:
-        st.session_state["uploaded_bytes"]=up.getvalue(); st.rerun()
-
-# ---------------- Top bar ----------------
-with st.container():
-    st.markdown('<div class="topbar">', unsafe_allow_html=True)
-    c1,c2,c3,c4 = st.columns([5,2.2,2.5,2.5])
-    with c1: st.markdown('<div class="title">☰ MTD vs Cohort — Drawer UI</div>', unsafe_allow_html=True)
-    with c2: st.button("☰ Filters", key="toggle_filters", on_click=_toggle_filters_toggle, use_container_width=True)
-    with c3:
-        if st.session_state["show_b"]:
-            st.button("Disable B", key="disable_b", on_click=_disable_b, use_container_width=True)
-        else:
-            st.button("Enable B", key="enable_b", on_click=_enable_b, use_container_width=True)
-    with c4:
-        cb1,cb2,cb3 = st.columns([1,1,1])
-        with cb1: st.button("A→B", key="clone_ab_btn", on_click=_request_clone, args=("A2B",), use_container_width=True)
-        with cb2: st.button("B→A", key="clone_ba_btn", on_click=_request_clone, args=("B2A",), use_container_width=True)
-        with cb3: st.button("Reset", key="reset_all", on_click=_reset_all_cb, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# ---------------- Data load ----------------
-if st.session_state["uploaded_bytes"]:
-    df = robust_read_csv(BytesIO(st.session_state["uploaded_bytes"]))
-else:
-    df = robust_read_csv(st.session_state["csv_path"])
-df.columns=[c.strip() for c in df.columns]
-missing=[c for c in REQUIRED_COLS if c not in df.columns]
-if missing: st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}"); st.stop()
-
-# Clean + enrich
-df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
-df["Create Date"]=pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
-df["Create_Month"]=df["Create Date"].dt.to_period("M")
-date_like_cols=detect_measure_date_columns(df)
-if not date_like_cols: st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date')."); st.stop()
-program_col = detect_program_column(df)  # for Predictability
-
-# ---------------- Global filter widgets ----------------
-def _summary(values, all_flag, max_items=2):
-    vals=coerce_list(values)
-    if all_flag: return "All"
-    if not vals: return "None"
-    s=", ".join(map(str, vals[:max_items]))
-    if len(vals)>max_items: s+=f" +{len(vals)-max_items} more"
-    return s
-
-def unified_multifilter(label, df, colname, key_prefix):
-    options=sorted([v for v in df[colname].dropna().astype(str).unique()])
-    all_key=f"{key_prefix}_all"; ms_key=f"{key_prefix}_ms"
-    if all_key not in st.session_state: st.session_state[all_key]=True
-    if ms_key not in st.session_state: st.session_state[ms_key]=options.copy()
-    stored=coerce_list(st.session_state.get(ms_key, []))
-    selected=[v for v in stored if v in options]
-    if selected!=stored: st.session_state[ms_key]=selected
-    all_flag=bool(st.session_state[all_key])
-    effective = options if all_flag else selected
-    header=f"{label}: {_summary(effective, all_flag)}"
-    ctx = st.popover(header) if hasattr(st,"popover") else st.expander(header, expanded=False)
-    with ctx:
-        left,right = st.columns([1,3])
-        with left: st.checkbox("All", value=all_flag, key=all_key)
-        with right:
-            disabled=st.session_state[all_key]
-            st.multiselect(label, options=options, default=selected, key=ms_key,
-                           placeholder=f"Type to search {label.lower()}…",
-                           label_visibility="collapsed", disabled=disabled)
-            c1,c2 = st.columns(2)
-            with c1: st.button("Select all", key=f"{key_prefix}_select_all", use_container_width=True,
-                               on_click=_select_all_cb, args=(ms_key, all_key, options))
-            with c2: st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True,
-                               on_click=_clear_cb, args=(ms_key, all_key))
-    all_flag=bool(st.session_state[all_key])
-    selected=[v for v in coerce_list(st.session_state.get(ms_key, [])) if v in options]
-    effective = options if all_flag else selected
-    return all_flag, effective, f"{label}: {_summary(effective, all_flag)}"
+def ensure_month_cols(base: pd.DataFrame, measures: List[str]):
+    for m in measures:
+        col=f"{m}_Month"
+        if m in base.columns and col not in base.columns:
+            base[col]=base[m].dt.to_period("M")
+    return base
 
 def scenario_filters_block(name: str, df: pd.DataFrame):
     st.markdown(f"**Scenario {name}** <span class='badge'>independent</span>", unsafe_allow_html=True)
@@ -310,14 +309,7 @@ def scenario_filters_block(name: str, df: pd.DataFrame):
                    key=f"{name}_split", default=st.session_state.get(f"{name}_split", []))
     st.toggle(f"[{name}] Country × Deal Source (Top 10)", value=st.session_state.get(f"{name}_pair", False), key=f"{name}_pair")
 
-def ensure_month_cols(base: pd.DataFrame, measures):
-    for m in measures:
-        col=f"{m}_Month"
-        if m in base.columns and col not in base.columns:
-            base[col]=base[m].dt.to_period("M")
-    return base
-
-def assemble_meta(name: str, df: pd.DataFrame):
+def assemble_meta(name: str, df: pd.DataFrame) -> Dict:
     pipe_all=st.session_state.get(f"{name}_pipe_all", True); pipe_sel=st.session_state.get(f"{name}_pipe_ms", [])
     src_all=st.session_state.get(f"{name}_src_all", True);  src_sel=st.session_state.get(f"{name}_src_ms", [])
     ctry_all=st.session_state.get(f"{name}_ctry_all", True); ctry_sel=st.session_state.get(f"{name}_ctry_ms", [])
@@ -358,7 +350,7 @@ def assemble_meta(name: str, df: pd.DataFrame):
         ctry_all=ctry_all, ctry_sel=ctry_sel, cslr_all=cslr_all, cslr_sel=cslr_sel
     )
 
-def compute_outputs(meta):
+def compute_outputs(meta: Dict):
     base=meta["base"]; measures=meta["measures"]
     mtd=meta["mtd"]; cohort=meta["cohort"]
     mtd_from, mtd_to = meta["mtd_from"], meta["mtd_to"]
@@ -370,6 +362,7 @@ def compute_outputs(meta):
     show_combo_pairs=meta["show_combo_pairs"]
     metrics_rows, tables, charts = [], {}, {}
 
+    # MTD
     if mtd and mtd_from and mtd_to and measures:
         in_cre=base["Create Date"].between(pd.to_datetime(mtd_from), pd.to_datetime(mtd_to), inclusive="both")
         sub=base[in_cre].copy()
@@ -386,33 +379,33 @@ def compute_outputs(meta):
                 sub["_CreateCount"]=1
                 grp=sub.groupby(split_dims, dropna=False)[flags+["_CreateCount"]].sum().reset_index()
                 rename_map={"_CreateCount":"Create Count in window"}
-                for f, m in zip(flags, measures):
-                    rename_map[f] = f"MTD: {m}"
+                for f,m in zip(flags,measures): rename_map[f]=f"MTD: {m}"
                 grp=grp.rename(columns=rename_map).sort_values(by=f"MTD: {measures[0]}", ascending=False)
                 tables[f"MTD split by {', '.join(split_dims)}"]=grp
             if show_top_countries and "Country" in sub.columns:
                 g=sub.groupby("Country", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                 tables["Top 5 Countries — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             if show_top_sources and "JetLearn Deal Source" in sub.columns:
                 g=sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                 tables["Top 3 Deal Sources — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             if show_top_counsellors and "Student/Academic Counsellor" in sub.columns:
                 g=sub.groupby("Student/Academic Counsellor", dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures): g=g.rename(columns={f:f"MTD: {m}"})
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                 tables["Top 5 Counsellors — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub.columns):
                 both=sub.groupby(["Country","JetLearn Deal Source"], dropna=False)[flags].sum().reset_index()
-                for f, m in zip(flags, measures): both=both.rename(columns={f:f"MTD: {m}"})
+                both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                 tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
             trend=sub.copy()
             trend["Bucket"]=group_label_from_series(trend["Create Date"], f"{meta['name']}_mtd_grain")
             t=trend.groupby("Bucket")[flags].sum().reset_index()
-            for f, m in zip(flags, measures): t=t.rename(columns={f:m})
+            t=t.rename(columns={f:m for f,m in zip(flags,measures)})
             long=t.melt(id_vars="Bucket", var_name="Measure", value_name="Count")
             charts["MTD Trend"]=alt_line(long,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
 
+    # Cohort
     if cohort and coh_from and coh_to and measures:
         tmp=base.copy(); ch_flags=[]
         for m in measures:
@@ -428,24 +421,24 @@ def compute_outputs(meta):
                 tmp["_CreateInCohort"]=in_cre_coh.astype(int)
                 grp2=tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
                 rename_map2={"_CreateInCohort":"Create Count in Cohort window"}
-                for f, m in zip(ch_flags, measures): rename_map2[f]=f"Cohort: {m}"
+                for f,m in zip(ch_flags,measures): rename_map2[f]=f"Cohort: {m}"
                 grp2=grp2.rename(columns=rename_map2).sort_values(by=f"Cohort: {measures[0]}", ascending=False)
                 tables[f"Cohort split by {', '.join(split_dims)}"]=grp2
             if show_top_countries and "Country" in base.columns:
                 g=tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                 tables["Top 5 Countries — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             if show_top_sources and "JetLearn Deal Source" in base.columns:
                 g=tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                 tables["Top 3 Deal Sources — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
             if show_top_counsellors and "Student/Academic Counsellor" in base.columns:
                 g=tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures): g=g.rename(columns={f:f"Cohort: {m}"})
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                 tables["Top 5 Counsellors — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
                 both2=tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index()
-                for f, m in zip(ch_flags, measures): both2=both2.rename(columns={f:f"Cohort: {m}"})
+                both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                 tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
             frames=[]
             for m in measures:
@@ -457,6 +450,7 @@ def compute_outputs(meta):
             if frames:
                 trend=pd.concat(frames, ignore_index=True)
                 charts["Cohort Trend"]=alt_line(trend,"Bucket:O","Count:Q",color="Measure:N",tooltip=["Bucket","Measure","Count"])
+
     return metrics_rows, tables, charts
 
 def kpi_grid(dfk, label_prefix=""):
@@ -490,185 +484,12 @@ def mk_caption(meta):
             f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
             f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 
-# ---------------- Predictability (Upgraded ML) ----------------
-@st.cache_data(show_spinner=False)
-def build_enrolment_daily(df: pd.DataFrame, program_col: str|None):
-    """Daily enrolments by JetLearn Deal Source from Payment Received Date (fallback: first other date-like)."""
-    if "Payment Received Date" in df.columns:
-        measure = "Payment Received Date"
-    else:
-        dcols = [c for c in df.columns if c != "Create Date" and ("date" in c.lower() or "time" in c.lower())]
-        measure = dcols[0] if dcols else "Create Date"
-    work = df.copy()
-    work[measure] = pd.to_datetime(work[measure], errors="coerce")
-    work = work.dropna(subset=[measure])
-    work["d"] = work[measure].dt.date
-    cols = ["d", "JetLearn Deal Source"]
-    if program_col and program_col in work.columns:
-        cols.append(program_col)
-    g = work.groupby(cols, dropna=False).size().reset_index(name="y")
-    return g, measure
+# -------------------- Sidebar drawer --------------------
+def store_upload(key):
+    up=st.session_state.get(key)
+    if up is not None:
+        st.session_state["uploaded_bytes"]=up.getvalue(); st.rerun()
 
-def expand_calendar(start: date, end: date) -> pd.DataFrame:
-    rng = pd.date_range(start, end, freq="D")
-    out = pd.DataFrame({"d": rng.date})
-    out["dow"]  = rng.dayofweek
-    out["dom"]  = rng.day
-    out["mon"]  = rng.month
-    out["doy"]  = rng.dayofyear
-    out["woy"]  = rng.isocalendar().week.astype(int)
-    out["trend"]= np.arange(len(out))
-    return out
-
-def make_feats(full_cal: pd.DataFrame, hist: pd.DataFrame):
-    x = pd.merge(full_cal, hist.rename(columns={"y":"y_hist"}), on="d", how="left")
-    x["y"] = x["y_hist"].fillna(0.0)
-    x = x.drop(columns=["y_hist"])
-    # lags & rolling mean
-    x["lag1"]  = x["y"].shift(1)
-    x["lag7"]  = x["y"].shift(7)
-    x["roll7"] = x["y"].rolling(7, min_periods=1).mean()
-    # fill features
-    X = x[["trend","dow","dom","mon","doy","woy","lag1","lag7","roll7"]].fillna(0.0)
-    y = x["y"].values
-    return x, X, y
-
-def fit_model(X, y, name: str):
-    if name == "Linear":
-        mdl = LinearRegression()
-    elif name == "Ridge":
-        mdl = Ridge(alpha=1.0, random_state=None)
-    elif name == "RandomForest":
-        mdl = RandomForestRegressor(n_estimators=300, max_depth=8, random_state=42, n_jobs=-1, min_samples_leaf=2)
-    elif name == "GBDT":
-        mdl = GradientBoostingRegressor(random_state=42, max_depth=3, n_estimators=300, learning_rate=0.05)
-    else:
-        return None
-    mdl.fit(X, y)
-    return mdl
-
-def naive_mean_forecaster(y_hist: np.ndarray, days:int):
-    mu = float(pd.Series(y_hist).tail(28).mean() if len(y_hist)>0 else 0.0)
-    sigma = float(pd.Series(y_hist).tail(28).std(ddof=1) if len(y_hist)>1 else 0.0)
-    return np.full(days, mu), sigma
-
-def walk_forward_backtest(ts: pd.DataFrame, model_name: str, fold_size:int=14, n_folds:int=3):
-    """
-    Rolling-origin backtest. Each fold trains on all data up to split point and
-    predicts next 'fold_size' days. Returns metrics & residual stats.
-    """
-    ts = ts.sort_values("d").reset_index(drop=True)
-    if len(ts) < max(28, fold_size*(n_folds+1)):
-        return None  # not enough data
-
-    start_idx = len(ts) - fold_size*n_folds
-    folds = []
-    errors = []
-    preds_all = []
-    acts_all  = []
-    for f in range(n_folds):
-        end_train = start_idx + f*fold_size
-        train = ts.iloc[:end_train].copy()
-        test  = ts.iloc[end_train:end_train+fold_size].copy()
-        # calendar covering train + test
-        cal = expand_calendar(train["d"].min(), test["d"].max())
-        _, X_full, y_full = make_feats(cal, train.rename(columns={"y":"y"}))
-        # indexes for test part
-        X_train = X_full.iloc[:len(cal)-fold_size]
-        y_train = y_full[:len(cal)-fold_size]
-        X_test  = X_full.iloc[len(cal)-fold_size:]
-        # predict
-        if model_name == "Naive":
-            yhat, sigma = naive_mean_forecaster(y_train, fold_size)
-        else:
-            mdl = fit_model(X_train, y_train, model_name)
-            if mdl is None:
-                yhat, sigma = naive_mean_forecaster(y_train, fold_size)
-            else:
-                yhat = mdl.predict(X_test)
-                # residual sigma from train fit
-                y_fit = mdl.predict(X_train)
-                sigma = float(np.sqrt(np.mean((y_train - y_fit)**2))) if len(y_train)>0 else 0.0
-        y_true = test["y"].values.astype(float)
-        preds_all.append(yhat); acts_all.append(y_true)
-        err = y_true - yhat
-        errors.append(err)
-        folds.append(dict(y_true=y_true, yhat=yhat, sigma=sigma))
-
-    y_true_all = np.concatenate(acts_all)
-    y_pred_all = np.concatenate(preds_all)
-    abs_err = np.abs(y_true_all - y_pred_all)
-    mae  = float(abs_err.mean())
-    mape = float(np.mean(abs_err / np.maximum(1e-9, y_true_all)))  # guard zero
-    wape = float(abs_err.sum() / np.maximum(1e-9, y_true_all.sum()))
-    bias = float((y_pred_all.sum() - y_true_all.sum()) / np.maximum(1e-9, y_true_all.sum()))
-    sigma_resid = float(np.sqrt(np.mean(np.concatenate(errors)**2)))
-    return dict(MAE=mae, MAPE=mape, WAPE=wape, Bias=bias, Sigma=sigma_resid)
-
-def train_best_model(ts: pd.DataFrame, candidates=("GBDT","RandomForest","Ridge","Linear","Naive")):
-    """
-    Backtests all candidates, picks best by MAPE, then fits final on full history.
-    Returns (best_name, metrics, final_model_or_None, sigma, bias_for_calibration)
-    """
-    # evaluate
-    results = {}
-    for name in candidates:
-        bt = walk_forward_backtest(ts, name, fold_size=14, n_folds=3)
-        if bt is not None:
-            results[name] = bt
-    if not results:
-        # fallback if insufficient data
-        name = "Naive"
-        bt = dict(MAE=np.nan, MAPE=np.nan, WAPE=np.nan, Bias=0.0, Sigma=0.0)
-        final = None; sigma=0.0; bias=0.0
-        return name, bt, final, sigma, bias
-
-    # pick best by MAPE (lowest)
-    best = min(results.items(), key=lambda kv: (np.inf if np.isnan(kv[1]["MAPE"]) else kv[1]["MAPE"]))
-    best_name, best_metrics = best
-
-    # fit final
-    cal = expand_calendar(ts["d"].min(), ts["d"].max())
-    _, X_full, y_full = make_feats(cal, ts.rename(columns={"y":"y"}))
-    if best_name == "Naive":
-        final = None
-        sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
-    else:
-        final = fit_model(X_full, y_full, best_name)
-        if final is None:
-            sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
-        else:
-            y_fit = final.predict(X_full)
-            sigma = float(np.sqrt(np.mean((y_full - y_fit)**2))) if len(y_full)>0 else 0.0
-
-    # bias from backtest to de-bias forecasts
-    bias = best_metrics.get("Bias", 0.0)
-    return best_name, best_metrics, final, sigma, bias
-
-def predict_with_model(ts: pd.DataFrame, model_name: str, final_model, start: date, end: date, sigma: float, de_bias: float=0.0):
-    cal_hist = expand_calendar(ts["d"].min(), end)
-    _, X_full, y_full = make_feats(cal_hist, ts.rename(columns={"y":"y"}))
-    # horizon rows
-    cal_h = expand_calendar(start, end)
-    horizon_days = len(cal_h)
-    X_pred = X_full.iloc[-horizon_days:]
-    # predict
-    if model_name == "Naive" or final_model is None:
-        yhat, sigma_est = naive_mean_forecaster(y_full, horizon_days)
-        sigma_use = sigma if sigma>0 else sigma_est
-        yhat = yhat
-    else:
-        yhat = final_model.predict(X_pred)
-        sigma_use = sigma
-    # de-bias: if bias > 0 means over-forecast; reduce by factor (1+bias)
-    if np.isfinite(de_bias) and de_bias != 0.0:
-        yhat = yhat / (1.0 + de_bias)
-    lo = np.clip(yhat - 1.64*sigma_use, 0, None)
-    hi = np.clip(yhat + 1.64*sigma_use, 0, None)
-    out = pd.DataFrame({"d": cal_h["d"], "yhat": yhat, "yhat_lo": lo, "yhat_hi": hi})
-    return out
-
-# ---------------- Sidebar drawer ----------------
 if st.session_state.get("filters_open", True):
     with st.sidebar:
         with st.expander("Scenario A controls", expanded=True):
@@ -678,30 +499,25 @@ if st.session_state.get("filters_open", True):
                 scenario_filters_block("B", df)
         with st.expander("Data source (optional)", expanded=False):
             st.caption("Upload a CSV or provide a file path. If both are given, upload takes precedence.")
-            st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=_store_upload, args=("__uploader__",))
+            st.file_uploader("Upload CSV", type=["csv"], key="__uploader__", on_change=store_upload, args=("__uploader__",))
             st.text_input("CSV path", key="csv_path")
 
-# ---------------- Compute A/B ----------------
+# -------------------- Compute A/B --------------------
 metaA = assemble_meta("A", df)
 with st.spinner("Crunching scenario A…"):
     metricsA, tablesA, chartsA = compute_outputs(metaA)
+
 if st.session_state["show_b"]:
     metaB = assemble_meta("B", df)
     with st.spinner("Crunching scenario B…"):
         metricsB, tablesB, chartsB = compute_outputs(metaB)
 
-# ---------------- Tabs ----------------
-tabs = ["Scenario A"]
+# -------------------- Tabs --------------------
 if st.session_state["show_b"]:
-    tabs += ["Scenario B", "Compare"]
-tabs += ["Predictability"]
-t_objs = st.tabs(tabs)
-tabA = t_objs[0]
-tabB = t_objs[1] if st.session_state["show_b"] else None
-tabC = t_objs[2] if st.session_state["show_b"] else None
-tabPred = t_objs[-1]
+    tabA, tabB, tabC, tabP = st.tabs(["Scenario A", "Scenario B", "Compare", "Predictability"])
+else:
+    tabA, tabP = st.tabs(["Scenario A", "Predictability"])
 
-# ---------------- Render A ----------------
 with tabA:
     st.markdown("<div class='section-title'>📌 KPI Overview — A</div>", unsafe_allow_html=True)
     dfA=pd.DataFrame(metricsA); kpi_grid(dfA, "A · ")
@@ -716,7 +532,6 @@ with tabA:
     if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
     if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
 
-# ---------------- Render B + Compare ----------------
 if st.session_state["show_b"]:
     with tabB:
         st.markdown("<div class='section-title'>📌 KPI Overview — B</div>", unsafe_allow_html=True)
@@ -759,188 +574,308 @@ if st.session_state["show_b"]:
                 except Exception:
                     pass
 
-# ---------------- Predictability Tab (Upgraded) ----------------
-with tabPred:
-    st.markdown("<div class='section-title'>🔮 Predictability — Source-wise Enrolment Forecast (with Backtesting)</div>", unsafe_allow_html=True)
-    st.caption("Forecasts **enrolments** by **JetLearn Deal Source** from *Payment Received Date* (or nearest date-like). "
-               "Uses rolling-origin backtests to choose the best model per source and reports accuracy metrics.")
-
-    colH, colP, colM = st.columns([2,2,3])
-    with colH:
-        horizon = st.selectbox("Horizon", ["Today","Tomorrow","This Week","Next Week","This Month","Next Month","Custom"])
-    with colP:
-        # Program filter
-        if program_col:
-            prog_choice = st.selectbox("Program", ["Both","AI-Coding","Math","Custom filter…"], index=0)
-            prog_custom = None
-            if prog_choice == "Custom filter…":
-                all_vals = sorted([v for v in df[program_col].dropna().astype(str).unique()])
-                prog_custom = st.multiselect("Choose program values", all_vals, default=all_vals)
-        else:
-            prog_choice = "Both"
-            st.info("No program column found — treating **Both** as all records.", icon="ℹ️")
-    with colM:
-        model_pref = st.selectbox("Model preference", ["Auto (best MAPE)","GBDT","RandomForest","Ridge","Linear","Naive"], index=0)
-        do_backtest = st.toggle("Show backtest details", value=True)
-        de_bias_on  = st.toggle("De-bias forecasts using backtest bias", value=True)
-
-    # Horizon dates
-    if horizon == "Today":
-        H_from, H_to = today_bounds()
-    elif horizon == "Tomorrow":
-        t = pd.Timestamp.today().date() + timedelta(days=1)
-        H_from, H_to = t, t
-    elif horizon == "This Week":
-        H_from, H_to = this_week_bounds()
-    elif horizon == "Next Week":
-        H_from, H_to = next_week_bounds()
-    elif horizon == "This Month":
-        H_from, H_to = this_month_bounds()
-    elif horizon == "Next Month":
-        H_from, H_to = next_month_bounds()
+# -------------------- Predictability Tab --------------------
+def _resample_counts(df_in: pd.DataFrame, date_col: str, grain: str, by_source: bool):
+    # grain -> Pandas rule
+    rule = "D" if grain=="Day" else ("W-MON" if grain=="Week" else "MS")
+    cols = [date_col]
+    if by_source: cols += ["JetLearn Deal Source"]
+    s = df_in[cols].dropna(subset=[date_col]).copy()
+    s["_dt"] = pd.to_datetime(s[date_col])
+    if by_source:
+        g = (s.groupby([pd.Grouper(key="_dt", freq=rule), "JetLearn Deal Source"])
+               .size().reset_index(name="y"))
+        # complete each source's timeline
+        frames=[]
+        for src, sub in g.groupby("JetLearn Deal Source"):
+            full_idx = pd.date_range(sub["_dt"].min(), sub["_dt"].max(), freq=rule)
+            sub = sub.set_index("_dt").reindex(full_idx).fillna(0).rename_axis("_dt").reset_index()
+            sub["JetLearn Deal Source"]=src
+            frames.append(sub)
+        g = pd.concat(frames, ignore_index=True)
     else:
-        dmin, dmax = safe_minmax_date(df["Create Date"])
-        rng = st.date_input("Custom forecast range", (dmin, dmax))
-        H_from, H_to = (rng[0], rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin,dmax)
+        g = (s.groupby(pd.Grouper(key="_dt", freq=rule))
+               .size().reset_index(name="y"))
+        full_idx = pd.date_range(g["_dt"].min(), g["_dt"].max(), freq=rule)
+        g = g.set_index("_dt").reindex(full_idx).fillna(0).rename_axis("_dt").reset_index()
+    g["y"] = g["y"].astype(float)
+    return g, rule
 
-    with st.spinner("Preparing time series…"):
-        daily, used_measure = build_enrolment_daily(df, program_col)
-        # Program filter
-        if program_col and prog_choice != "Both":
-            if prog_choice == "AI-Coding":
-                daily = daily[daily[program_col].astype(str).str.contains("ai", case=False, na=False)]
-            elif prog_choice == "Math":
-                daily = daily[daily[program_col].astype(str).str.contains("math", case=False, na=False)]
-            elif prog_choice == "Custom filter…":
-                if prog_custom:
-                    daily = daily[daily[program_col].astype(str).isin(prog_custom)]
-                else:
-                    st.warning("No program values selected; using all.")
-        sources = sorted(daily["JetLearn Deal Source"].dropna().astype(str).unique())
+def _lag_features(frame: pd.DataFrame, grain: str) -> pd.DataFrame:
+    # simple supervised lags + time features
+    lags = [1,2,3]
+    if grain=="Day": lags += [7,14,28]
+    dfX = frame.copy()
+    for L in lags:
+        dfX[f"lag_{L}"] = dfX["y"].shift(L)
+    # time features
+    dt = pd.to_datetime(dfX["_dt"])
+    dfX["month"] = dt.dt.month
+    if grain=="Day":
+        dfX["dow"]   = dt.dt.dayofweek
+        dfX["week"]  = dt.dt.isocalendar().week.astype(int)
+    elif grain=="Week":
+        dfX["week"]  = dt.dt.isocalendar().week.astype(int)
+    dfX = dfX.dropna().reset_index(drop=True)
+    return dfX
 
-    st.caption(f"Using enrolment signal from **{used_measure}**.")
-    rows = []
-    daily_forecasts = {}
-    bt_rows = []
+def _walk_forward_backtest(dfX: pd.DataFrame, n_splits: int = 5) -> Tuple[float,float,float,float]:
+    # rolling CV (de-biased)
+    if len(dfX) < 40:  # small data guard
+        n_splits = max(2, min(4, len(dfX)//10))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    maes, mapes = [], []
+    X = dfX.drop(columns=["y","_dt"])
+    y = dfX["y"].values
+    for train_idx, test_idx in tscv.split(X):
+        Xtr, Xte = X.iloc[train_idx], X.iloc[test_idx]
+        ytr, yte = y[train_idx], y[test_idx]
+        pipe = SkPipeline([
+            ("sc", StandardScaler(with_mean=False)),
+            ("rf", RandomForestRegressor(n_estimators=300, random_state=42))
+        ])
+        pipe.fit(Xtr, ytr)
+        pred = np.maximum(0, pipe.predict(Xte))  # non-negative
+        maes.append(mean_absolute_error(yte, pred))
+        denom = np.where(yte==0, np.nan, yte)
+        mape = np.nanmean(np.abs((pred - yte)/denom))*100
+        mapes.append(mape)
+    mae = float(np.nanmean(maes))
+    mape = float(np.nanmean(mapes))
+    # 95% CI via fold errors
+    mae_ci = 1.96*np.nanstd(maes, ddof=1)/np.sqrt(len(maes)) if len(maes)>1 else 0.0
+    mape_ci = 1.96*np.nanstd(mapes, ddof=1)/np.sqrt(len(mapes)) if len(mapes)>1 else 0.0
+    return mae, mae_ci, mape, mape_ci
 
-    with st.spinner("Backtesting & forecasting per source…"):
-        for src in sources:
-            ts = (daily[daily["JetLearn Deal Source"].astype(str)==src]
-                    .groupby("d")["y"].sum().reset_index())
-            if ts.empty or len(ts)<21:
-                continue
-
-            if model_pref.startswith("Auto"):
-                best_name, metrics, final_model, sigma, bias = train_best_model(ts)
+def _fit_and_forecast(dfX: pd.DataFrame, horizon: int) -> np.ndarray:
+    Xfull = dfX.drop(columns=["y","_dt"]).copy()
+    yfull = dfX["y"].values
+    pipe = SkPipeline([
+        ("sc", StandardScaler(with_mean=False)),
+        ("rf", RandomForestRegressor(n_estimators=300, random_state=42))
+    ])
+    pipe.fit(Xfull, yfull)
+    # recursive (use last rows to build lags)
+    df_for = dfX.copy()
+    preds = []
+    for _ in range(horizon):
+        # build next-row features from last known row
+        last = df_for.iloc[-1:].copy()
+        new = last.copy()
+        # shift lags
+        for col in [c for c in df_for.columns if c.startswith("lag_")]:
+            L = int(col.split("_")[1])
+            # lag_L (new) = lag_{L-1} (last) or y for L==1
+            if L==1:
+                new[col] = last["y"].values
             else:
-                # Evaluate the chosen model too (so we still have metrics)
-                metrics = walk_forward_backtest(ts, "Naive", fold_size=14, n_folds=3) or dict(MAE=np.nan, MAPE=np.nan, WAPE=np.nan, Bias=0.0, Sigma=0.0)
-                # Train on full for selected model
-                cal = expand_calendar(ts["d"].min(), ts["d"].max())
-                _, X_full, y_full = make_feats(cal, ts.rename(columns={"y":"y"}))
-                if model_pref == "Naive":
-                    best_name, final_model = "Naive", None
-                    sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
-                    bias = 0.0
-                else:
-                    mdl = fit_model(X_full, y_full, model_pref)
-                    if mdl is None:
-                        best_name, final_model = "Naive", None
-                        sigma = float(pd.Series(y_full).tail(28).std(ddof=1) if len(y_full)>1 else 0.0)
-                        bias = 0.0
-                    else:
-                        best_name, final_model = model_pref, mdl
-                        y_fit = mdl.predict(X_full)
-                        sigma = float(np.sqrt(np.mean((y_full - y_fit)**2))) if len(y_full)>0 else 0.0
-                        # Also compute model's own backtest metrics
-                        mt = walk_forward_backtest(ts, model_pref, fold_size=14, n_folds=3)
-                        if mt is not None:
-                            metrics = mt
-                        bias = metrics.get("Bias", 0.0)
+                prev = f"lag_{L-1}"
+                new[col] = last[prev].values
+        # time step forward (month/week/dow approximations)
+        new["_dt"] = pd.to_datetime(last["_dt"].values[0]) + (pd.Timedelta(days=1))
+        new["month"] = int(pd.to_datetime(new["_dt"]).dt.month)
+        if "dow" in new.columns:
+            new["dow"] = int((int(last["dow"]) + 1) % 7)
+        if "week" in new.columns:
+            new["week"] = int(pd.to_datetime(new["_dt"]).dt.isocalendar().week)
+        Xnew = new.drop(columns=["y","_dt"])
+        yhat = float(pipe.predict(Xnew)[0])
+        yhat = max(0.0, yhat)
+        new["y"] = yhat
+        preds.append(yhat)
+        df_for = pd.concat([df_for, new], ignore_index=True)
+    return np.array(preds, dtype=float)
 
-            # Forecast
-            pred_df = predict_with_model(ts, best_name, final_model, H_from, H_to, sigma=sigma, de_bias=bias if de_bias_on else 0.0)
-            pred_sum = float(pred_df["yhat"].sum())
-            lo = float(pred_df["yhat_lo"].sum())
-            hi = float(pred_df["yhat_hi"].sum())
-            acc = (1.0 - (metrics["MAPE"] if np.isfinite(metrics["MAPE"]) else np.nan))*100.0
+def _preset_to_horizon(grain: str, choice: str) -> Tuple[pd.Timestamp, int, List[str]]:
+    today = pd.Timestamp.today().normalize()
+    if grain=="Day":
+        if choice=="Today":    start, periods, idx = today, 1, [str(today.date())]
+        elif choice=="Tomorrow": 
+            d = today + pd.Timedelta(days=1); start, periods, idx = d, 1, [str(d.date())]
+        elif choice=="This Month":
+            start = today.replace(day=today.day)  # next steps will fill
+            last_day = (today.replace(day=1) + pd.offsets.MonthEnd(1))
+            days = (last_day - today).days + 1
+            periods = days; idx = [str((today + pd.Timedelta(days=i)).date()) for i in range(days)]
+        elif choice=="Next Month":
+            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
+            last_next = (first_next + pd.offsets.MonthEnd(1))
+            days = (last_next - first_next).days + 1
+            periods = days; idx = [str((first_next + pd.Timedelta(days=i)).date()) for i in range(days)]
+        else:  # Custom handled outside
+            start, periods, idx = today, 1, [str(today.date())]
+    elif grain=="Week":
+        # Forecast 1 period for This/Next month as weekly sums
+        if choice in ("Today","Tomorrow"): choice="This Month"
+        if choice=="This Month":
+            start = today
+            last_day = (today.replace(day=1) + pd.offsets.MonthEnd(1))
+            weeks = int(np.ceil((last_day - today).days/7))+1
+            periods = max(1, weeks)
+            idx = [f"{(today + pd.Timedelta(weeks=i)).date()}" for i in range(periods)]
+        else:  # Next Month
+            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
+            weeks = 4
+            periods = weeks
+            idx = [f"{(first_next + pd.Timedelta(weeks=i)).date()}" for i in range(periods)]
+    else:  # Month grain
+        if choice in ("Today","Tomorrow"): choice="This Month"
+        if choice=="This Month":
+            start = today.replace(day=1)
+            periods = 1; idx=[str(start.date())]
+        else: # Next Month
+            first_next = (today.replace(day=1) + pd.offsets.MonthBegin(1))
+            start = first_next
+            periods = 1; idx=[str(first_next.date())]
+    return pd.to_datetime(start), int(periods), idx
 
-            rows.append({
-                "JetLearn Deal Source": src,
-                "Model": best_name,
-                "Accuracy % (1-MAPE)": None if np.isnan(acc) else round(acc,1),
-                "MAE": None if np.isnan(metrics["MAE"]) else round(metrics["MAE"],2),
-                "Bias %": round(metrics["Bias"]*100.0,1) if np.isfinite(metrics["Bias"]) else None,
-                "Predicted": round(pred_sum,1),
-                "Lower (90%)": round(lo,1),
-                "Upper (90%)": round(hi,1),
-            })
-            if do_backtest:
-                bt_rows.append({
-                    "JetLearn Deal Source": src,
-                    "Model": best_name,
-                    "MAPE": None if np.isnan(metrics["MAPE"]) else round(metrics["MAPE"]*100.0,1),
-                    "WAPE": None if np.isnan(metrics["WAPE"]) else round(metrics["WAPE"]*100.0,1),
-                    "MAE": None if np.isnan(metrics["MAE"]) else round(metrics["MAE"],2),
-                    "Bias %": round(metrics["Bias"]*100.0,1) if np.isfinite(metrics["Bias"]) else None,
-                    "Sigma (RMSE of resid)": round(metrics["Sigma"],2)
-                })
-            daily_forecasts[src] = pred_df.assign(source=src)
+with tabP:
+    st.markdown("### 🔮 Predictability")
+    with st.expander("Settings", expanded=True):
+        # Base: use Scenario A global filters as context
+        base_pred = metaA["base"].copy()
+        # Measure to predict (default Payment Received Date if present)
+        default_measure = "Payment Received Date" if "Payment Received Date" in date_like_cols else date_like_cols[0]
+        target_measure = st.selectbox("Target date to predict (count of events)", options=date_like_cols,
+                                      index=date_like_cols.index(default_measure))
+        # Program filter via Pipeline
+        prog_choice = st.radio("Program (from Pipeline)", ["Both", "AI-Coding", "Math"], horizontal=True)
+        base_pred = subset_for_program(base_pred, prog_choice)
 
-    if not rows:
-        st.warning("Not enough historical enrolments to produce a robust forecast.")
+        # Grain + horizon
+        grain = st.radio("Forecast granularity", ["Day","Week","Month"], horizontal=True, index=0)
+        horizon_choice = st.radio("Horizon preset", ["Today","Tomorrow","This Month","Next Month","Custom"], horizontal=True, index=2)
+        custom_range = None
+        if horizon_choice=="Custom":
+            dmin, dmax = safe_minmax_date(base_pred[target_measure].dropna())
+            custom_range = st.date_input("Custom forecast window (start → end)", (dmin, dmax))
+        split_by_source = st.toggle("Split by JetLearn Deal Source", value=True)
+        st.caption("Backtest uses walk-forward rolling windows with no look-ahead, scalers fit on train only, and non-negative predictions.")
+
+    # Build training series
+    tmp = base_pred.dropna(subset=[target_measure]).copy()
+    if tmp.empty:
+        st.warning("No rows for selected target. Pick another date column.")
     else:
-        pred_table = pd.DataFrame(rows).sort_values("Predicted", ascending=False)
-        # Totals
-        tot = {
-            "JetLearn Deal Source": "TOTAL",
-            "Model": "—",
-            "Accuracy % (1-MAPE)": None,
-            "MAE": None,
-            "Bias %": None,
-            "Predicted": round(pred_table["Predicted"].sum(),1),
-            "Lower (90%)": round(pred_table["Lower (90%)"].sum(),1),
-            "Upper (90%)": round(pred_table["Upper (90%)"].sum(),1),
-        }
-        # Weighted MAPE across sources (by actuals is better; we don't have future actuals—so weight by predicted)
-        valid_acc = pred_table.dropna(subset=["Accuracy % (1-MAPE)"])
-        if not valid_acc.empty:
-            weights = valid_acc["Predicted"].replace(0, np.nan)
-            w_acc = np.nansum(valid_acc["Accuracy % (1-MAPE)"]*weights)/np.nansum(weights)
-            tot["Accuracy % (1-MAPE)"] = round(w_acc,1)
-        # Render table
-        st.subheader(f"Forecast for {H_from} → {H_to}")
-        st.dataframe(pd.concat([pd.DataFrame([tot]), pred_table], ignore_index=True), use_container_width=True)
+        if split_by_source:
+            # per-source
+            series, rule = _resample_counts(tmp, target_measure, grain, by_source=True)
+            outputs = []
+            charts = []
+            metrics_list = []
+            for src, sub in series.groupby("JetLearn Deal Source"):
+                fX = _lag_features(sub[["_dt","y"]].copy(), grain)
+                if fX.empty or fX["y"].sum()==0:
+                    continue
+                mae, mae_ci, mape, mape_ci = _walk_forward_backtest(fX)
+                # Forecast horizon
+                if horizon_choice!="Custom":
+                    start_dt, periods, idx = _preset_to_horizon(grain, horizon_choice)
+                else:
+                    if isinstance(custom_range,(tuple,list)) and len(custom_range)==2:
+                        start_dt = pd.to_datetime(custom_range[0])
+                        end_dt   = pd.to_datetime(custom_range[1])
+                        if grain=="Day":
+                            periods = max(1, (end_dt - start_dt).days + 1)
+                        elif grain=="Week":
+                            periods = max(1, int(np.ceil((end_dt - start_dt).days/7)))
+                        else:
+                            # months between
+                            periods = max(1, (end_dt.year - start_dt.year)*12 + (end_dt.month - start_dt.month) + 1)
+                        idx = [str((start_dt + (pd.offsets.Day(i) if grain=="Day" else (pd.offsets.Week(i) if grain=="Week" else pd.offsets.MonthBegin(i)))).date())
+                               for i in range(periods)]
+                    else:
+                        start_dt, periods, idx = _preset_to_horizon(grain, "This Month")
+                preds = _fit_and_forecast(fX, periods)
+                df_src = pd.DataFrame({"When": idx, "Predicted Count": preds.astype(int)})
+                df_src.insert(0, "JetLearn Deal Source", src)
+                outputs.append(df_src)
+                metrics_list.append({"Source": src, "MAE": round(mae,2), "MAE±95%": round(mae_ci,2),
+                                     "MAPE%": round(mape,1), "MAPE±95%": round(mape_ci,1)})
+                # Chart
+                hist = sub.rename(columns={"_dt":"When", "y":"Count"}).copy()
+                hist["When"] = pd.to_datetime(hist["When"])
+                last_hist = hist.iloc[-min(len(hist), 100):]  # last window
+                fore = pd.DataFrame({"When": pd.to_datetime(idx), "Count": preds})
+                ch = alt.Chart(last_hist).mark_line().encode(
+                    x=alt.X("When:T", title=None), y=alt.Y("Count:Q", title="Count"),
+                    tooltip=[alt.Tooltip("When:T"), alt.Tooltip("Count:Q")]
+                ).properties(height=220)
+                ch2 = alt.Chart(fore).mark_line(color="#2563eb", strokeDash=[4,3]).encode(
+                    x="When:T", y="Count:Q", tooltip=["When:T","Count:Q"]
+                )
+                charts.append((src, ch + ch2))
+            if not outputs:
+                st.warning("No per-source data to forecast. Try turning off 'Split by source' or pick another target.")
+            else:
+                st.subheader("Per-source forecast")
+                out = pd.concat(outputs, ignore_index=True)
+                st.dataframe(out, use_container_width=True)
+                st.download_button("Download per-source forecast CSV", to_csv_bytes(out),
+                                   file_name="forecast_per_source.csv", mime="text/csv")
+                st.subheader("Per-source backtest metrics")
+                met = pd.DataFrame(metrics_list).sort_values("MAE")
+                st.dataframe(met, use_container_width=True)
+                st.subheader("Per-source charts")
+                for src, chart in charts:
+                    st.markdown(f"**{src}**")
+                    st.altair_chart(chart, use_container_width=True)
+                # Overall aggregate from per-source predictions
+                agg = out.groupby("When", as_index=False)["Predicted Count"].sum()
+                st.subheader("Overall predicted total")
+                st.dataframe(agg, use_container_width=True)
+                st.download_button("Download overall forecast CSV", to_csv_bytes(agg),
+                                   file_name="forecast_overall.csv", mime="text/csv")
+        else:
+            # overall only
+            series, rule = _resample_counts(tmp, target_measure, grain, by_source=False)
+            fX = _lag_features(series[["_dt","y"]].copy(), grain)
+            if fX.empty or fX["y"].sum()==0:
+                st.warning("Not enough history to train. Try another target or grain.")
+            else:
+                mae, mae_ci, mape, mape_ci = _walk_forward_backtest(fX)
+                if horizon_choice!="Custom":
+                    start_dt, periods, idx = _preset_to_horizon(grain, horizon_choice)
+                else:
+                    dmin, dmax = safe_minmax_date(tmp[target_measure])
+                    rng = st.date_input("Custom forecast window (start → end)", (dmin, dmax), key="pred_custom")
+                    if isinstance(rng,(tuple,list)) and len(rng)==2:
+                        start_dt = pd.to_datetime(rng[0]); end_dt = pd.to_datetime(rng[1])
+                        if grain=="Day":
+                            periods = max(1, (end_dt - start_dt).days + 1)
+                        elif grain=="Week":
+                            periods = max(1, int(np.ceil((end_dt - start_dt).days/7)))
+                        else:
+                            periods = max(1, (end_dt.year - start_dt.year)*12 + (end_dt.month - start_dt.month) + 1)
+                        idx = [str((start_dt + (pd.offsets.Day(i) if grain=="Day" else (pd.offsets.Week(i) if grain=="Week" else pd.offsets.MonthBegin(i)))).date())
+                               for i in range(periods)]
+                    else:
+                        start_dt, periods, idx = _preset_to_horizon(grain, "This Month")
+                preds = _fit_and_forecast(fX, periods)
+                out = pd.DataFrame({"When": idx, "Predicted Count": preds.astype(int)})
+                st.subheader("Forecast (overall)")
+                st.dataframe(out, use_container_width=True)
+                st.download_button("Download forecast CSV", to_csv_bytes(out),
+                                   file_name="forecast_overall.csv", mime="text/csv")
+                st.markdown("**Backtest (de-biased)**")
+                st.write(f"MAE: **{mae:.2f} ± {mae_ci:.2f}**, MAPE: **{mape:.1f}% ± {mape_ci:.1f}%** (95% CI)")
+                # Chart
+                hist = series.rename(columns={"_dt":"When", "y":"Count"}).copy()
+                hist["When"] = pd.to_datetime(hist["When"])
+                last_hist = hist.iloc[-min(len(hist), 120):]
+                fore = pd.DataFrame({"When": pd.to_datetime(idx), "Count": preds})
+                ch = alt.Chart(last_hist).mark_line().encode(
+                    x=alt.X("When:T", title=None), y=alt.Y("Count:Q", title="Count"),
+                    tooltip=[alt.Tooltip("When:T"), alt.Tooltip("Count:Q")]
+                ).properties(height=260)
+                ch2 = alt.Chart(fore).mark_line(color="#2563eb", strokeDash=[4,3]).encode(
+                    x="When:T", y="Count:Q", tooltip=["When:T","Count:Q"]
+                )
+                st.altair_chart(ch + ch2, use_container_width=True)
 
-        # Bar chart for predictions
-        chart_df = pred_table.rename(columns={"Predicted":"yhat"})
-        st.altair_chart(
-            alt_bar(chart_df, x="JetLearn Deal Source:N", y="yhat:Q",
-                    tooltip=["JetLearn Deal Source","yhat","Lower (90%)","Upper (90%)","Model","Accuracy % (1-MAPE)"]),
-            use_container_width=True
-        )
-
-        if do_backtest and bt_rows:
-            st.markdown("**Backtest metrics (rolling-origin)**")
-            bt_df = pd.DataFrame(bt_rows).sort_values("MAPE", ascending=True)
-            st.dataframe(bt_df, use_container_width=True)
-
-        with st.expander("Daily forecast details"):
-            long_df = pd.concat(daily_forecasts.values(), ignore_index=True) if daily_forecasts else pd.DataFrame()
-            if not long_df.empty:
-                st.dataframe(long_df.sort_values(["source","d"]), use_container_width=True)
-                st.download_button("Download daily forecast (CSV)", to_csv_bytes(long_df),
-                                   file_name="daily_forecast.csv", mime="text/csv")
-
-# ---------------- Footer ----------------
+# -------------------- Footers --------------------
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-def mk_caption(meta):
-    return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-            f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
-            f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
-            f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
-            f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
-st.caption("**Scenario A** — " + mk_caption(assemble_meta("A", df)))
+st.caption("**Scenario A** — " + mk_caption(metaA))
 if st.session_state["show_b"]:
     st.caption("**Scenario B** — " + mk_caption(assemble_meta("B", df)))
 st.caption("Excluded globally: 1.2 Invalid Deal")
