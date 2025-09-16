@@ -1,5 +1,5 @@
-# app_drawer_ui_v3.py
-# Minimal, world-class drawer UI with safe multiselect defaults + fixed renames.
+# app_drawer_ui_v4.py
+# Drawer UI with hamburger toggle (no "Close drawer" button)
 
 import streamlit as st
 import pandas as pd
@@ -22,10 +22,6 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
   padding:10px 12px; background:#0b1220; color:#fff; border-radius:12px; margin-bottom:10px;
 }
 .topbar .title { font-weight:800; font-size:1.02rem; margin-right:auto; white-space:nowrap; }
-.topbar .btn {
-  background:#111827; color:#e5e7eb; padding:6px 10px; border-radius:10px; cursor:pointer;
-  border:1px solid #1f2937;
-}
 .section-title { font-weight:800; margin:.25rem 0 .6rem; color:var(--text); }
 .kpi { padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--card); }
 .kpi .label { color:var(--muted); font-size:.78rem; margin-bottom:4px; }
@@ -33,9 +29,6 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 .kpi .delta { font-size:.84rem; color: var(--blue-600); }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
-.sidebar-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
-.sidebar-close { background:#fff; border:1px solid var(--border); color:#111; padding:6px 10px; border-radius:10px; cursor:pointer; width:100%; }
-.sidebar-caption { color:#111; font-weight:700; }
 .popcap { font-size:.78rem; color:var(--muted); margin-top:2px; }
 </style>
 """, unsafe_allow_html=True)
@@ -159,7 +152,9 @@ if "csv_path" not in st.session_state: st.session_state["csv_path"] = "Master_sh
 if "uploaded_bytes" not in st.session_state: st.session_state["uploaded_bytes"] = None
 
 # ---------------- Safe callbacks ----------------
-def _toggle_filters(open_state: bool): st.session_state["filters_open"] = open_state
+def _toggle_filters_toggle():
+    st.session_state["filters_open"] = not st.session_state.get("filters_open", True)
+
 def _enable_b(): st.session_state["show_b"] = True
 def _disable_b(): st.session_state["show_b"] = False
 def _select_all_cb(ms_key: str, all_key: str, options: list):
@@ -180,8 +175,7 @@ with st.container():
     with c1:
         st.markdown('<div class="title">☰ MTD vs Cohort — Drawer UI</div>', unsafe_allow_html=True)
     with c2:
-        st.button("☰ Filters", key="open_filters", on_click=_toggle_filters, args=(True,),
-                  use_container_width=True)
+        st.button("☰ Filters", key="toggle_filters", on_click=_toggle_filters_toggle, use_container_width=True)
     with c3:
         if st.session_state["show_b"]:
             st.button("Disable B", key="disable_b", on_click=_disable_b, use_container_width=True)
@@ -227,10 +221,8 @@ def _summary(values, all_flag, max_items=2):
 def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: str):
     options = sorted([v for v in df[colname].dropna().astype(str).unique()])
     all_key = f"{key_prefix}_all"; ms_key  = f"{key_prefix}_ms"
-    # init state
     if all_key not in st.session_state: st.session_state[all_key] = True
     if ms_key  not in st.session_state: st.session_state[ms_key]  = options.copy()
-    # sanitize stored selection to avoid default-not-in-options error
     stored = coerce_list(st.session_state.get(ms_key, []))
     selected = [v for v in stored if v in options]
     if selected != stored:
@@ -246,7 +238,6 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
             st.checkbox("All", value=all_flag, key=all_key)
         with right:
             disabled = st.session_state[all_key]
-            # pass sanitized default
             st.multiselect(label, options=options, default=selected, key=ms_key,
                            placeholder=f"Type to search {label.lower()}…",
                            label_visibility="collapsed", disabled=disabled)
@@ -257,13 +248,12 @@ def unified_multifilter(label: str, df: pd.DataFrame, colname: str, key_prefix: 
             with c2:
                 st.button("Clear", key=f"{key_prefix}_clear", use_container_width=True,
                           on_click=_clear_cb, args=(ms_key, all_key))
-    # recompute effective after possible changes
     all_flag = bool(st.session_state[all_key])
     selected = [v for v in coerce_list(st.session_state.get(ms_key, [])) if v in options]
     effective = options if all_flag else selected
     return all_flag, effective, f"{label}: {_summary(effective, all_flag)}"
 
-# ---------------- Drawer (Sidebar) ----------------
+# ---------------- Sidebar (only when open) ----------------
 def scenario_filters_block(name: str, df: pd.DataFrame):
     st.markdown(f"**Scenario {name}** <span class='badge'>independent</span>", unsafe_allow_html=True)
     pipe_all, pipe_sel, s1 = unified_multifilter("Pipeline", df, "Pipeline", f"{name}_pipe")
@@ -513,13 +503,9 @@ def mk_caption(meta):
             f"Country: {'All' if meta['ctry_all'] else ', '.join(coerce_list(meta['ctry_sel'])) or 'None'} · "
             f"Counsellor: {'All' if meta['cslr_all'] else ', '.join(coerce_list(meta['cslr_sel'])) or 'None'}")
 
-# ---------------- Sidebar (only when open) ----------------
+# ---------------- Sidebar (drawer) ----------------
 if st.session_state.get("filters_open", True):
     with st.sidebar:
-        st.markdown("<div class='sidebar-head'><span class='sidebar-caption'>Filters</span></div>", unsafe_allow_html=True)
-        st.button("← Close drawer", use_container_width=True,
-                  on_click=_toggle_filters, args=(False,), key="close_filters_btn")
-
         with st.expander("Scenario A controls", expanded=True):
             scenario_filters_block("A", df)
 
