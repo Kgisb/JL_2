@@ -1,6 +1,7 @@
-# app_compare_pro_tabs_counsellor_grain.py
-# A/B analyzer — Tabs UI, global "All→type-to-search" filters, multi-measure, presets,
-# ALWAYS-on granularity (Day/Week/Month) for all date presets, splits incl. Counsellor.
+# app_compare_pro_tabs_counsellor_grain_clonefix.py
+# A/B analyzer — Tabs UI, global "All→type-to-search" filters, multi-measure,
+# presets with Day/Week/Month granularity, splits incl. Counsellor, trends.
+# ✅ FIX: Clone A→B / B→A via safe callbacks + early clone processing.
 
 import streamlit as st
 import pandas as pd
@@ -9,7 +10,8 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ---------- Page ----------
-st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Granularity)", layout="wide", page_icon="📊")
+st.set_page_config(page_title="MTD vs Cohort — A/B Compare (Granularity + Clone Fix)",
+                   layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{ --text:#0f172a; --muted:#6b7280; --blue-600:#2563eb; --blue-700:#1d4ed8; --border: rgba(15,23,42,.10); --card:#fff; }
@@ -28,8 +30,42 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country","Student/Academic Counsellor","Deal Stage","Create Date"]
+REQUIRED_COLS = ["Pipeline","JetLearn Deal Source","Country",
+                 "Student/Academic Counsellor","Deal Stage","Create Date"]
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
+
+# ---------- Clone helpers (safe) ----------
+def _request_clone(direction: str):
+    # Set a flag only; actual copying happens early next run
+    st.session_state["__clone_request__"] = direction
+
+def _perform_clone_if_requested():
+    """
+    Apply cloning BEFORE any widget declarations to respect Streamlit's rules.
+    Copies A_* → B_* or B_* → A_* except ephemeral button keys.
+    """
+    direction = st.session_state.get("__clone_request__")
+    if not direction:
+        return
+    src_prefix, dst_prefix = ("A_", "B_") if direction == "A2B" else ("B_", "A_")
+    # Take a snapshot of keys to avoid dict mutation during iteration
+    keys = list(st.session_state.keys())
+    for k in keys:
+        if not k.startswith(src_prefix):
+            continue
+        # Skip ephemeral action keys for safety
+        if k.endswith("_select_all") or k.endswith("_clear"):
+            continue
+        v = st.session_state[k]
+        dst_key = k.replace(src_prefix, dst_prefix, 1)
+        # Only assign simple serializable values (lists, bools, str, numbers, dates)
+        st.session_state[dst_key] = v
+    # Clear the request and rerun once to render with cloned state
+    st.session_state["__clone_request__"] = None
+    st.rerun()
+
+# Trigger clone pass as early as possible (before any widgets below)
+_perform_clone_if_requested()
 
 # ---------- Utils ----------
 def robust_read_csv(file_or_path):
@@ -85,19 +121,10 @@ def last_quarter_bounds():
 def this_year_so_far_bounds(): t = pd.Timestamp.today().date(); return date(t.year,1,1), t
 
 def date_range_from_preset(label, series: pd.Series, key_prefix: str):
-    """
-    Always shows a granularity picker (Day/Week/Month) for *all* presets.
-    For 'Custom', also shows a date range picker.
-    """
     presets = ["Today","This month so far","Last month","Last quarter","This year","Custom"]
-    # Defaults per preset to keep it smart but editable:
     default_grain_map = {
-        "Today": "Day",
-        "This month so far": "Day",
-        "Last month": "Month",
-        "Last quarter": "Month",
-        "This year": "Month",
-        "Custom": "Month",
+        "Today": "Day", "This month so far": "Day", "Last month": "Month",
+        "Last quarter": "Month", "This year": "Month", "Custom": "Month",
     }
     c1, c2 = st.columns([3,2])
     with c1:
@@ -108,21 +135,15 @@ def date_range_from_preset(label, series: pd.Series, key_prefix: str):
                          index=["Day","Week","Month"].index(default_grain),
                          key=f"{key_prefix}_grain")
 
-    if choice == "Today":
-        f,t = today_bounds()
-    elif choice == "This month so far":
-        f,t = this_month_so_far_bounds()
-    elif choice == "Last month":
-        f,t = last_month_bounds()
-    elif choice == "Last quarter":
-        f,t = last_quarter_bounds()
-    elif choice == "This year":
-        f,t = this_year_so_far_bounds()
+    if choice == "Today":            f,t = today_bounds()
+    elif choice == "This month so far": f,t = this_month_so_far_bounds()
+    elif choice == "Last month":     f,t = last_month_bounds()
+    elif choice == "Last quarter":   f,t = last_quarter_bounds()
+    elif choice == "This year":      f,t = this_year_so_far_bounds()
     else:
         dmin,dmax = safe_minmax_date(series)
         rng = st.date_input("Custom range", (dmin,dmax), key=f"{key_prefix}_custom")
-        if isinstance(rng,(tuple,list)) and len(rng)==2: f,t = rng[0], rng[1]
-        else: f,t = dmin, dmax
+        f,t = (rng[0], rng[1]) if isinstance(rng,(tuple,list)) and len(rng)==2 else (dmin, dmax)
 
     if f > t:
         st.error("'From' is after 'To'. Please adjust.")
@@ -141,19 +162,13 @@ with st.container():
     c1,c2,c3 = st.columns([6,3,3])
     with c1:
         st.markdown('<div class="title">MTD vs Cohort — A/B Compare (Granularity)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub">Scenario B in its own tab • All→untick→type to search • multi-measure • presets with granularity • splits</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sub">Scenario B tab • All→untick→type to search • multi-measure • granularity • splits • safe cloning</div>', unsafe_allow_html=True)
     with c2:
-        if st.button("Clone A → B", key="clone_ab"):
-            for k in list(st.session_state.keys()):
-                if str(k).startswith("A_"): st.session_state[str(k).replace("A_","B_",1)] = st.session_state[k]
-            st.rerun()
+        st.button("Clone A → B", key="clone_ab_btn", on_click=_request_clone, args=("A2B",))
     with c3:
         col_ba,col_reset = st.columns(2)
         with col_ba:
-            if st.button("Clone B → A", key="clone_ba"):
-                for k in list(st.session_state.keys()):
-                    if str(k).startswith("B_"): st.session_state[str(k).replace("B_","A_",1)] = st.session_state[k]
-                st.rerun()
+            st.button("Clone B → A", key="clone_ba_btn", on_click=_request_clone, args=("B2A",))
         with col_reset:
             if st.button("Reset", key="reset_all"): st.session_state.clear(); st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
