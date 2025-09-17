@@ -1,3 +1,5 @@
+# app.py — JetLearn Insights (MTD/Cohort) + Cohort-based Predictability
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -26,7 +28,7 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 .kpi .value { font-size:1.45rem; font-weight:800; line-height:1.05; color:var(--text); }
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
-.popcap { font-size:.78rem; color:var(--muted); margin-top:2px; }
+.popcap { font-size:.78rem; color:#64748b; margin-top:2px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,6 +53,7 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum()>0:
                 df[col] = parsed
                 date_like.append(col)
+    # Preference: Payment Received Date first if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
@@ -71,24 +74,18 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
 def today_bounds(): t=pd.Timestamp.today().date(); return t,t
-
 def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
-
 def last_month_bounds():
     first_this = pd.Timestamp.today().date().replace(day=1)
     last_prev = first_this - timedelta(days=1)
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
-
 def quarter_start(y,q): return date(y,3*(q-1)+1,1)
-
 def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedelta(days=1)
-
 def last_quarter_bounds():
     t=pd.Timestamp.today().date(); q=(t.month-1)//3+1
     y,lq=(t.year-1,4) if q==1 else (t.year,q-1)
     return quarter_start(y,lq), quarter_end(y,lq)
-
 def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
 
 def alt_line(df,x,y,color=None,tooltip=None,height=260):
@@ -137,8 +134,7 @@ except Exception as e:
 df.columns = [c.strip() for c in df.columns]
 missing=[c for c in REQUIRED_COLS if c not in df.columns]
 if missing:
-    st.error(f"Missing required columns: {missing}
-Available: {list(df.columns)}")
+    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
     st.stop()
 
 if exclude_invalid:
@@ -175,6 +171,7 @@ with tab_insights:
         options = sorted([v for v in df[colname].dropna().astype(str).unique()])
         all_key = f"{key_prefix}_all"
         ms_key  = f"{key_prefix}_ms"
+        # UI container: popover (if available) else expander
         header = f"{label}: " + summary_label(options, True)
         ctx = st.popover(header) if hasattr(st, "popover") else st.expander(header, expanded=False)
         with ctx:
@@ -186,6 +183,7 @@ with tab_insights:
                                   placeholder=f"Type to search {label.lower()}…",
                                   label_visibility="collapsed",
                                   disabled=disabled)
+        # Effective values
         all_flag = bool(st.session_state.get(all_key, True))
         selected = [v for v in coerce_list(st.session_state.get(ms_key, options)) if v in options]
         effective = options if all_flag else selected
@@ -238,11 +236,13 @@ with tab_insights:
         with mcol2:
             mode = st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
 
+        # Prepare month cols for measures
         for m in measures:
             mn = f"{m}_Month"
             if m in base.columns and mn not in base.columns:
                 base[mn] = base[m].dt.to_period("M")
 
+        # Windows
         mtd_from = mtd_to = coh_from = coh_to = None
         mtd_grain = coh_grain = "Month"
 
@@ -324,6 +324,7 @@ with tab_insights:
                     both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                     tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
 
+                # Trend
                 trend=sub.copy()
                 trend["Bucket"]=group_label_from_series(trend["Create Date"], mtd_grain)
                 t=trend.groupby("Bucket")[flags].sum().reset_index()
@@ -372,6 +373,7 @@ with tab_insights:
                     both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                     tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
 
+                # Trend (measure-date buckets)
                 frames=[]
                 for m in measures:
                     mask=base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -394,6 +396,7 @@ with tab_insights:
                 f"Country: {'All' if meta['cty_all'] else ', '.join(coerce_list(meta['cty_sel'])) or 'None'} · "
                 f"Counsellor: {'All' if meta['csl_all'] else ', '.join(coerce_list(meta['csl_sel'])) or 'None'}")
 
+    # Scenario A + optional B
     show_b = st.toggle("Enable Scenario B (compare)", value=False)
     left_col, right_col = st.columns(2) if show_b else (st.container(), None)
     with (left_col if show_b else st.container()):
@@ -402,6 +405,7 @@ with tab_insights:
         with right_col:
             metaB = scenario_controls("B", df, date_like_cols)
 
+    # Compute and render
     with st.spinner("Calculating…"):
         metricsA, tablesA, chartsA = compute_outputs(metaA)
         if show_b:
@@ -589,6 +593,7 @@ with tab_predict:
         """
         Compute EB-smoothed M0/M1 rates per finest group (Source×Country×Counsellor) with backoff priors.
         """
+        # Restrict to lookback window based on Create_Month
         last_month = df_cre["Create_Month"].max()
         if pd.isna(last_month):
             return pd.DataFrame(columns=["JetLearn Deal Source","Country","Student/Academic Counsellor","r0","r1","trials"])  # empty
@@ -597,6 +602,7 @@ with tab_predict:
         cre_lb = df_cre.loc[mask_lb]
         paid_lb = df_paid_cohort.loc[cre_lb.index]
 
+        # Priors
         pg, psrc, psrccty = compute_priors(cre_lb, paid_lb)
 
         recs = []
@@ -608,6 +614,7 @@ with tab_predict:
             succ0 = int(((sub["Lag"] == 0)).sum())
             succ1 = int(((sub["Lag"] == 1)).sum())
 
+            # Choose prior hierarchy: src×cty -> src -> global
             src = keys[0]
             cty = keys[1]
             prior_r0, prior_r1, prior_n = pg["r0"], pg["r1"], max(pg["n"], 1)
@@ -618,6 +625,7 @@ with tab_predict:
                 pr = psrc[src]
                 prior_r0, prior_r1, prior_n = pr["r0"], pr["r1"], pr["n"]
 
+            # Scale prior strength: stronger prior when local trials are small
             prior_strength = prior_strength_base * (1.0 if trials < min_trials_for_local else 0.4)
 
             r0 = eb_rate(succ0, trials, prior_r0, prior_strength)
@@ -637,10 +645,18 @@ with tab_predict:
 
     def forecast_month_groupwise(df: pd.DataFrame, df_paid: pd.DataFrame, rates: pd.DataFrame,
                                  target_month: pd.Timestamp) -> pd.DataFrame:
+        """
+        Forecast payments for target_month from:
+          - M0 conversions of deals created in target_month, and
+          - M1 conversions of deals created in previous month.
+        Returns a table at finest granularity (Source×Country×Counsellor) with columns:
+          [Deal Source, Country, Counsellor, Forecast]
+        """
         prev_month = month_add(target_month, -1)
+        # Count creates this and prev month at finest level
         grp_cols = ["JetLearn Deal Source", "Country", "Student/Academic Counsellor"]
         dfc = df.copy()
-        dfc["Create_Month"] = to_month(dfc["Create Date"])  
+        dfc["Create_Month"] = to_month(dfc["Create Date"])  # ensure set
 
         cur_cre = dfc[dfc["Create_Month"] == target_month].groupby(grp_cols, dropna=False)["Create Date"].count().rename("C_cur")
         prev_cre = dfc[dfc["Create_Month"] == prev_month].groupby(grp_cols, dropna=False)["Create Date"].count().rename("C_prev")
@@ -663,7 +679,7 @@ with tab_predict:
 
     dfX = df.copy()
     dfX["Create Date"] = pd.to_datetime(dfX["Create Date"], errors="coerce", dayfirst=True)
-    dfX["Create_Month"] = to_month(dfX["Create Date"]) 
+    dfX["Create_Month"] = to_month(dfX["Create Date"])  # ensure set
     dfX["Payment Received Date"] = pd.to_datetime(dfX[PAYMENT_COL], errors="coerce", dayfirst=True)
     paid = dfX[dfX["Payment Received Date"].notna()].copy()
     paid["PaymentMonth"] = to_month(paid["Payment Received Date"])  
@@ -674,7 +690,8 @@ with tab_predict:
 
     # Cohort merge: align each deal with its payment month (if any) and compute Lag
     df_cohort = dfX[["Create Date","Create_Month","JetLearn Deal Source","Country","Student/Academic Counsellor"]].copy()
-    df_cohort["PaymentMonth"] = to_month(dfX["Payment Received Date"])  
+    df_cohort["PaymentMonth"] = to_month(dfX["Payment Received Date"])  # keeps NaT for non-paid
+    # Lag in months: PM - CM (NaN -> NaN; won't match 0/1)
     cm_code = df_cohort["Create_Month"].dt.year * 12 + df_cohort["Create_Month"].dt.month
     pm_code = df_cohort["PaymentMonth"].dt.year * 12 + df_cohort["PaymentMonth"].dt.month
     df_cohort["Lag"] = (pm_code - cm_code)
@@ -721,6 +738,7 @@ with tab_predict:
     fc_this = forecast_month_groupwise(dfX, paid, rates, cm)
     fc_next = forecast_month_groupwise(dfX, paid, rates, nm)
 
+    # Helper to aggregate to view level
     def aggregate_view(df_fc: pd.DataFrame, view: str) -> pd.DataFrame:
         if view == "Deal Source":
             keys = ["JetLearn Deal Source"]
@@ -740,7 +758,7 @@ with tab_predict:
     merged_months = v_this.merge(v_next, on=v_this.columns[:-1].tolist(), how="outer").fillna(0)
 
     # ----------------------------
-    # Today / Tomorrow using day-of-month allocation per group
+    # Today / Tomorrow using day-of-month + hourly profiles per group
     # ----------------------------
     st.markdown("### Today & Tomorrow (day/time aware)")
     with st.expander("Daily & hourly allocation settings", expanded=False):
@@ -750,6 +768,7 @@ with tab_predict:
     dom_today = today_dt.day
     dom_tom = (today_dt + timedelta(days=1)).day
 
+    # Function to get a boolean mask for paid rows matching a group row
     def mask_for_row(row: pd.Series) -> pd.Series:
         m = pd.Series(True, index=paid.index)
         if "JetLearn Deal Source" in row.index and not pd.isna(row["JetLearn Deal Source"]):
@@ -772,6 +791,7 @@ with tab_predict:
         vt.at[i, "Today"] = row["This Month"] * p_today
         vt.at[i, "Tomorrow"] = row["This Month"] * p_tom
 
+    # Show KPIs
     k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.markdown(f"""
@@ -804,6 +824,9 @@ with tab_predict:
 
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
+    # ----------------------------
+    # Tables & Downloads
+    # ----------------------------
     st.markdown("#### Month-level Forecast (cohort-based)")
     st.dataframe(merged_months.sort_values("This Month", ascending=False), use_container_width=True)
     st.download_button("Download — Month Forecast CSV",
@@ -816,6 +839,7 @@ with tab_predict:
                        vt.to_csv(index=False).encode("utf-8"),
                        file_name="cohort_today_tomorrow.csv", mime="text/csv")
 
+    # Optional hourly split for Today for the top groups (limit to 10 for clarity)
     st.markdown("#### Optional: Today's hourly breakdown (top 10 groups by Today forecast)")
     top_today = vt.sort_values("Today", ascending=False).head(10)
     if not top_today.empty:
