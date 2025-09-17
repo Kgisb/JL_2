@@ -630,7 +630,7 @@ with tab_predict:
             remainder="drop"
         )
         clf = HistGradientBoostingClassifier(
-            learning_rate=0.08, max_leaf_nodes=31, n_estimators=250,
+            learning_rate=0.08, max_leaf_nodes=31, max_iter=250,
             early_stopping=True, random_state=42
         )
         pipe = Pipeline([("pre", pre), ("clf", clf)])
