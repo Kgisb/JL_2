@@ -1,5 +1,6 @@
 # app.py — JetLearn Insights + Predictability (robust & data-agnostic)
 # Run: streamlit run app.py
+pip install -U "streamlit==1.37.1" "pandas==2.2.2" "numpy==1.26.4" "altair==5.2.0" "scikit-learn==1.3.2"
 
 import streamlit as st
 import pandas as pd
