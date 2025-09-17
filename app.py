@@ -1,4 +1,5 @@
-# app.py — JetLearn Insights (MTD/Cohort) + ML Predictability (Payment Count)
+# app.py — JetLearn Insights (MTD/Cohort) + ML Predictability (Payment Count, leak-free + inflow)
+# Run: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
@@ -53,6 +54,7 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum()>0:
                 df[col] = parsed
                 date_like.append(col)
+    # Preference: Payment Received Date first if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
@@ -529,7 +531,7 @@ with tab_predict:
     group_by = st.multiselect("Breakdowns (group by)", options=group_options,
                               default=[x for x in ["JetLearn Deal Source","Country"] if x in group_options])
 
-    # ---------- Build training: positives (payment days before cm_start) + sampled negatives ----------
+    # ---------- Build training: positives + sampled negatives ----------
     NEG_PER_POS = 5
     MAX_AGE_DAYS = 150
 
@@ -538,9 +540,13 @@ with tab_predict:
         if D.empty: return pd.DataFrame()
         D["deal_id"] = np.arange(len(D))
 
-        pos = D[D[COL_PAY].notna() & (D[COL_PAY] < cm_start)][
-            ["deal_id", COL_CREATE, COL_PAY, COL_COUNTRY, COL_SOURCE, COL_CSL, COL_TIMES, COL_SALES, COL_LAST_ACT, COL_LAST_CNT]
-        ].copy()
+        # Choose columns safely
+        base_cols = ["deal_id", COL_CREATE, COL_COUNTRY, COL_SOURCE, COL_CSL, COL_TIMES, COL_SALES, COL_LAST_ACT, COL_LAST_CNT]
+        base_cols = [c for c in base_cols if c is not None]
+
+        # positives: payments < current month
+        pos_cols = base_cols + [COL_PAY]
+        pos = D[D[COL_PAY].notna() & (D[COL_PAY] < cm_start)][pos_cols].copy()
         pos.rename(columns={COL_PAY: "day"}, inplace=True)
         pos["y"] = 1.0
 
@@ -557,12 +563,13 @@ with tab_predict:
             take = min(span, NEG_PER_POS)
             offs = rng.choice(span, size=take, replace=False)
             for o in offs:
-                neg_rows.append({**r.to_dict(), "day": (d0 + pd.Timedelta(days=int(o))), "y": 0.0})
+                row = r.to_dict()
+                row["day"] = (d0 + pd.Timedelta(days=int(o)))
+                row["y"] = 0.0
+                neg_rows.append(row)
 
         # negatives from unpaid-as-of-cutoff
-        unpaid = D[D[COL_PAY].isna() & (D[COL_CREATE] < cm_start)][
-            ["deal_id", COL_CREATE, COL_COUNTRY, COL_SOURCE, COL_CSL, COL_TIMES, COL_SALES, COL_LAST_ACT, COL_LAST_CNT]
-        ]
+        unpaid = D[D[COL_PAY].isna() & (D[COL_CREATE] < cm_start)][base_cols].copy()
         for _, r in unpaid.iterrows():
             d0 = pd.to_datetime(r[COL_CREATE]).normalize()
             d1 = cm_start - pd.Timedelta(days=1)
@@ -571,12 +578,16 @@ with tab_predict:
             take = min(span, NEG_PER_POS)
             offs = rng.choice(span, size=take, replace=False)
             for o in offs:
-                neg_rows.append({**r.to_dict(), "day": (d0 + pd.Timedelta(days=int(o))), "y": 0.0})
+                row = r.to_dict()
+                row["day"] = (d0 + pd.Timedelta(days=int(o)))
+                row["y"] = 0.0
+                neg_rows.append(row)
 
         neg = pd.DataFrame(neg_rows) if neg_rows else pd.DataFrame(columns=pos.columns)
         train = pd.concat([pos, neg], ignore_index=True)
         if train.empty: return train
 
+        # features
         train["day"] = pd.to_datetime(train["day"]).dt.normalize()
         train["age"] = (train["day"] - pd.to_datetime(train[COL_CREATE]).dt.normalize()).dt.days.clip(lower=0, upper=MAX_AGE_DAYS).astype(int)
         train["moy"] = train["day"].dt.month.astype(int)
@@ -584,23 +595,19 @@ with tab_predict:
         train["dom"] = train["day"].dt.day.astype(int)
 
         def recency(series_name):
-            if series_name is None: return 365
+            if series_name is None or series_name not in train.columns: return 365
             d = pd.to_datetime(train[series_name], errors="coerce")
             return (train["day"] - d).dt.days.clip(lower=0, upper=365).fillna(365).astype(int)
         train["rec_act"] = recency(COL_LAST_ACT)
         train["rec_cnt"] = recency(COL_LAST_CNT)
 
-        if COL_TIMES not in train.columns or train[COL_TIMES].isna().all():
-            train["times"] = 0; times_col = "times"
-        else:
-            times_col = COL_TIMES
-        if COL_SALES not in train.columns or train[COL_SALES].isna().all():
-            train["sales"] = 0; sales_col = "sales"
-        else:
-            sales_col = COL_SALES
+        # normalize numeric feature names used by the model
+        train["times"] = pd.to_numeric(train[COL_TIMES], errors="coerce").fillna(0) if COL_TIMES in train.columns else 0
+        train["sales"] = pd.to_numeric(train[COL_SALES], errors="coerce").fillna(0) if COL_SALES in train.columns else 0
 
-        keep = ["deal_id","day","y","age","moy","dow","dom","rec_act","rec_cnt",
-                COL_COUNTRY, COL_SOURCE, COL_CSL, times_col, sales_col]
+        keep = ["deal_id","day","y","age","moy","dow","dom","rec_act","rec_cnt","times","sales"]
+        for c in [COL_COUNTRY, COL_SOURCE, COL_CSL]:
+            if c is not None and c in train.columns: keep.append(c)
         return train[keep].copy()
 
     with st.spinner("Preparing & training…"):
@@ -630,8 +637,11 @@ with tab_predict:
             remainder="drop"
         )
         clf = HistGradientBoostingClassifier(
-            learning_rate=0.08, max_leaf_nodes=31, max_iter=250,
-            early_stopping=True, random_state=42
+            learning_rate=0.08,
+            max_leaf_nodes=31,
+            max_iter=250,          # correct param (not n_estimators)
+            early_stopping=True,
+            random_state=42
         )
         pipe = Pipeline([("pre", pre), ("clf", clf)])
         pipe.fit(train.drop(columns=["y","deal_id","day"], errors="ignore"), train["y"])
@@ -647,44 +657,63 @@ with tab_predict:
     deals["Create"] = pd.to_datetime(deals[COL_CREATE]).dt.normalize()
     deals["Pay"]    = pd.to_datetime(deals[COL_PAY]).dt.normalize()
 
-    cart = deals[["deal_id","Create","Pay", COL_COUNTRY, COL_SOURCE, COL_CSL, COL_TIMES or "times", COL_SALES or "sales", COL_LAST_ACT, COL_LAST_CNT]].copy()
-    if (COL_TIMES is None) and ("times" not in cart.columns): cart["times"] = 0
-    if (COL_SALES is None) and ("sales" not in cart.columns): cart["sales"] = 0
-    cart = cart.assign(key=1).merge(pd.DataFrame({"day": dates, "key":1}), on="key").drop(columns=["key"])
+    # make sure placeholder numeric cols exist BEFORE selecting
+    if COL_TIMES is None: deals["times"] = 0
+    if COL_SALES is None: deals["sales"] = 0
+
+    sel_cols = ["deal_id","Create","Pay"]
+    for c in [COL_COUNTRY, COL_SOURCE, COL_CSL, COL_TIMES if COL_TIMES else "times", COL_SALES if COL_SALES else "sales", COL_LAST_ACT, COL_LAST_CNT]:
+        if c is not None and c in deals.columns: sel_cols.append(c)
+
+    base_deals = deals[sel_cols].copy()
+
+    cart = base_deals.assign(key=1).merge(pd.DataFrame({"day": dates, "key":1}), on="key").drop(columns=["key"])
     cart = cart[(cart["Create"] <= cart["day"]) & (cart["Pay"].isna() | (cart["Pay"] >= cart["day"]))].copy()
 
+    # features for scoring
     cart["age"] = (cart["day"] - cart["Create"]).dt.days.clip(lower=0, upper=MAX_AGE_DAYS).astype(int)
     cart["moy"] = cart["day"].dt.month.astype(int)
     cart["dow"] = cart["day"].dt.dayofweek.astype(int)
     cart["dom"] = cart["day"].dt.day.astype(int)
-    def recency_s(col):
-        d = pd.to_datetime(cart[col], errors="coerce") if col in cart.columns else None
-        if d is None: return 365
-        return (cart["day"] - d).dt.days.clip(lower=0, upper=365).fillna(365).astype(int)
-    cart["rec_act"] = recency_s(COL_LAST_ACT) if COL_LAST_ACT else 365
-    cart["rec_cnt"] = recency_s(COL_LAST_CNT) if COL_LAST_CNT else 365
-    cart["times"] = pd.to_numeric(cart[COL_TIMES] if COL_TIMES in cart.columns else cart["times"], errors="coerce").fillna(0)
-    cart["sales"] = pd.to_numeric(cart[COL_SALES] if COL_SALES in cart.columns else cart["sales"], errors="coerce").fillna(0)
 
-    proba = pipe.predict_proba(cart.drop(columns=["deal_id","Create","Pay","day"], errors="ignore"))[:,1]
+    def recency_s(col):
+        if col is None or col not in cart.columns: return 365
+        d = pd.to_datetime(cart[col], errors="coerce")
+        return (cart["day"] - d).dt.days.clip(lower=0, upper=365).fillna(365).astype(int)
+    cart["rec_act"] = recency_s(COL_LAST_ACT)
+    cart["rec_cnt"] = recency_s(COL_LAST_CNT)
+
+    # normalize numeric names
+    if COL_TIMES and COL_TIMES in cart.columns:
+        cart["times"] = pd.to_numeric(cart[COL_TIMES], errors="coerce").fillna(0)
+    else:
+        cart["times"] = pd.to_numeric(cart.get("times", 0), errors="coerce").fillna(0)
+    if COL_SALES and COL_SALES in cart.columns:
+        cart["sales"] = pd.to_numeric(cart[COL_SALES], errors="coerce").fillna(0)
+    else:
+        cart["sales"] = pd.to_numeric(cart.get("sales", 0), errors="coerce").fillna(0)
+
+    # predict probability → expected count per deal-day
+    drop_cols = ["deal_id","Create","Pay","day"]
+    Xscore = cart.drop(columns=[c for c in drop_cols if c in cart.columns], errors="ignore")
+    proba = pipe.predict_proba(Xscore)[:,1]
     cart["p"] = proba
+
     cart["Day"] = cart["day"].dt.date.astype(str)
     cart["Day of Week"] = cart["day"].dt.day_name()
 
-    # ---------- New-deal inflow modeling ----------
-    # 1) Cohort rates r0/r1 per (Source, Country, Counsellor) from all history excluding current month
+    # ---------- New-deal inflow (from last full month DOW create-rate, with M0/M1 spill) ----------
     def month_code(ts): return ts.dt.year * 12 + ts.dt.month
+
+    gcols_full = [c for c in [COL_SOURCE, COL_COUNTRY, COL_CSL] if c is not None]
+
     dfC = X.copy()
     dfC["Create_M"] = dfC[COL_CREATE].dt.to_period("M").dt.to_timestamp()
     dfC["Pay_M"]    = dfC[COL_PAY].dt.to_period("M").dt.to_timestamp()
     dfC_hist = dfC[dfC["Create_M"].notna() & (dfC["Create_M"] < cm_start)].copy()
 
-    gcols_full = [COL_SOURCE, COL_COUNTRY, COL_CSL]
     for c in gcols_full:
-        if c is None: gcols_full.remove(c)
-    # ensure string keys & NA buckets
-    for c in gcols_full:
-        dfC_hist[c] = dfC_hist[c].astype(str).fillna("NA")
+        dfC_hist[c] = dfC_hist[c].fillna("NA").astype(str)
 
     cmcode = month_code(dfC_hist["Create_M"])
     pmcode = month_code(dfC_hist["Pay_M"])
@@ -694,119 +723,110 @@ with tab_predict:
     succ0 = dfC_hist[dfC_hist["Lag"]==0].groupby(gcols_full)["Lag"].count().rename("succ0")
     succ1 = dfC_hist[dfC_hist["Lag"]==1].groupby(gcols_full)["Lag"].count().rename("succ1")
     rates = pd.concat([global_trials, succ0, succ1], axis=1).fillna(0)
-    # global priors
-    g_trials = int(rates["trials"].sum())
+
+    g_trials = int(rates["trials"].sum()) if not rates.empty else 0
     g_r0 = (rates["succ0"].sum()/g_trials) if g_trials>0 else 0.0
     g_r1 = (rates["succ1"].sum()/g_trials) if g_trials>0 else 0.0
     alpha = 20.0
-    rates["r0"] = (rates["succ0"] + alpha*g_r0) / (rates["trials"] + alpha)
-    rates["r1"] = (rates["succ1"] + alpha*g_r1) / (rates["trials"] + alpha)
-    rates = rates.reset_index()
+    if not rates.empty:
+        rates["r0"] = (rates["succ0"] + alpha*g_r0) / (rates["trials"] + alpha)
+        rates["r1"] = (rates["succ1"] + alpha*g_r1) / (rates["trials"] + alpha)
+        rates = rates.reset_index()
+    else:
+        rates = pd.DataFrame(columns=gcols_full+["trials","succ0","succ1","r0","r1"])
 
-    # 2) Create-rate per group per day-of-week from last full month
     lm_start = (cm_start - pd.offsets.MonthBegin(1))
     lm_end   = (cm_start - pd.Timedelta(days=1))
     lastm = X[(X[COL_CREATE] >= lm_start) & (X[COL_CREATE] <= lm_end)].copy()
     for c in gcols_full:
-        lastm[c] = lastm[c].astype(str).fillna("NA")
+        lastm[c] = lastm[c].fillna("NA").astype(str)
     lastm["dow"] = lastm[COL_CREATE].dt.dayofweek
 
-    # occurrences of each DOW in last month
     days_last_month = pd.date_range(lm_start, lm_end, freq="D")
-    dow_counts = pd.Series(days_last_month.dayofweek).value_counts().to_dict()  # {dow: count-of-days}
-    if len(dow_counts) < 7:
-        for d in range(7): dow_counts.setdefault(d, 0)
+    dow_counts = pd.Series(days_last_month.dayofweek).value_counts().to_dict()
+    for d in range(7): dow_counts.setdefault(d, 0)
 
-    creates_dow = lastm.groupby(gcols_full + ["dow"])[COL_CREATE].count().rename("creates").reset_index()
-    # expected creates per day for that DOW
-    creates_dow["rate_per_day"] = creates_dow.apply(lambda r: (r["creates"] / max(1, dow_counts[int(r["dow"])])), axis=1)
+    if lastm.empty:
+        creates_dow = pd.DataFrame(columns=gcols_full+["dow","creates","rate_per_day"])
+    else:
+        creates_dow = lastm.groupby(gcols_full + ["dow"])[COL_CREATE].count().rename("creates").reset_index()
+        creates_dow["rate_per_day"] = creates_dow.apply(lambda r: (r["creates"] / max(1, dow_counts[int(r["dow"])])), axis=1)
 
-    # build inflow per future day: expected creates × r0/r1 → spread uniformly
+    # functions to get expected creates per day for a date range
+    def expected_creates_for_month(day_range):
+        if creates_dow.empty:
+            return pd.DataFrame(columns=gcols_full+["day","exp_creates"])
+        recs=[]
+        rows = creates_dow.to_dict("records")
+        for d in day_range:
+            dw = int(d.dayofweek)
+            for r in rows:
+                if int(r["dow"]) == dw:
+                    recs.append(tuple([*(r[c] for c in gcols_full), d, float(r["rate_per_day"])]))
+        if not recs:
+            return pd.DataFrame(columns=gcols_full+["day","exp_creates"])
+        E = pd.DataFrame(recs, columns=gcols_full+["day","exp_creates"])
+        return E.groupby(gcols_full+["day"], dropna=False)["exp_creates"].sum().reset_index()
+
     future_days = pd.date_range(start=today, end=end_next, freq="D")
-    future_df = []
-    # join helper dicts
-    rates_key = rates.set_index(gcols_full)[["r0","r1"]].to_dict(orient="index")
-    # all groups observed in last month for inflow; fallback to global avg if absent
-    all_groups = creates_dow[gcols_full].drop_duplicates()
-
-    # For missing groups in last month but present historically, include them with 0 create rate → no inflow (reasonable)
-    # build per-day inflow contributions
     days_remaining_this = pd.date_range(start=today, end=end_this, freq="D")
     days_next_month = pd.date_range(start=end_this + pd.Timedelta(days=1), end=end_next, freq="D")
     n_rem = max(1, len(days_remaining_this))
     n_next = max(1, len(days_next_month))
 
-    # Pre-compute total expected creates per group this month (remaining) and next month
-    def expected_creates_for_month(day_range):
-        recs=[]
-        for _, row in creates_dow.iterrows():
-            gkey = tuple(row[c] for c in gcols_full)
-            for d in day_range:
-                dow = int(d.dayofweek)
-                if dow == int(row["dow"]):
-                    recs.append((*gkey, d, float(row["rate_per_day"])))
-        if not recs: 
-            return pd.DataFrame(columns=gcols_full+["day","exp_creates"])
-        E = pd.DataFrame(recs, columns=gcols_full+["day","exp_creates"])
-        return E.groupby(gcols_full+["day"], dropna=False)["exp_creates"].sum().reset_index()
-
     exp_this = expected_creates_for_month(days_remaining_this)
     exp_next = expected_creates_for_month(days_next_month)
 
-    # Aggregate totals per group
-    tot_this = exp_this.groupby(gcols_full)["exp_creates"].sum().rename("tot_creates").reset_index()
-    tot_next = exp_next.groupby(gcols_full)["exp_creates"].sum().rename("tot_creates").reset_index()
-
-    # Build uniform per-day inflow payments
-    inflow_rows = []
-
-    # This month: M0 from this month's remaining creates, spread uniformly over remaining days
-    for _, r in tot_this.iterrows():
-        gkey = tuple(r[c] for c in gcols_full)
-        rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
-        m0_total = float(r["tot_creates"]) * float(rr["r0"])
-        per_day = m0_total / n_rem
-        for d in days_remaining_this:
-            inflow_rows.append((*gkey, d, per_day))
-
-    # Next month: (M1 from this month's remaining creates) + (M0 from next month's creates), spread uniformly over next month days
-    # M1 part
-    for _, r in tot_this.iterrows():
-        gkey = tuple(r[c] for c in gcols_full)
-        rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
-        m1_total = float(r["tot_creates"]) * float(rr["r1"])
-        per_day = m1_total / n_next
-        for d in days_next_month:
-            inflow_rows.append((*gkey, d, per_day))
-    # Next-month M0 from next-month creates
-    for _, r in tot_next.iterrows():
-        gkey = tuple(r[c] for c in gcols_full)
-        rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
-        m0n_total = float(r["tot_creates"]) * float(rr["r0"])
-        per_day = m0n_total / n_next
-        for d in days_next_month:
-            inflow_rows.append((*gkey, d, per_day))
-
-    inflow = pd.DataFrame(inflow_rows, columns=gcols_full+["day","p"])
-    if inflow.empty:
+    if rates.empty:
+        # no history → no inflow
         inflow = pd.DataFrame(columns=gcols_full+["day","p"])
+    else:
+        rates_key = rates.set_index(gcols_full)[["r0","r1"]].to_dict(orient="index")
 
-    # Conform group dtypes & labels with existing cart
+        # aggregate totals per group
+        tot_this = exp_this.groupby(gcols_full)["exp_creates"].sum().rename("tot_creates").reset_index() if not exp_this.empty else pd.DataFrame(columns=gcols_full+["tot_creates"])
+        tot_next = exp_next.groupby(gcols_full)["exp_creates"].sum().rename("tot_creates").reset_index() if not exp_next.empty else pd.DataFrame(columns=gcols_full+["tot_creates"])
+
+        inflow_rows = []
+        # This month: M0 from this month's remaining creates, spread uniformly
+        for _, r in tot_this.iterrows():
+            gkey = tuple(r[c] for c in gcols_full)
+            rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
+            m0_total = float(r["tot_creates"]) * float(rr["r0"])
+            per_day = m0_total / n_rem
+            for d in days_remaining_this:
+                inflow_rows.append((*gkey, d, per_day))
+        # Next month: M1 from this month's creates + M0 from next month's creates
+        for _, r in tot_this.iterrows():
+            gkey = tuple(r[c] for c in gcols_full)
+            rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
+            m1_total = float(r["tot_creates"]) * float(rr["r1"])
+            per_day = m1_total / n_next
+            for d in days_next_month:
+                inflow_rows.append((*gkey, d, per_day))
+        for _, r in tot_next.iterrows():
+            gkey = tuple(r[c] for c in gcols_full)
+            rr = rates_key.get(gkey, {"r0":g_r0, "r1":g_r1})
+            m0n_total = float(r["tot_creates"]) * float(rr["r0"])
+            per_day = m0n_total / n_next
+            for d in days_next_month:
+                inflow_rows.append((*gkey, d, per_day))
+
+        inflow = pd.DataFrame(inflow_rows, columns=gcols_full+["day","p"])
+        if inflow.empty:
+            inflow = pd.DataFrame(columns=gcols_full+["day","p"])
+
+    # Conform group labels
     for c in gcols_full:
-        if c not in inflow.columns:
-            inflow[c] = "NA"
+        if c not in cart.columns: cart[c] = "NA"
+        if c not in inflow.columns: inflow[c] = "NA"
+        cart[c] = cart[c].astype(str)
         inflow[c] = inflow[c].astype(str)
+
     inflow["Day"] = inflow["day"].dt.date.astype(str)
     inflow["Day of Week"] = inflow["day"].dt.day_name()
 
-    # Combine existing-pipeline predictions + inflow
-    base_cols = ["day","p","Day","Day of Week"]
-    for c in gcols_full:
-        if c is not None:
-            base_cols.append(c)
-            cart[c] = cart[c].astype(str)
-            inflow[c] = inflow[c].astype(str)
-
+    base_cols = ["day","p","Day","Day of Week"] + gcols_full
     cart_all = pd.concat([
         cart[base_cols].copy(),
         inflow[base_cols].copy()
@@ -883,4 +903,5 @@ with tab_predict:
         except Exception:
             pass
 
-    st.caption("Counts combine: (1) predicted payments from existing open deals, and (2) expected payments from **new deals not yet created**, using last-month day-of-week create rates and cohort M0/M1 rates (smoothed).")
+    st.caption("Counts = predicted payments from **existing open deals** + expected payments from **new deals** "
+               "(last-month DOW create rates with smoothed M0/M1 cohort rates).")
