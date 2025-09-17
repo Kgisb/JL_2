@@ -1,5 +1,3 @@
-# app.py  — JetLearn Insights (MTD/Cohort) + Predictability in one Streamlit app
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -53,7 +51,6 @@ def detect_measure_date_columns(df: pd.DataFrame):
             if parsed.notna().sum()>0:
                 df[col] = parsed
                 date_like.append(col)
-    # Preference: Payment Received Date first if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
@@ -74,18 +71,24 @@ def safe_minmax_date(s: pd.Series, fallback=(date(2020,1,1), date.today())):
     return (pd.to_datetime(s.min()).date(), pd.to_datetime(s.max()).date())
 
 def today_bounds(): t=pd.Timestamp.today().date(); return t,t
+
 def this_month_so_far_bounds(): t=pd.Timestamp.today().date(); return t.replace(day=1),t
+
 def last_month_bounds():
     first_this = pd.Timestamp.today().date().replace(day=1)
     last_prev = first_this - timedelta(days=1)
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
+
 def quarter_start(y,q): return date(y,3*(q-1)+1,1)
+
 def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedelta(days=1)
+
 def last_quarter_bounds():
     t=pd.Timestamp.today().date(); q=(t.month-1)//3+1
     y,lq=(t.year-1,4) if q==1 else (t.year,q-1)
     return quarter_start(y,lq), quarter_end(y,lq)
+
 def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
 
 def alt_line(df,x,y,color=None,tooltip=None,height=260):
@@ -134,7 +137,8 @@ except Exception as e:
 df.columns = [c.strip() for c in df.columns]
 missing=[c for c in REQUIRED_COLS if c not in df.columns]
 if missing:
-    st.error(f"Missing required columns: {missing}\nAvailable: {list(df.columns)}")
+    st.error(f"Missing required columns: {missing}
+Available: {list(df.columns)}")
     st.stop()
 
 if exclude_invalid:
@@ -147,7 +151,7 @@ df["Create_Month"] = df["Create Date"].dt.to_period("M")
 date_like_cols = detect_measure_date_columns(df)
 
 # --------------------- Tabs ---------------------
-tab_insights, tab_predict = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predictability"])
+tab_insights, tab_predict = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predictability"]) 
 
 # =========================================================
 # ===============  INSIGHTS (MTD / Cohort)  ===============
@@ -171,7 +175,6 @@ with tab_insights:
         options = sorted([v for v in df[colname].dropna().astype(str).unique()])
         all_key = f"{key_prefix}_all"
         ms_key  = f"{key_prefix}_ms"
-        # UI container: popover (if available) else expander
         header = f"{label}: " + summary_label(options, True)
         ctx = st.popover(header) if hasattr(st, "popover") else st.expander(header, expanded=False)
         with ctx:
@@ -183,7 +186,6 @@ with tab_insights:
                                   placeholder=f"Type to search {label.lower()}…",
                                   label_visibility="collapsed",
                                   disabled=disabled)
-        # Effective values
         all_flag = bool(st.session_state.get(all_key, True))
         selected = [v for v in coerce_list(st.session_state.get(ms_key, options)) if v in options]
         effective = options if all_flag else selected
@@ -236,13 +238,11 @@ with tab_insights:
         with mcol2:
             mode = st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
 
-        # Prepare month cols for measures
         for m in measures:
             mn = f"{m}_Month"
             if m in base.columns and mn not in base.columns:
                 base[mn] = base[m].dt.to_period("M")
 
-        # Windows
         mtd_from = mtd_to = coh_from = coh_to = None
         mtd_grain = coh_grain = "Month"
 
@@ -290,7 +290,7 @@ with tab_insights:
             for m in measures:
                 if m not in sub.columns: continue
                 flg=f"__MTD__{m}"
-                sub[flg] = ((sub[m].notna()) & (sub[f"{m}_Month"]==sub["Create_Month"])).astype(int)
+                sub[flg] = ((sub[m].notna()) & (sub[f"{m}_Month"]==sub["Create_Month"]).astype(bool)).astype(int)
                 flags.append(flg)
                 metrics_rows.append({"Scope":"MTD","Metric":f"Count on '{m}'","Window":f"{mtd_from} → {mtd_to}","Value":int(sub[flg].sum())})
             metrics_rows.append({"Scope":"MTD","Metric":"Create Count in window","Window":f"{mtd_from} → {mtd_to}","Value":int(len(sub))})
@@ -324,7 +324,6 @@ with tab_insights:
                     both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                     tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
 
-                # Trend
                 trend=sub.copy()
                 trend["Bucket"]=group_label_from_series(trend["Create Date"], mtd_grain)
                 t=trend.groupby("Bucket")[flags].sum().reset_index()
@@ -373,7 +372,6 @@ with tab_insights:
                     both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                     tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
 
-                # Trend (measure-date buckets)
                 frames=[]
                 for m in measures:
                     mask=base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -396,7 +394,6 @@ with tab_insights:
                 f"Country: {'All' if meta['cty_all'] else ', '.join(coerce_list(meta['cty_sel'])) or 'None'} · "
                 f"Counsellor: {'All' if meta['csl_all'] else ', '.join(coerce_list(meta['csl_sel'])) or 'None'}")
 
-    # Scenario A + optional B
     show_b = st.toggle("Enable Scenario B (compare)", value=False)
     left_col, right_col = st.columns(2) if show_b else (st.container(), None)
     with (left_col if show_b else st.container()):
@@ -405,7 +402,6 @@ with tab_insights:
         with right_col:
             metaB = scenario_controls("B", df, date_like_cols)
 
-    # Compute and render
     with st.spinner("Calculating…"):
         metricsA, tablesA, chartsA = compute_outputs(metaA)
         if show_b:
@@ -477,291 +473,370 @@ with tab_insights:
     st.caption("Excluded globally: 1.2 Invalid Deal")
 
 # =========================================================
-# ================  PREDICTABILITY (Standalone) ===========
+# ================  PREDICTABILITY (Cohort-based) =========
 # =========================================================
 with tab_predict:
-    # ---- Helpers specific to predictability ----
+    # ----------------------------
+    # Utilities specific to cohort forecast
+    # ----------------------------
     def detect_payment_col(cols):
         for c in cols:
-            cl=c.lower()
+            cl = c.lower()
             if "payment" in cl and "received" in cl and "date" in cl:
                 return c
         for c in cols:
-            cl=c.lower()
+            cl = c.lower()
             if "payment" in cl and "date" in cl:
                 return c
         return None
 
-    def month_start(dt: date) -> pd.Timestamp:
-        return pd.Timestamp(dt).to_period("M").to_timestamp()
+    def to_month(dtser: pd.Series) -> pd.Series:
+        return pd.to_datetime(dtser, errors="coerce", dayfirst=True).dt.to_period("M").dt.to_timestamp()
 
-    def month_days(dt: date) -> int:
-        m0 = month_start(dt)
+    def month_add(ts: pd.Timestamp, k: int) -> pd.Timestamp:
+        return (ts.to_period("M") + k).to_timestamp()
+
+    def month_start(d: date) -> pd.Timestamp:
+        return pd.Timestamp(d).to_period("M").to_timestamp()
+
+    def month_days(ts: pd.Timestamp) -> int:
+        m0 = ts
         m1 = (m0 + pd.offsets.MonthBegin(1))
         return int((m1 - m0).days)
 
-    def make_month_table_from_dates(dates: pd.Series) -> pd.DataFrame:
-        m = pd.to_datetime(dates, errors="coerce").dt.to_period("M").dt.to_timestamp()
-        monthly = m.value_counts().rename_axis("Month").sort_index().rename("y").reset_index()
-        return monthly
+    def safe_div(a, b):
+        return (a / b) if b else 0.0
 
-    def add_calendar_features(months: pd.DatetimeIndex) -> pd.DataFrame:
-        dfc = pd.DataFrame({"Month": months})
-        dfc["t"] = np.arange(len(dfc))  # trend
-        dfc["moy"] = dfc["Month"].dt.month
-        for m in range(1,12):  # drop December to avoid dummy trap
-            dfc[f"m_{m}"] = (dfc["moy"]==m).astype(int)
-        return dfc.drop(columns=["moy"])
+    # Empirical-Bayes smoothing for binomial rate
+    def eb_rate(success: float, trials: float, prior_rate: float, prior_strength: float) -> float:
+        return (success + prior_strength * prior_rate) / (trials + prior_strength) if (trials + prior_strength) > 0 else prior_rate
 
-    def fit_poisson_or_none(hist_months: pd.DatetimeIndex, y: np.ndarray, alpha=0.5):
-        try:
-            from sklearn.linear_model import PoissonRegressor
-            X = add_calendar_features(hist_months).drop(columns=["Month"])
-            if len(X) < 12:
-                return None
-            model = PoissonRegressor(alpha=alpha, max_iter=1000)
-            model.fit(X, y)
-            return model
-        except Exception:
-            return None
-
-    def forecast_months(hist_months: pd.DatetimeIndex, y: np.ndarray, horizon: int, alpha=0.5):
-        model = fit_poisson_or_none(hist_months, y, alpha=alpha)
-        last = hist_months[-1]
-        fut = pd.date_range(start=last + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-        if model is not None:
-            Xf = add_calendar_features(fut).drop(columns=["Month"])
-            yhat = np.maximum(0.0, model.predict(Xf))
-        else:
-            hist = pd.DataFrame({"Month": hist_months, "y": y})
-            hist["moy"] = hist["Month"].dt.month
-            moy_avg = hist.groupby("moy")["y"].mean()
-            yhat = np.array([moy_avg.get(m, np.mean(y)) for m in fut.month], dtype=float)
-        return pd.DataFrame({"Month": fut, "yhat": yhat})
-
-    def forecast_this_and_next_month(hist_months: pd.DatetimeIndex, y: np.ndarray, alpha=0.5):
-        today = pd.Timestamp.today().normalize()
-        cm = pd.Timestamp(year=today.year, month=today.month, day=1)
-        mask = hist_months < cm
-        hm, hy = (hist_months[mask], y[mask]) if mask.sum()>=6 else (hist_months, y)
-        model = fit_poisson_or_none(hm, hy, alpha=alpha)
-        months_to_predict = pd.DatetimeIndex([cm, cm + pd.offsets.MonthBegin(1)])
-        if model is not None:
-            Xf = add_calendar_features(months_to_predict).drop(columns=["Month"])
-            yhat = np.maximum(0.0, model.predict(Xf))
-        else:
-            hist = pd.DataFrame({"Month": hm, "y": hy})
-            hist["moy"] = hist["Month"].dt.month
-            moy_avg = hist.groupby("moy")["y"].mean()
-            yhat = np.array([moy_avg.get(m, np.mean(hy)) for m in months_to_predict.month], dtype=float)
-        return {"this_month": float(yhat[0]), "next_month": float(yhat[1])}
-
-    def eb_smooth_props(counts_by_cat: pd.Series, prior_props: pd.Series, prior_strength: float = 5.0):
-        counts = counts_by_cat.astype(float)
-        total = counts.sum()
-        if total <= 0:
-            pp = prior_props.fillna(0).clip(0,1)
-            return (pp / pp.sum()) if pp.sum()>0 else pp
-        cats = counts.index
-        prior = prior_props.reindex(cats).fillna(0.0)
-        smoothed = (counts + prior_strength * prior) / (total + prior_strength)
-        s = smoothed.sum()
-        return smoothed / s if s>0 else smoothed
-
-    def historical_split_props(df_paid: pd.DataFrame, split_col: str, lookback_months: int = 6):
-        if split_col not in df_paid.columns:
-            return pd.Series(dtype=float)
-        dfp = df_paid.copy()
-        dfp["Month"] = dfp["PaymentMonth"]
-        global_counts = dfp.groupby(split_col)["Payment Received Date"].count()
-        gp_total = global_counts.sum()
-        prior_props = (global_counts / gp_total) if gp_total>0 else global_counts
-        months = sorted(dfp["Month"].dropna().unique())
-        take = months[-lookback_months:] if len(months)>=lookback_months else months
-        recent = dfp[dfp["Month"].isin(take)]
-        recent_counts = recent.groupby(split_col)["Payment Received Date"].count().sort_values(ascending=False)
-        return eb_smooth_props(recent_counts, prior_props, prior_strength=5.0)
-
-    def day_of_month_profile(df_paid: pd.DataFrame, target_month: pd.Timestamp):
-        if df_paid.empty:
-            return None
-        dfp = df_paid.copy()
+    # Day-of-month profile with EB smoothing and seasonal pooling (same month-of-year preferred)
+    def day_of_month_profile(df_paid: pd.DataFrame, target_month: pd.Timestamp, group_mask: pd.Series, prior_strength: float = 5.0) -> pd.Series:
+        dfp = df_paid.loc[group_mask].copy()
+        if dfp.empty:
+            days = month_days(target_month)
+            return pd.Series(1.0 / days, index=pd.Index(range(1, days + 1), name="day"))
         dfp["d"] = dfp["Payment Received Date"].dt.day
         dfp["moy"] = dfp["Payment Received Date"].dt.month
         moy = int(target_month.month)
         pool = dfp[dfp["moy"] == moy]
-        if pool.empty: pool = dfp
-        cnt = pool["d"].value_counts().sort_index()
-        days_in_target = month_days(target_month)
-        idx = pd.Index(range(1, days_in_target+1), name="day")
-        cnt = cnt.reindex(idx, fill_value=0)
+        if pool.empty:
+            pool = dfp
+        days = month_days(target_month)
+        idx = pd.Index(range(1, days + 1), name="day")
+        cnt = pool["d"].value_counts().reindex(idx, fill_value=0).astype(float)
         total = cnt.sum()
-        if total == 0:
-            return pd.Series(1.0/days_in_target, index=idx, name="prop")
-        return (cnt/total).rename("prop")
+        prior = pd.Series(1.0 / days, index=idx)
+        smoothed = (cnt + prior_strength * prior) / (total + prior_strength)
+        return smoothed / smoothed.sum()
 
-    # ---- Detect payments and prepare ----
-    PAYMENT_COL = None
+    # Hour-of-day profile (0..23) with EB smoothing; used to split Today's prediction by hour
+    def hour_of_day_profile(df_paid: pd.DataFrame, group_mask: pd.Series, prior_strength: float = 10.0) -> pd.Series:
+        dfp = df_paid.loc[group_mask].copy()
+        if dfp.empty or dfp["Payment Received Date"].isna().all():
+            return pd.Series(1/24, index=pd.Index(range(24), name="hour"))
+        hrs = dfp["Payment Received Date"].dt.hour
+        idx = pd.Index(range(24), name="hour")
+        cnt = hrs.value_counts().reindex(idx, fill_value=0).astype(float)
+        total = cnt.sum()
+        prior = pd.Series(1/24, index=idx)
+        smoothed = (cnt + prior_strength * prior) / (total + prior_strength)
+        return smoothed / smoothed.sum()
+
+    # Backoff helpers for priors
+    def compute_priors(df_cre: pd.DataFrame, df_paid_cohort: pd.DataFrame):
+        """
+        Returns dictionaries with prior rates for:
+        - global
+        - by Deal Source
+        - by (Deal Source, Country)
+        Keys:
+          priors_global = {"r0": float, "r1": float, "n": int}
+          priors_src[(src)] = {"r0": float, "r1": float, "n": int}
+          priors_src_cty[(src, cty)] = {"r0": float, "r1": float, "n": int}
+        """
+        g_trials = len(df_cre)
+        g_succ0 = int(((df_paid_cohort["Lag"] == 0)).sum())
+        g_succ1 = int(((df_paid_cohort["Lag"] == 1)).sum())
+        priors_global = {"r0": safe_div(g_succ0, g_trials), "r1": safe_div(g_succ1, g_trials), "n": g_trials}
+
+        priors_src = {}
+        if "JetLearn Deal Source" in df_cre.columns:
+            for src, grp in df_cre.groupby("JetLearn Deal Source", dropna=False):
+                gidx = grp.index
+                sub = df_paid_cohort.loc[gidx]
+                trials = len(grp)
+                succ0 = int(((sub["Lag"] == 0)).sum())
+                succ1 = int(((sub["Lag"] == 1)).sum())
+                priors_src[src] = {"r0": safe_div(succ0, trials), "r1": safe_div(succ1, trials), "n": trials}
+
+        priors_src_cty = {}
+        if {"JetLearn Deal Source", "Country"}.issubset(df_cre.columns):
+            for (src, cty), grp in df_cre.groupby(["JetLearn Deal Source", "Country"], dropna=False):
+                gidx = grp.index
+                sub = df_paid_cohort.loc[gidx]
+                trials = len(grp)
+                succ0 = int(((sub["Lag"] == 0)).sum())
+                succ1 = int(((sub["Lag"] == 1)).sum())
+                priors_src_cty[(src, cty)] = {"r0": safe_div(succ0, trials), "r1": safe_div(succ1, trials), "n": trials}
+
+        return priors_global, priors_src, priors_src_cty
+
+    def estimate_group_rates(df_cre: pd.DataFrame, df_paid_cohort: pd.DataFrame,
+                             lookback_months: int, prior_strength_base: float = 25.0,
+                             min_trials_for_local: int = 30) -> pd.DataFrame:
+        """
+        Compute EB-smoothed M0/M1 rates per finest group (Source×Country×Counsellor) with backoff priors.
+        """
+        last_month = df_cre["Create_Month"].max()
+        if pd.isna(last_month):
+            return pd.DataFrame(columns=["JetLearn Deal Source","Country","Student/Academic Counsellor","r0","r1","trials"])  # empty
+        first_lb = month_add(last_month, -lookback_months + 1)
+        mask_lb = (df_cre["Create_Month"] >= first_lb) & (df_cre["Create_Month"] <= last_month)
+        cre_lb = df_cre.loc[mask_lb]
+        paid_lb = df_paid_cohort.loc[cre_lb.index]
+
+        pg, psrc, psrccty = compute_priors(cre_lb, paid_lb)
+
+        recs = []
+        grp_cols = ["JetLearn Deal Source", "Country", "Student/Academic Counsellor"]
+        for keys, grp in cre_lb.groupby(grp_cols, dropna=False):
+            gidx = grp.index
+            sub = paid_lb.loc[gidx]
+            trials = len(grp)
+            succ0 = int(((sub["Lag"] == 0)).sum())
+            succ1 = int(((sub["Lag"] == 1)).sum())
+
+            src = keys[0]
+            cty = keys[1]
+            prior_r0, prior_r1, prior_n = pg["r0"], pg["r1"], max(pg["n"], 1)
+            if (src, cty) in psrccty and psrccty[(src, cty)]["n"] >= 10:
+                pr = psrccty[(src, cty)]
+                prior_r0, prior_r1, prior_n = pr["r0"], pr["r1"], pr["n"]
+            elif src in psrc and psrc[src]["n"] >= 10:
+                pr = psrc[src]
+                prior_r0, prior_r1, prior_n = pr["r0"], pr["r1"], pr["n"]
+
+            prior_strength = prior_strength_base * (1.0 if trials < min_trials_for_local else 0.4)
+
+            r0 = eb_rate(succ0, trials, prior_r0, prior_strength)
+            r1 = eb_rate(succ1, trials, prior_r1, prior_strength)
+
+            recs.append({
+                "JetLearn Deal Source": keys[0],
+                "Country": keys[1],
+                "Student/Academic Counsellor": keys[2],
+                "r0": float(r0),
+                "r1": float(r1),
+                "trials": int(trials)
+            })
+
+        rates = pd.DataFrame(recs)
+        return rates
+
+    def forecast_month_groupwise(df: pd.DataFrame, df_paid: pd.DataFrame, rates: pd.DataFrame,
+                                 target_month: pd.Timestamp) -> pd.DataFrame:
+        prev_month = month_add(target_month, -1)
+        grp_cols = ["JetLearn Deal Source", "Country", "Student/Academic Counsellor"]
+        dfc = df.copy()
+        dfc["Create_Month"] = to_month(dfc["Create Date"])  
+
+        cur_cre = dfc[dfc["Create_Month"] == target_month].groupby(grp_cols, dropna=False)["Create Date"].count().rename("C_cur")
+        prev_cre = dfc[dfc["Create_Month"] == prev_month].groupby(grp_cols, dropna=False)["Create Date"].count().rename("C_prev")
+        base = pd.concat([cur_cre, prev_cre], axis=1).fillna(0)
+
+        out = base.reset_index().merge(rates, on=grp_cols, how="left")
+        out[["r0","r1"]] = out[["r0","r1"]].fillna(out[["r0","r1"]].median().fillna(0))
+        out["Forecast"] = out["r0"] * out["C_cur"] + out["r1"] * out["C_prev"]
+        out["Forecast"] = out["Forecast"].clip(lower=0)
+        out["Month"] = target_month
+        return out[grp_cols + ["C_cur","C_prev","r0","r1","Forecast","Month"]]
+
+    # ----------------------------
+    # Detect payments and prep cohort frame
+    # ----------------------------
     PAYMENT_COL = detect_payment_col(df.columns)
     if PAYMENT_COL is None:
         st.error("Couldn't find a payment date column. Add one like 'Payment Received Date'.")
         st.stop()
 
-    df_paid = df.copy()
-    df_paid["Payment Received Date"] = pd.to_datetime(df_paid[PAYMENT_COL], errors="coerce", dayfirst=True)
-    paid = df_paid[df_paid["Payment Received Date"].notna()].copy()
+    dfX = df.copy()
+    dfX["Create Date"] = pd.to_datetime(dfX["Create Date"], errors="coerce", dayfirst=True)
+    dfX["Create_Month"] = to_month(dfX["Create Date"]) 
+    dfX["Payment Received Date"] = pd.to_datetime(dfX[PAYMENT_COL], errors="coerce", dayfirst=True)
+    paid = dfX[dfX["Payment Received Date"].notna()].copy()
+    paid["PaymentMonth"] = to_month(paid["Payment Received Date"])  
+
     if paid.empty:
         st.error("No non-empty payment dates found.")
         st.stop()
-    paid["PaymentMonth"] = paid["Payment Received Date"].dt.to_period("M").dt.to_timestamp()
 
-    # ---- Controls ----
-    st.markdown("### Forecast controls")
-    cc1, cc2, cc3, cc4 = st.columns(4)
-    with cc1:
-        horizon = st.slider("Forecast horizon (months)", 1, 12, 6, 1)
-    with cc2:
-        alpha = st.slider("Poisson regularization (alpha)", 0.0, 2.0, 0.5, 0.1)
-    with cc3:
-        split_by = st.selectbox("Split forecast by", ["None","JetLearn Deal Source","Student/Academic Counsellor","Country","Pipeline"])
-    with cc4:
-        lookback_split = st.slider("Split lookback (months)", 1, 12, 6, 1)
+    # Cohort merge: align each deal with its payment month (if any) and compute Lag
+    df_cohort = dfX[["Create Date","Create_Month","JetLearn Deal Source","Country","Student/Academic Counsellor"]].copy()
+    df_cohort["PaymentMonth"] = to_month(dfX["Payment Received Date"])  
+    cm_code = df_cohort["Create_Month"].dt.year * 12 + df_cohort["Create_Month"].dt.month
+    pm_code = df_cohort["PaymentMonth"].dt.year * 12 + df_cohort["PaymentMonth"].dt.month
+    df_cohort["Lag"] = (pm_code - cm_code)
 
-    # ---- Monthly history & forecast ----
-    monthly = make_month_table_from_dates(paid["Payment Received Date"]).sort_values("Month")
-    hist_months = pd.to_datetime(monthly["Month"]); y = monthly["y"].astype(float).values
-    fut = forecast_months(hist_months, y, horizon=horizon, alpha=alpha)
-    fut["MonthStr"] = fut["Month"].dt.strftime("%Y-%m")
-    monthly["MonthStr"] = pd.to_datetime(monthly["Month"]).dt.strftime("%Y-%m")
+    # ----------------------------
+    # Controls
+    # ----------------------------
+    st.markdown("### Cohort-based Predictability")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        lookback = st.slider("Lookback window (months)", 3, 12, 6, 1)
+    with c2:
+        min_trials = st.slider("Min. creates for local rates", 10, 100, 30, 5)
+    with c3:
+        prior_strength = st.slider("Prior strength", 5, 100, 25, 5)
+    with c4:
+        group_view = st.selectbox("View level", [
+            "Deal Source",
+            "Country",
+            "Counsellor",
+            "Deal Source × Country",
+            "Deal Source × Country × Counsellor"
+        ])
 
-    st.markdown("### History + Forecast")
-    hist_line = alt_line(monthly, "MonthStr:O", "y:Q", tooltip=["MonthStr","y"]).encode(color=alt.value("#0ea5e9"))
-    fut_line  = alt_line(fut,     "MonthStr:O", "yhat:Q", tooltip=["MonthStr","yhat"]).encode(color=alt.value("#ef4444"))
-    st.altair_chart(alt.layer(hist_line, fut_line).resolve_scale(y='shared'), use_container_width=True)
-
-    # ---- KPIs Today / Tomorrow / This Month / Next Month ----
-    k = forecast_this_and_next_month(hist_months, y, alpha=alpha)
-    this_month_forecast = k["this_month"]; next_month_forecast = k["next_month"]
     today_dt = pd.Timestamp.today().date()
-    cm_start = month_start(today_dt)
-    dom_prop = day_of_month_profile(paid, cm_start)
-    def safe_take_prop(prop_series, day_idx):
-        if prop_series is None: return 0.0
-        return float(prop_series.reindex(range(1, len(prop_series)+1)).get(day_idx, 0.0))
-    today_n  = int(round(this_month_forecast * safe_take_prop(dom_prop, today_dt.day)))
-    tom_dt   = today_dt + timedelta(days=1)
-    tom_n    = int(round(this_month_forecast * safe_take_prop(dom_prop, tom_dt.day)))
+    cm = month_start(today_dt)
+    nm = month_add(cm, 1)
+
+    # ----------------------------
+    # Estimate rates (r0/r1) with EB
+    # ----------------------------
+    with st.spinner("Estimating conversion rates by cohort…"):
+        rates = estimate_group_rates(
+            df_cre=df_cohort,
+            df_paid_cohort=df_cohort,
+            lookback_months=lookback,
+            prior_strength_base=float(prior_strength),
+            min_trials_for_local=int(min_trials)
+        )
+
+    # ----------------------------
+    # Forecast this & next month at finest level
+    # ----------------------------
+    fc_this = forecast_month_groupwise(dfX, paid, rates, cm)
+    fc_next = forecast_month_groupwise(dfX, paid, rates, nm)
+
+    def aggregate_view(df_fc: pd.DataFrame, view: str) -> pd.DataFrame:
+        if view == "Deal Source":
+            keys = ["JetLearn Deal Source"]
+        elif view == "Country":
+            keys = ["Country"]
+        elif view == "Counsellor":
+            keys = ["Student/Academic Counsellor"]
+        elif view == "Deal Source × Country":
+            keys = ["JetLearn Deal Source","Country"]
+        else:
+            keys = ["JetLearn Deal Source","Country","Student/Academic Counsellor"]
+        agg = df_fc.groupby(keys, dropna=False)["Forecast"].sum().reset_index()
+        return agg
+
+    v_this = aggregate_view(fc_this, group_view).rename(columns={"Forecast":"This Month"})
+    v_next = aggregate_view(fc_next, group_view).rename(columns={"Forecast":"Next Month"})
+    merged_months = v_this.merge(v_next, on=v_this.columns[:-1].tolist(), how="outer").fillna(0)
+
+    # ----------------------------
+    # Today / Tomorrow using day-of-month allocation per group
+    # ----------------------------
+    st.markdown("### Today & Tomorrow (day/time aware)")
+    with st.expander("Daily & hourly allocation settings", expanded=False):
+        daily_prior_strength = st.slider("Daily profile prior strength", 1, 20, 5, 1)
+        hourly_prior_strength = st.slider("Hourly profile prior strength", 5, 50, 10, 5)
+
+    dom_today = today_dt.day
+    dom_tom = (today_dt + timedelta(days=1)).day
+
+    def mask_for_row(row: pd.Series) -> pd.Series:
+        m = pd.Series(True, index=paid.index)
+        if "JetLearn Deal Source" in row.index and not pd.isna(row["JetLearn Deal Source"]):
+            m &= (paid["JetLearn Deal Source"].astype(str) == str(row["JetLearn Deal Source"]))
+        if "Country" in row.index and not pd.isna(row.get("Country", np.nan)):
+            m &= (paid["Country"].astype(str) == str(row["Country"]))
+        if "Student/Academic Counsellor" in row.index and not pd.isna(row.get("Student/Academic Counsellor", np.nan)):
+            m &= (paid["Student/Academic Counsellor"].astype(str) == str(row["Student/Academic Counsellor"]))
+        return m
+
+    vt = v_this.copy()
+    vt["Today"] = 0.0
+    vt["Tomorrow"] = 0.0
+
+    for i, row in vt.iterrows():
+        m = mask_for_row(row)
+        dom_profile = day_of_month_profile(paid, cm, m, prior_strength=daily_prior_strength)
+        p_today = float(dom_profile.reindex(range(1, month_days(cm) + 1)).get(dom_today, 0.0))
+        p_tom = float(dom_profile.reindex(range(1, month_days(cm) + 1)).get(dom_tom, 0.0))
+        vt.at[i, "Today"] = row["This Month"] * p_today
+        vt.at[i, "Tomorrow"] = row["This Month"] * p_tom
 
     k1, k2, k3, k4 = st.columns(4)
-    with k1: st.markdown(f"<div class='kpi'><div class='label'>Today ({today_dt:%d %b})</div><div class='value'>{today_n:,}</div></div>", unsafe_allow_html=True)
-    with k2: st.markdown(f"<div class='kpi'><div class='label'>Tomorrow ({tom_dt:%d %b})</div><div class='value'>{tom_n:,}</div></div>", unsafe_allow_html=True)
-    with k3: st.markdown(f"<div class='kpi'><div class='label'>This Month ({cm_start:%b %Y})</div><div class='value'>{int(round(this_month_forecast)):,}</div></div>", unsafe_allow_html=True)
+    with k1:
+        st.markdown(f"""
+        <div class='kpi'>
+          <div class='label'>Today ({pd.Timestamp(today_dt):%d %b})</div>
+          <div class='value'>{int(round(vt['Today'].sum())):,}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with k2:
+        st.markdown(f"""
+        <div class='kpi'>
+          <div class='label'>Tomorrow ({pd.Timestamp(today_dt + timedelta(days=1)):%d %b})</div>
+          <div class='value'>{int(round(vt['Tomorrow'].sum())):,}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with k3:
+        st.markdown(f"""
+        <div class='kpi'>
+          <div class='label'>This Month ({cm:%b %Y})</div>
+          <div class='value'>{int(round(v_this['This Month'].sum())):,}</div>
+        </div>
+        """, unsafe_allow_html=True)
     with k4:
-        nm = (cm_start + pd.offsets.MonthBegin(1))
-        st.markdown(f"<div class='kpi'><div class='label'>Next Month ({nm:%b %Y})</div><div class='value'>{int(round(next_month_forecast)):,}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class='kpi'>
+          <div class='label'>Next Month ({nm:%b %Y})</div>
+          <div class='value'>{int(round(v_next['Next Month'].sum())):,}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
-    # ---- Inspect a forecast month & Split ----
-    st.markdown("### Inspect a forecast month")
-    tm1, tm2 = st.columns([1.2,3])
-    with tm1:
-        options = list((pd.date_range(start=cm_start, periods=max(horizon, 2), freq="MS")).to_pydatetime())
-        default_index = 1
-        target_month = st.selectbox("Pick a month", options=options, index=default_index, format_func=lambda d: pd.Timestamp(d).strftime("%b %Y"))
+    st.markdown("#### Month-level Forecast (cohort-based)")
+    st.dataframe(merged_months.sort_values("This Month", ascending=False), use_container_width=True)
+    st.download_button("Download — Month Forecast CSV",
+                       merged_months.to_csv(index=False).encode("utf-8"),
+                       file_name="cohort_month_forecast.csv", mime="text/csv")
 
-    target_month_ts = pd.Timestamp(target_month)
-    if target_month_ts == cm_start:
-        pred_total = this_month_forecast
-    elif target_month_ts == (cm_start + pd.offsets.MonthBegin(1)):
-        pred_total = next_month_forecast
-    else:
-        row = fut[fut["Month"]==target_month_ts]
-        pred_total = float(row["yhat"].iloc[0]) if not row.empty else float(next_month_forecast)
+    st.markdown("#### Today & Tomorrow (by group)")
+    st.dataframe(vt.sort_values("Today", ascending=False), use_container_width=True)
+    st.download_button("Download — Today/Tomorrow CSV",
+                       vt.to_csv(index=False).encode("utf-8"),
+                       file_name="cohort_today_tomorrow.csv", mime="text/csv")
 
-    s1, s2 = st.columns(2)
-    with s1:
-        st.markdown(f"<div class='kpi'><div class='label'>Forecast — {target_month_ts:%b %Y}</div><div class='value'>{int(round(pred_total)):,}</div></div>", unsafe_allow_html=True)
-
-    st.markdown("### Split of forecast (category proportions)")
-    if split_by == "None":
-        st.info("No split selected.")
-    else:
-        props = historical_split_props(paid, split_by, lookback_months=lookback_split)
-        if props.empty or props.sum() == 0:
-            st.warning("Not enough data to compute split proportions; showing uniform split across observed categories.")
-            cats = paid[split_by].dropna().astype(str).value_counts().index
-            if len(cats) == 0:
-                st.info("No categories available for split.")
-            else:
-                props = pd.Series(1/len(cats), index=cats)
-
-        if len(props) > 0:
-            split_table = props.rename("Prop").reset_index().rename(columns={"index":split_by})
-            split_table["Forecast"] = (pred_total * split_table["Prop"]).round(0)
-            st.dataframe(split_table.sort_values("Forecast", ascending=False), use_container_width=True)
-            st.download_button("Download split CSV", split_table.to_csv(index=False).encode("utf-8"),
-                               file_name="forecast_split.csv", mime="text/csv")
-            ch = alt.Chart(split_table).mark_bar().encode(
-                x=alt.X(f"{split_by}:N", title=None),
+    st.markdown("#### Optional: Today's hourly breakdown (top 10 groups by Today forecast)")
+    top_today = vt.sort_values("Today", ascending=False).head(10)
+    if not top_today.empty:
+        for _, row in top_today.iterrows():
+            m = mask_for_row(row)
+            hprof = hour_of_day_profile(paid, m, prior_strength=hourly_prior_strength)
+            hour_df = hprof.rename("Prop").reset_index()
+            hour_df["Forecast"] = (row["Today"] * hour_df["Prop"]).round(1)
+            title_bits = []
+            if "JetLearn Deal Source" in row.index and not pd.isna(row["JetLearn Deal Source"]):
+                title_bits.append(str(row["JetLearn Deal Source"]))
+            if "Country" in row.index and not pd.isna(row.get("Country", np.nan)):
+                title_bits.append(str(row["Country"]))
+            if "Student/Academic Counsellor" in row.index and not pd.isna(row.get("Student/Academic Counsellor", np.nan)):
+                title_bits.append(str(row["Student/Academic Counsellor"]))
+            st.caption(" — ".join(title_bits) or "Group")
+            ch = alt.Chart(hour_df).mark_bar().encode(
+                x=alt.X("hour:O", title=None),
                 y=alt.Y("Forecast:Q", title=None),
-                tooltip=[split_by,"Forecast","Prop"]
-            )
+                tooltip=["hour","Forecast","Prop"]
+            ).properties(height=160)
             st.altair_chart(ch, use_container_width=True)
 
-    # ---- Day-of-month distribution for chosen month ----
-    st.markdown("### Day-of-month distribution")
-    prop_dom = day_of_month_profile(paid, target_month_ts)
-    if prop_dom is None:
-        st.info("Not enough data for daily profile.")
-    else:
-        dom = prop_dom.reset_index().rename(columns={"day":"Day","prop":"Prop"})
-        dom["Forecast"] = (pred_total * dom["Prop"]).round(0)
-        st.dataframe(dom, use_container_width=True)
-        ch2 = alt.Chart(dom).mark_bar().encode(
-            x=alt.X("Day:O", title=None), y=alt.Y("Forecast:Q", title=None),
-            tooltip=["Day","Forecast","Prop"]
-        )
-        st.altair_chart(ch2, use_container_width=True)
-
-    # ---- Quick backtest (walk-forward) ----
-    st.markdown("### Backtest (walk-forward, quick)")
-    bt_window = st.slider("Training window (months)", 6, 24, 12, 1)
-    hist = monthly.copy()
-    hist["Month"] = pd.to_datetime(hist["Month"])
-    hist = hist.sort_values("Month")
-
-    if len(hist) <= bt_window + 2:
-        st.info("Not enough history to backtest with the chosen window.")
-    else:
-        tests = min(12, len(hist) - bt_window - 1)
-        recs = []
-        for i in range(bt_window, bt_window + tests):
-            train = hist.iloc[:i].copy()
-            test  = hist.iloc[i:i+1].copy()
-            m_train = train["Month"].values
-            y_train = train["y"].astype(float).values
-            m_test  = test["Month"].values[0]
-            model = fit_poisson_or_none(pd.to_datetime(m_train), y_train, alpha=alpha)
-            if model is not None:
-                Xf = add_calendar_features(pd.DatetimeIndex([m_test])).drop(columns=["Month"])
-                pred = float(max(0.0, model.predict(Xf)[0]))
-            else:
-                train["moy"] = pd.to_datetime(train["Month"]).dt.month
-                moy_avg = train.groupby("moy")["y"].mean()
-                pred = float(moy_avg.get(pd.Timestamp(m_test).month, train["y"].mean()))
-            actual = float(test["y"].values[0])
-            mae = abs(pred - actual)
-            mape = (mae / actual * 100) if actual>0 else np.nan
-            recs.append({"Month": m_test, "Pred":pred, "Actual":actual, "MAE":mae, "MAPE":mape})
-        bt = pd.DataFrame(recs)
-        if not bt.empty:
-            c1,c2 = st.columns(2)
-            c1.metric("Avg MAE", f"{bt['MAE'].mean():.1f}")
-            c2.metric("Avg MAPE", f"{bt['MAPE'].dropna().mean():.1f}%")
-            line_bt = alt.layer(
-                alt_line(bt.assign(M=bt["Month"].dt.strftime("%Y-%m")), "M:O", "Actual:Q").encode(color=alt.value("#10b981")),
-                alt_line(bt.assign(M=bt["Month"].dt.strftime("%Y-%m")), "M:O", "Pred:Q").encode(color=alt.value("#ef4444")),
-            ).resolve_scale(y='shared')
-            st.altair_chart(line_bt, use_container_width=True)
-            st.dataframe(bt.assign(Month=bt["Month"].dt.strftime("%Y-%m")).drop(columns=["Month"]), use_container_width=True)
+    st.caption("Model: Cohort-based (M0/M1) using EB-smoothed rates by Deal Source × Country × Counsellor; daily/hourly allocation from historical payment patterns of the same month-of-year. Excludes '1.2 Invalid Deal'.")
