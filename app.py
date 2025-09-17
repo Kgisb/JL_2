@@ -1,4 +1,4 @@
-# app.py — Drawer UI + A/B Compare + Predictability (robust headers, safe models)
+# app.py — Drawer UI + A/B Compare + Predictability (robust headers, Poisson GLM, controls)
 
 import streamlit as st
 import pandas as pd
@@ -8,12 +8,11 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # ML
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline as SKPipeline
 from sklearn.metrics import mean_absolute_error
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import PoissonRegressor
 
 # --------------------------- PAGE / THEME ---------------------------
 st.set_page_config(page_title="MTD vs Cohort — Drawer UI + Predictability",
@@ -44,7 +43,6 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 """, unsafe_allow_html=True)
 
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
-REQUIRED_COLS_BASE = ["JetLearn Deal Source","Country","Student/Academic Counsellor","Deal Stage","Create Date"]
 
 # --------------------------- CLONE REQUEST HANDLING ---------------------------
 def _request_clone(direction: str):
@@ -72,30 +70,22 @@ def robust_read_csv(file_or_path):
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
 def ensure_named_column(df: pd.DataFrame, target: str, aliases: list[str], create_unknown: bool = True) -> pd.DataFrame:
-    """
-    Ensure column `target` exists; rename from aliases (case/space tolerant) or create safe fallback.
-    """
     if target in df.columns:
         return df
-
     norm_map = {c: c.strip().lower() for c in df.columns}
     candidate_keys = {target.strip().lower(), *[a.strip().lower() for a in aliases]}
-
     hit = None
     for col, low in norm_map.items():
         if low in candidate_keys:
-            hit = col
-            break
-
+            hit = col; break
     if hit is not None:
         return df.rename(columns={hit: target})
-
     if create_unknown:
         if any(k in target.lower() for k in ["date","time","timestamp"]):
             df[target] = pd.NaT
         else:
             df[target] = "Unknown"
-        st.warning(f"‘{target}’ column not found; created a fallback `{target}`. Please align your CSV header.")
+        st.warning(f"‘{target}’ column not found; created `{target}` fallback. Please align your CSV header.")
     return df
 
 def detect_measure_date_columns(df: pd.DataFrame):
@@ -241,7 +231,7 @@ if not date_like_cols:
     st.error("No usable date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
 
-# --------------------------- FILTER WIDGETS ---------------------------
+# --------------------------- FILTER WIDGETS (drawer) ---------------------------
 def _summary(values, all_flag, max_items=2):
     vals=coerce_list(values)
     if all_flag: return "All"
@@ -490,109 +480,103 @@ def build_compare_delta(dfA, dfB):
     out["Δ%"]=((out["Δ"].astype(float)/denom)*100).round(1)
     return out
 
-# --------------------------- PREDICTABILITY HELPERS ---------------------------
-def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
-    """Filter by Pipeline values for AI-Coding / Math / Both, tolerant to variants."""
-    if "Pipeline" not in df.columns:
-        return df
-    if program_choice == "Both":
-        return df
+# --------------------------- PREDICTABILITY (improved) ---------------------------
+# We predict counts ONLY for "Payment Received Date" and allow you to choose granularity (more variables).
+PRED_DATE_COL = "Payment Received Date"
 
+def subset_for_program(df: pd.DataFrame, program_choice: str) -> pd.DataFrame:
+    if "Pipeline" not in df.columns or program_choice == "Both":
+        return df
     s = df["Pipeline"].astype(str).str.strip().str.lower()
     if program_choice == "AI-Coding":
         mask = (s.eq("ai-coding") | s.str.contains(r"\bai\b") | s.str.contains("coding"))
-    elif program_choice == "Math":
+    else:  # Math
         mask = (s.eq("math") | s.str.contains("math") | s.str.contains("vedic"))
-    else:
-        mask = pd.Series(True, index=df.index)
-
     sub = df[mask].copy()
     if sub.empty:
         st.warning(f"No rows matched **{program_choice}** in Pipeline. Showing all records instead.")
         return df
     return sub
 
-def build_daily_counts(df: pd.DataFrame, measure_col: str):
-    """
-    Aggregate daily counts per JetLearn Deal Source (treat NaT as 0),
-    robust if columns are missing.
-    """
-    if "JetLearn Deal Source" not in df.columns:
-        df["JetLearn Deal Source"] = "Unknown"
-
-    if measure_col not in df.columns:
-        return pd.DataFrame(columns=["ds","JetLearn Deal Source","y"])
-
-    data = df.dropna(subset=[measure_col]).copy()
+def build_daily_counts(df: pd.DataFrame, group_cols: list[str]):
+    # Filter to rows with Payment Received Date
+    if PRED_DATE_COL not in df.columns:
+        return pd.DataFrame(columns=["ds", *group_cols, "y"])
+    data = df.dropna(subset=[PRED_DATE_COL]).copy()
     if data.empty:
-        return pd.DataFrame(columns=["ds","JetLearn Deal Source","y"])
-
-    data["ds"] = pd.to_datetime(data[measure_col]).dt.date
-    grp = (data.groupby(["ds","JetLearn Deal Source"])
-                .size()
-                .reset_index(name="y"))
+        return pd.DataFrame(columns=["ds", *group_cols, "y"])
+    data["ds"] = pd.to_datetime(data[PRED_DATE_COL]).dt.date
+    grp = data.groupby(["ds", *group_cols]).size().reset_index(name="y")
     return grp
 
-def add_time_features(frame: pd.DataFrame):
-    f = frame.copy()
-    f["ds"] = pd.to_datetime(f["ds"])
-    f["dow"] = f["ds"].dt.dayofweek
-    f["month"] = f["ds"].dt.month
-    f["dom"] = f["ds"].dt.day
-    f["week"] = f["ds"].dt.isocalendar().week.astype(int)
-    f["year"] = f["ds"].dt.year
+def add_time_feats(f: pd.DataFrame):
+    x = f.copy()
+    x["ds"] = pd.to_datetime(x["ds"])
+    x["dow"] = x["ds"].dt.dayofweek
+    x["week"] = x["ds"].dt.isocalendar().week.astype(int)
+    x["month"] = x["ds"].dt.month
+    x["dom"] = x["ds"].dt.day
+    x["year"] = x["ds"].dt.year
+    return x
+
+def add_group_lags(df_counts: pd.DataFrame, group_cols: list[str]):
+    f = df_counts.sort_values(group_cols + ["ds"]).copy()
+    f["y_lag7"]  = f.groupby(group_cols)["y"].shift(7)
+    f["y_lag14"] = f.groupby(group_cols)["y"].shift(14)
     return f
 
-def add_lags_and_rolls(frame: pd.DataFrame, group_col="JetLearn Deal Source"):
-    f = frame.sort_values([group_col,"ds"]).copy()
-    f["y_lag7"] = f.groupby(group_col)["y"].shift(7)
-    f["y_lag14"] = f.groupby(group_col)["y"].shift(14)
-    f["y_roll7"] = f.groupby(group_col)["y"].rolling(7, min_periods=1).mean().reset_index(0,drop=True)
-    f["y_roll28"] = f.groupby(group_col)["y"].rolling(28, min_periods=1).mean().reset_index(0,drop=True)
-    return f
+def last_rolling_mean(df_counts: pd.DataFrame, group_cols: list[str], window: int = 7):
+    """Return df with one row per group containing last rolling mean (for naive & lags proxy)."""
+    f = df_counts.sort_values(group_cols + ["ds"]).copy()
+    f["roll"] = f.groupby(group_cols)["y"].rolling(window, min_periods=1).mean().reset_index(0, drop=True)
+    last = f.groupby(group_cols).tail(1)[group_cols + ["roll"]].rename(columns={"roll": f"roll{window}"})
+    return last
 
-def train_forecast_model(df_counts: pd.DataFrame):
-    """Fit a GBM with one-hot on source; time-aware split; return model, features, metrics."""
-    if df_counts.empty or df_counts["ds"].nunique() < 40:
-        return None, None, None
+def train_poisson(df_counts: pd.DataFrame, group_cols: list[str]):
+    if df_counts.empty or df_counts["ds"].nunique() < 30:
+        return None, None, None, None
 
-    X = add_time_features(df_counts)
-    X = add_lags_and_rolls(X)
-    X = X.dropna().reset_index(drop=True)
-    if X.empty:
-        return None, None, None
+    # Features
+    f = add_time_feats(df_counts)
+    f = add_group_lags(f, group_cols)
+    f = f.dropna(subset=["y_lag7", "y_lag14"]).reset_index(drop=True)  # avoid leakage
+    if f.empty:
+        return None, None, None, None
 
-    features = ["dow","month","dom","week","year","y_lag7","y_lag14","y_roll7","y_roll28","JetLearn Deal Source"]
+    # Train / test split by time
+    f = f.sort_values("ds")
+    split_idx = int(len(f) * 0.8)
+    train, test = f.iloc[:split_idx], f.iloc[split_idx:]
+    if train.empty or test.empty:
+        return None, None, None, None
+
+    features = group_cols + ["dow","week","month","dom","year","y_lag7","y_lag14"]
     target = "y"
-    cat_cols = ["JetLearn Deal Source"]
 
     ct = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
-        ],
+        transformers=[("cat", OneHotEncoder(handle_unknown="ignore"), group_cols)],
         remainder="passthrough"
     )
 
     model = SKPipeline(steps=[
         ("prep", ct),
-        ("gbm", GradientBoostingRegressor(random_state=42))
+        ("glm", PoissonRegressor(alpha=1.0, max_iter=2000))
     ])
-
-    X = X.sort_values("ds")
-    split_idx = int(len(X) * 0.8)
-    train, test = X.iloc[:split_idx], X.iloc[split_idx:]
-    if train.empty or test.empty:
-        return None, None, None
-
     model.fit(train[features], train[target])
     pred = model.predict(test[features]).clip(min=0)
+
     mae = mean_absolute_error(test[target], pred)
     mape = float(np.mean(np.abs((test[target].values - pred) / np.maximum(1, test[target].values))) * 100)
 
-    metrics = {"MAE": round(mae, 2), "MAPE%": round(mape, 1), "train_n": len(train), "test_n": len(test)}
-    return model, features, metrics
+    # Historical caps per group to curb inflation
+    caps = (df_counts
+            .groupby(group_cols)["y"]
+            .agg(p95=lambda s: np.percentile(s, 95), mean="mean")
+            .reset_index())
+    caps["cap"] = np.maximum(caps["p95"], 1.2 * caps["mean"]).clip(min=1.0)
+    return model, features, {"MAE": round(mae,2), "MAPE%": round(mape,1)}, caps
 
-def make_future_frame(horizon: str):
+def make_future_dates(horizon: str):
     today = pd.Timestamp.today().date()
     if horizon == "Today":
         dates = [today]
@@ -602,29 +586,50 @@ def make_future_frame(horizon: str):
         start = today
         end = (date(today.year + (today.month==12), 1 if today.month==12 else today.month+1, 1) - timedelta(days=1))
         dates = pd.date_range(start, end, freq="D").date.tolist()
-    elif horizon == "Next month":
+    else:  # Next month
         start = date(today.year + (today.month==12), 1 if today.month==12 else today.month+1, 1)
         end = date(start.year + (start.month==12), 1 if start.month==12 else start.month+1, 1) - timedelta(days=1)
         dates = pd.date_range(start, end, freq="D").date.tolist()
-    else:
-        dates = [today]
     return pd.DataFrame({"ds": dates})
 
-def predict_by_source(model, feature_cols, sources, future_dates):
-    frames=[]
-    for s in sources:
-        f = future_dates.copy()
-        f["JetLearn Deal Source"] = s
-        f = add_time_features(f)
-        for c in ["y_lag7","y_lag14","y_roll7","y_roll28"]:
-            f[c] = 0.0  # unknown future lags -> 0 (model learns baseline seasonality via calendar + OHE)
-        yhat = model.predict(f[feature_cols]).clip(min=0)
-        out = f[["ds","JetLearn Deal Source"]].copy()
-        out["yhat"] = np.round(yhat, 2)
-        frames.append(out)
-    if frames:
-        return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame(columns=["ds","JetLearn Deal Source","yhat"])
+def prepare_future_frame(df_counts: pd.DataFrame, group_cols: list[str], future_dates: pd.DataFrame):
+    # All historical group combos:
+    groups = df_counts[group_cols].drop_duplicates().reset_index(drop=True)
+    grid = future_dates.assign(key=1).merge(groups.assign(key=1), on="key", how="outer").drop(columns="key")
+    # Calendar feats
+    Xf = add_time_feats(grid)
+    # Use group's last 7-day rolling mean as proxy for y_lag7/14
+    last7 = last_rolling_mean(df_counts, group_cols, window=7)
+    last14 = last_rolling_mean(df_counts, group_cols, window=14)
+    Xf = Xf.merge(last7, on=group_cols, how="left").rename(columns={"roll7":"y_lag7"})
+    Xf = Xf.merge(last14, on=group_cols, how="left").rename(columns={"roll14":"y_lag14"})
+    for col in ["y_lag7","y_lag14"]:
+        Xf[col] = Xf[col].fillna(Xf[col].median() if not Xf[col].dropna().empty else 0.0)
+    return Xf
+
+def cap_and_blend(pred_df: pd.DataFrame, caps: pd.DataFrame, group_cols: list[str],
+                  daily_counts: pd.DataFrame, conservatism: float):
+    """
+    Apply per-group caps and blend with naive mean-7 to reduce inflation.
+    conservatism: 0..1 (1 = fully model, 0 = fully naive)
+    """
+    out = pred_df.copy()
+    if caps is not None and not caps.empty:
+        out = out.merge(caps[group_cols + ["cap"]], on=group_cols, how="left")
+        out["cap"] = out["cap"].fillna(out["yhat"].quantile(0.95) if not out["yhat"].empty else 1.0)
+        out["yhat"] = np.minimum(out["yhat"], out["cap"])
+
+    # naive baseline: last 7-day mean per group (constant)
+    naive = last_rolling_mean(daily_counts, group_cols, window=7)
+    naive = naive.rename(columns={"roll7":"naive7"}) if "roll7" in naive.columns else naive
+    if "naive7" not in naive.columns:
+        naive["naive7"] = 0.0
+    out = out.merge(naive[group_cols + ["naive7"]], on=group_cols, how="left")
+    out["naive7"] = out["naive7"].fillna(out["yhat"].median() if not out["yhat"].empty else 0.0)
+
+    c = float(conservatism)  # 0..1
+    out["yhat"] = (c * out["yhat"] + (1.0 - c) * out["naive7"]).clip(min=0)
+    return out.drop(columns=["cap","naive7"], errors="ignore")
 
 # --------------------------- SIDEBAR (Drawer) ---------------------------
 if st.session_state.get("filters_open", True):
@@ -642,7 +647,7 @@ if st.session_state.get("filters_open", True):
 # --------------------------- MAIN TABS ---------------------------
 main_tabs = st.tabs(["Analyze", "Predictability"])
 
-# --------------------------- ANALYZE TAB ---------------------------
+# --------------------------- ANALYZE TAB (unchanged) ---------------------------
 with main_tabs[0]:
     def mk_caption(meta):
         return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
@@ -725,71 +730,90 @@ with main_tabs[0]:
                     except Exception:
                         pass
 
-# --------------------------- PREDICTABILITY TAB ---------------------------
+# --------------------------- PREDICTABILITY TAB (improved) ---------------------------
 with main_tabs[1]:
-    st.markdown("### 🔮 Predictability (JetLearn Deal Source totals)")
-    st.caption("Trains on historical **daily counts** per deal source from your chosen event date column. "
-               "Time-aware split with metrics; fallback to 7-day mean if not enough data. "
-               "Program filter uses the **Pipeline** column (robust to naming variants).")
+    st.markdown("### 🔮 Predictability — Payment Received (Poisson GLM with guard-rails)")
+    st.caption("Predicts counts from **Payment Received Date** only. Choose forecast granularity to use more variables.")
 
     # Controls
     pc1, pc2, pc3 = st.columns([2,2,2])
     with pc1:
-        program_choice = st.selectbox("Program", ["AI-Coding", "Math", "Both"], index=2)
+        program_choice = st.selectbox("Program (filters Pipeline)", ["AI-Coding", "Math", "Both"], index=2)
     with pc2:
-        default_measure = "Payment Received Date" if "Payment Received Date" in date_like_cols else date_like_cols[0]
-        pred_measure = st.selectbox("Event date column to count", date_like_cols, index=date_like_cols.index(default_measure))
+        granularity = st.selectbox(
+            "Forecast by",
+            ["Deal Source", "Deal Source × Pipeline", "Deal Source × Country", "Deal Source × Counsellor"],
+            index=0
+        )
     with pc3:
-        horizon = st.selectbox("Forecast horizon", ["Today","Tomorrow","This month (rest)","Next month"], index=2)
+        horizon = st.selectbox("Horizon", ["Today","Tomorrow","This month (rest)","Next month"], index=2)
+
+    pc4, pc5 = st.columns([2,2])
+    with pc4:
+        conserv = st.slider("Conservatism (blend with 7-day mean)", 0, 100, 60, help="0=naive only, 100=model only")
+    with pc5:
+        st.caption("Capping at historical 95th percentile per group is applied automatically to avoid inflated forecasts.")
 
     run_btn = st.button("Run prediction", type="primary")
 
     if run_btn:
-        # Subset by program (Pipeline)
+        # Subset by Pipeline if requested
         df_prog = subset_for_program(df, program_choice)
 
-        # Daily counts by source for selected measure
-        daily = build_daily_counts(df_prog, pred_measure)
-        if daily.empty:
-            st.warning("Not enough data in the chosen event column to model. Try a different measure.")
+        # Choose group columns based on granularity (use more variables)
+        if granularity == "Deal Source":
+            group_cols = ["JetLearn Deal Source"]
+        elif granularity == "Deal Source × Pipeline":
+            group_cols = ["JetLearn Deal Source", "Pipeline"]
+        elif granularity == "Deal Source × Country":
+            group_cols = ["JetLearn Deal Source", "Country"]
         else:
-            with st.spinner("Training model & backtesting..."):
-                model, feats, back_metrics = train_forecast_model(daily)
+            group_cols = ["JetLearn Deal Source", "Student/Academic Counsellor"]
 
+        # Build historical daily counts
+        daily = build_daily_counts(df_prog, group_cols)
+        if daily.empty:
+            st.warning("Not enough payment data to model. Check your CSV has a 'Payment Received Date'.")
+        else:
+            # Train Poisson GLM with OHE on groups + calendar + lags
+            with st.spinner("Training Poisson GLM & computing caps…"):
+                model, feat_cols, back_metrics, caps = train_poisson(daily, group_cols)
+
+            # Future dates
+            future_dates = make_future_dates(horizon)
             if model is None:
-                st.info("Not enough history to train a model. Falling back to a 7-day average baseline.")
-                naive = (daily.groupby("JetLearn Deal Source").tail(7)
-                              .groupby("JetLearn Deal Source")["y"].mean()
-                              .reset_index().rename(columns={"y":"naive_mean"}))
-                future_dates = make_future_frame(horizon)
-                if future_dates.empty:
-                    st.info("No future dates formed for the selected horizon.")
-                else:
-                    sources = sorted(daily["JetLearn Deal Source"].unique())
-                    out = pd.MultiIndex.from_product([future_dates["ds"], sources], names=["ds","JetLearn Deal Source"]).to_frame(index=False)
-                    out = out.merge(naive, on="JetLearn Deal Source", how="left").fillna(0)
-                    out["yhat"] = out["naive_mean"].clip(lower=0).round(2)
-                    st.markdown("#### Forecast (Naive baseline)")
-                    st.dataframe(out[["ds","JetLearn Deal Source","yhat"]], use_container_width=True)
-                    total = out.groupby("ds")["yhat"].sum().reset_index()
-                    ch = alt.Chart(total).mark_bar().encode(x="ds:T", y="yhat:Q", tooltip=["ds","yhat"])
-                    st.altair_chart(ch, use_container_width=True)
+                st.info("Not enough history or lags to fit a model. Falling back to conservative naive forecast.")
+                # naive: last 7-day mean per group
+                base = prepare_future_frame(daily, group_cols, future_dates)
+                # emulate naive: yhat = group's last7 mean
+                naive_means = last_rolling_mean(daily, group_cols, window=7)
+                if "roll7" in naive_means.columns:
+                    naive_means = naive_means.rename(columns={"roll7":"naive7"})
+                if "naive7" not in naive_means.columns:
+                    naive_means["naive7"] = 0.0
+                fc = base[group_cols + ["ds"]].merge(naive_means[group_cols + ["naive7"]], on=group_cols, how="left")
+                fc["yhat"] = fc["naive7"].fillna(0.0).clip(min=0).round(2)
             else:
+                Xf = prepare_future_frame(daily, group_cols, future_dates)
+                yhat = model.predict(Xf[feat_cols]).clip(min=0)
+                fc = Xf[group_cols + ["ds"]].copy()
+                fc["yhat"] = yhat
+                # guard-rails: cap + blend
+                fc = cap_and_blend(fc, caps, group_cols, daily, conservatism=float(conserv)/100.0)
+                fc["yhat"] = fc["yhat"].round(2)
+
+            # Outputs
+            st.markdown("#### Forecast by group")
+            st.dataframe(fc, use_container_width=True)
+            totals = fc.groupby("ds")["yhat"].sum().reset_index()
+            st.markdown("#### Total forecast")
+            st.dataframe(totals, use_container_width=True)
+            ch = alt.Chart(totals).mark_line(point=True).encode(
+                x="ds:T", y="yhat:Q", tooltip=["ds","yhat"]
+            ).properties(height=260)
+            st.altair_chart(ch, use_container_width=True)
+
+            # Backtest metrics
+            if back_metrics:
                 st.markdown("#### Backtest (time-aware split)")
                 st.write(pd.DataFrame([back_metrics]))
-                future_dates = make_future_frame(horizon)
-                sources = sorted(daily["JetLearn Deal Source"].unique())
-                fc = predict_by_source(model, feats, sources, future_dates)
-                if fc.empty:
-                    st.info("Could not produce forecast for the selected horizon.")
-                else:
-                    fc["yhat"] = fc["yhat"].round(2)
-                    st.markdown("#### Forecast by Deal Source")
-                    st.dataframe(fc, use_container_width=True)
-                    totals = fc.groupby("ds")["yhat"].sum().reset_index()
-                    st.markdown("#### Total Forecast")
-                    st.dataframe(totals, use_container_width=True)
-                    ch = alt.Chart(totals).mark_line(point=True).encode(
-                        x="ds:T", y="yhat:Q", tooltip=["ds","yhat"]
-                    ).properties(height=260)
-                    st.altair_chart(ch, use_container_width=True)
