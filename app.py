@@ -1,6 +1,5 @@
 # app.py — JetLearn Insights + Predictability (robust & data-agnostic)
 # Run: streamlit run app.py
-pip install -U "streamlit==1.37.1" "pandas==2.2.2" "numpy==1.26.4" "altair==5.2.0" "scikit-learn==1.3.2"
 
 import streamlit as st
 import pandas as pd
@@ -31,7 +30,7 @@ hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 
 PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
 
-# --------------------- Helpers ---------------------
+# --------------------- Utilities ---------------------
 def robust_read_csv(file_or_path):
     for enc in ["utf-8","utf-8-sig","cp1252","latin1"]:
         try: return pd.read_csv(file_or_path, encoding=enc)
@@ -109,6 +108,9 @@ def alt_line(df,x,y,color=None,tooltip=None,height=260):
     enc=dict(x=alt.X(x,title=None), y=alt.Y(y,title=None), tooltip=tooltip or [])
     if color: enc["color"]=alt.Color(color, scale=alt.Scale(range=PALETTE))
     return alt.Chart(df).mark_line(point=True).encode(**enc).properties(height=height)
+
+def to_csv_bytes(df: pd.DataFrame)->bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
 # --------------------- Header ---------------------
 st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights & Predictability</div></div>', unsafe_allow_html=True)
@@ -205,6 +207,7 @@ tab_insights, tab_predict = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predict
 # =========================================================
 with tab_insights:
     st.markdown("### MTD vs Cohort — Payment Received Date")
+
     # Filters (only if columns exist)
     def summary_label(values, all_flag, max_items=2):
         vals = coerce_list(values)
@@ -401,7 +404,6 @@ with tab_predict:
             if (colname is None) or (colname not in train.columns): return 365
             d = pd.to_datetime(train[colname], errors="coerce")
             return (train["day"] - d).dt.days.clip(lower=0, upper=365).fillna(365).astype(int)
-        # chosen recencies
         act_col = available_dates.get("Last Activity Date")
         cnt_col = available_dates.get("Last Contacted")
         train["rec_act"] = recency(act_col)
@@ -582,7 +584,6 @@ with tab_predict:
                 return g
             return pd.DataFrame({"p":[float(sub["p"].sum())]})
 
-        base_cols = by + ["p"] if group_by else ["p"]
         g_today = sum_mask(pred_all, today_s).rename(columns={"p":"Today"})
         g_tom   = sum_mask(pred_all, tom_s).rename(columns={"p":"Tomorrow"})
         g_m     = sum_mask(pred_all, today_s, end_m_s).rename(columns={"p":"This Month"})
