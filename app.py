@@ -1,6 +1,5 @@
 # app.py
-# MTD vs Cohort (A/B) + Predictability (EB + Logistic blend, walk-forward backtest)
-# Minimal, smart UI with drawer filters
+# JL Analyzer + Predictability (hardened logistic fit; EB fallback)
 
 import streamlit as st
 import pandas as pd
@@ -56,7 +55,6 @@ def detect_measure_date_columns(df: pd.DataFrame):
             parsed = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
             if parsed.notna().sum()>0:
                 df[col]=parsed; date_like.append(col)
-    # Prefer Payment Received Date up front if present
     if "Payment Received Date" in date_like:
         date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
     return date_like
@@ -190,22 +188,17 @@ if not date_like_cols:
     st.error("No date-like columns besides 'Create Date' (e.g., 'Payment Received Date').")
     st.stop()
 
-# Try detect payment col
 def detect_payment_col(cols):
-    lc=[c.lower() for c in cols]
-    # strong rules
     for c in cols:
         cl=c.lower()
-        if "payment" in cl and "received" in cl and "date" in cl:
-            return c
+        if "payment" in cl and "received" in cl and "date" in cl: return c
     for c in cols:
         cl=c.lower()
-        if "payment" in cl and "date" in cl:
-            return c
+        if "payment" in cl and "date" in cl: return c
     return None
 PAYMENT_COL = detect_payment_col(df.columns) or ("Payment Received Date" if "Payment Received Date" in df.columns else None)
 
-# ---------- FILTER WIDGETS ----------
+# ---------- FILTER WIDGETS (compact) ----------
 def _summary(values, all_flag, max_items=2):
     vals=coerce_list(values)
     if all_flag: return "All"
@@ -229,8 +222,7 @@ def unified_multifilter(label, df, colname, key_prefix):
     with ctx:
         left,right = st.columns([1,3])
         with left:
-            st.checkbox("All", value=all_flag, key=all_key,
-                        help="Tick to include all values; untick to select specific values.")
+            st.checkbox("All", value=all_flag, key=all_key)
         with right:
             disabled=st.session_state[all_key]
             st.multiselect(label, options=options, default=selected, key=ms_key,
@@ -299,7 +291,6 @@ def group_label_from_series(s: pd.Series, grain_key: str):
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
 def assemble_meta(name: str, df: pd.DataFrame):
-    # Read selected filters
     pipe_all=st.session_state.get(f"{name}_pipe_all", True); pipe_sel=st.session_state.get(f"{name}_pipe_ms", [])
     src_all=st.session_state.get(f"{name}_src_all", True);  src_sel=st.session_state.get(f"{name}_src_ms", [])
     ctry_all=st.session_state.get(f"{name}_ctry_all", True); ctry_sel=st.session_state.get(f"{name}_ctry_ms", [])
@@ -369,30 +360,25 @@ def compute_outputs(meta):
                 sub["_CreateCount"]=1
                 grp=sub.groupby(split_dims, dropna=False)[flags+["_CreateCount"]].sum().reset_index()
                 rename_map={"_CreateCount":"Create Count in window"}
-                for f,m in zip(flags,measures):
-                    rename_map[f]=f"MTD: {m}"
+                for f,m in zip(flags,measures): rename_map[f]=f"MTD: {m}"
                 grp=grp.rename(columns=rename_map).sort_values(by=f"MTD: {measures[0]}", ascending=False)
                 tables[f"MTD split by {', '.join(split_dims)}"]=grp
             if show_top_countries and "Country" in sub.columns:
                 g=sub.groupby("Country", dropna=False)[flags].sum().reset_index()
-                ren = {f:f"MTD: {m}" for f,m in zip(flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
-                tables["Top 5 Countries — MTD"]=g
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
+                tables["Top 5 Countries — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             if show_top_sources and "JetLearn Deal Source" in sub.columns:
                 g=sub.groupby("JetLearn Deal Source", dropna=False)[flags].sum().reset_index()
-                ren = {f:f"MTD: {m}" for f,m in zip(flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
-                tables["Top 3 Deal Sources — MTD"]=g
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
+                tables["Top 3 Deal Sources — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(3)
             if show_top_counsellors and "Student/Academic Counsellor" in sub.columns:
                 g=sub.groupby("Student/Academic Counsellor", dropna=False)[flags].sum().reset_index()
-                ren = {f:f"MTD: {m}" for f,m in zip(flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
-                tables["Top 5 Counsellors — MTD"]=g
+                g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
+                tables["Top 5 Counsellors — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(sub.columns):
                 both=sub.groupby(["Country","JetLearn Deal Source"], dropna=False)[flags].sum().reset_index()
-                ren = {f:f"MTD: {m}" for f,m in zip(flags,measures)}
-                both=both.rename(columns=ren).sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
-                tables["Top Country × Deal Source — MTD"]=both
+                both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
+                tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
             trend=sub.copy()
             trend["Bucket"]=group_label_from_series(trend["Create Date"], f"{meta['name']}_mtd_grain")
             t=trend.groupby("Bucket")[flags].sum().reset_index()
@@ -416,30 +402,25 @@ def compute_outputs(meta):
                 tmp["_CreateInCohort"]=in_cre_coh.astype(int)
                 grp2=tmp.groupby(split_dims, dropna=False)[ch_flags+["_CreateInCohort"]].sum().reset_index()
                 rename_map2={"_CreateInCohort":"Create Count in Cohort window"}
-                for f,m in zip(ch_flags,measures):
-                    rename_map2[f]=f"Cohort: {m}"
+                for f,m in zip(ch_flags,measures): rename_map2[f]=f"Cohort: {m}"
                 grp2=grp2.rename(columns=rename_map2).sort_values(by=f"Cohort: {measures[0]}", ascending=False)
                 tables[f"Cohort split by {', '.join(split_dims)}"]=grp2
             if show_top_countries and "Country" in base.columns:
                 g=tmp.groupby("Country", dropna=False)[ch_flags].sum().reset_index()
-                ren = {f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-                tables["Top 5 Countries — Cohort"]=g
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
+                tables["Top 5 Countries — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             if show_top_sources and "JetLearn Deal Source" in base.columns:
                 g=tmp.groupby("JetLearn Deal Source", dropna=False)[ch_flags].sum().reset_index()
-                ren = {f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
-                tables["Top 3 Deal Sources — Cohort"]=g
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
+                tables["Top 3 Deal Sources — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(3)
             if show_top_counsellors and "Student/Academic Counsellor" in base.columns:
                 g=tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index()
-                ren = {f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)}
-                g=g.rename(columns=ren).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-                tables["Top 5 Counsellors — Cohort"]=g
+                g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
+                tables["Top 5 Counsellors — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
             if show_combo_pairs and {"Country","JetLearn Deal Source"}.issubset(base.columns):
                 both2=tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index()
-                ren = {f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)}
-                both2=both2.rename(columns=ren).sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
-                tables["Top Country × Deal Source — Cohort"]=both2
+                both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
+                tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
             frames=[]
             for m in measures:
                 mask=base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -579,8 +560,7 @@ with tab_objects[cmp_tab_index]:
                 except Exception:
                     pass
 
-# ---------------- PREDICTABILITY ----------------
-# Empirical-Bayes smoothing for rates by segment (Source x Country x Pipeline)
+# ---------------- PREDICTABILITY (HARDENED) ----------------
 def make_cohorts(df: pd.DataFrame, payment_col: str):
     out = df.copy()
     out["Create_Month"] = out["Create Date"].dt.to_period("M").astype(str)
@@ -590,28 +570,25 @@ def make_cohorts(df: pd.DataFrame, payment_col: str):
         created=("Create Date", "count"),
         paid=("paid_flag","sum")
     ).reset_index()
-    g["rate"] = g["paid"] / g["created"].replace(0, np.nan)
-    g["rate"] = g["rate"].fillna(0)
+    g["created"] = pd.to_numeric(g["created"], errors="coerce").fillna(0)
+    g["paid"] = pd.to_numeric(g["paid"], errors="coerce").fillna(0)
+    g.loc[g["paid"] > g["created"], "paid"] = g["created"]
+    g["rate"] = np.where(g["created"]>0, g["paid"] / g["created"], 0.0)
     return g
 
 def eb_rate(segment_created, segment_paid, global_alpha, global_beta, shrink=1.0):
-    # Posterior mean of Beta-Binomial with prior Beta(alpha, beta)
     return (segment_paid + shrink*global_alpha) / (segment_created + shrink*(global_alpha + global_beta))
 
 def global_prior(g: pd.DataFrame):
-    # Weakly-informative prior from overall conversion
-    total_c = g["created"].sum()
-    total_p = g["paid"].sum()
-    # alpha,beta scaled by 'strength' ~ a couple of months overall
+    total_c = float(g["created"].sum())
+    total_p = float(g["paid"].sum())
     strength = max(50.0, total_c * 0.05)
     overall = (total_p / total_c) if total_c>0 else 0.01
-    alpha = overall * strength
-    beta  = (1-overall) * strength
-    # guard
-    alpha = max(alpha, 1e-3); beta = max(beta, 1e-3)
+    alpha = max(overall * strength, 1e-3)
+    beta  = max((1-overall) * strength, 1e-3)
     return alpha, beta
 
-# --- Logistic on aggregated counts (two-rows-per-group + sample weights)
+# Logistic on aggregated counts — robust to single-class / tiny data
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -621,29 +598,29 @@ def _logit_rates(cohorts: pd.DataFrame):
     need = ["JetLearn Deal Source", "Country", "created", "paid"]
     if not set(need).issubset(cohorts.columns):
         return None
-
-    dfc = cohorts[need].copy()
-    dfc = dfc.replace([np.inf, -np.inf], np.nan).dropna(subset=need)
-
+    dfc = cohorts[need].copy().replace([np.inf,-np.inf], np.nan).dropna(subset=["JetLearn Deal Source","Country","created","paid"])
     dfc["created"] = pd.to_numeric(dfc["created"], errors="coerce")
     dfc["paid"]    = pd.to_numeric(dfc["paid"], errors="coerce")
-    dfc = dfc[dfc["created"] > 0]
+    dfc = dfc[(dfc["created"]>0) & (dfc["paid"]>=0)]
     if dfc.empty: return None
+    dfc.loc[dfc["paid"]>dfc["created"], "paid"] = dfc["created"]
 
-    dfc["paid"] = dfc[["paid","created"]].min(axis=1).clip(lower=0)
-
-    X_pos = dfc[["JetLearn Deal Source", "Country"]].copy()
+    X_pos = dfc[["JetLearn Deal Source","Country"]].copy()
     X_neg = X_pos.copy()
     y = np.r_[np.ones(len(dfc)), np.zeros(len(dfc))]
-    w = np.r_[dfc["paid"].values, (dfc["created"] - dfc["paid"]).values]
-    X2 = pd.concat([X_pos, X_neg], ignore_index=True)
+    w = np.r_[dfc["paid"].values, (dfc["created"]-dfc["paid"]).values]
 
     mask = w > 0
     if not np.any(mask): return None
-    X2 = X2.iloc[mask].reset_index(drop=True)
+    X2 = pd.concat([X_pos, X_neg], ignore_index=True).iloc[mask].reset_index(drop=True)
     y  = y[mask]
     w  = w[mask]
-    if len(np.unique(y[w > 0])) < 2: return None
+    # MUST have both classes after weighting
+    unique_classes = np.unique(y)
+    if unique_classes.size < 2:
+        return None
+    if len(y) < 2:
+        return None
 
     cat_cols = ["JetLearn Deal Source", "Country"]
     pre = ColumnTransformer(
@@ -653,27 +630,30 @@ def _logit_rates(cohorts: pd.DataFrame):
     )
     clf = LogisticRegression(solver="lbfgs", max_iter=500)
     pipe = Pipeline([("prep", pre), ("clf", clf)])
-    pipe.fit(X2, y, clf__sample_weight=w)
+    try:
+        pipe.fit(X2, y, clf__sample_weight=w)
+    except Exception:
+        return None
     return pipe
 
 def _predict_rate_from_logit(logit_model, jetlearn_source: str, country: str) -> float:
     if logit_model is None:
         return None
-    X = pd.DataFrame({"JetLearn Deal Source":[jetlearn_source], "Country":[country]})
-    p = logit_model.predict_proba(X)[0, 1]
-    if not np.isfinite(p):
+    try:
+        X = pd.DataFrame({"JetLearn Deal Source":[jetlearn_source], "Country":[country]})
+        p = logit_model.predict_proba(X)[0, 1]
+        if not np.isfinite(p): return None
+        return float(np.clip(p, 0.0, 1.0))
+    except Exception:
         return None
-    return float(np.clip(p, 0.0, 1.0))
 
 def recent_creation_baseline(df: pd.DataFrame, months=3):
-    # Recent moving-average of created by segment for volume forecast
-    df["Create_Month"] = df["Create Date"].dt.to_period("M").astype(str)
-    last_month = df["Create_Month"].max()
-    if last_month is None or pd.isna(last_month): return pd.DataFrame(columns=["JetLearn Deal Source","Country","Pipeline","created_ma"])
-    # take last N months
-    all_months = sorted(df["Create_Month"].unique())
+    tmp=df.copy()
+    tmp["Create_Month"] = tmp["Create Date"].dt.to_period("M").astype(str)
+    all_months = sorted(tmp["Create_Month"].dropna().unique())
+    if not all_months: return pd.DataFrame(columns=["JetLearn Deal Source","Country","Pipeline","created_ma"])
     take = all_months[-months:] if len(all_months)>=months else all_months
-    recent = df[df["Create_Month"].isin(take)]
+    recent = tmp[tmp["Create_Month"].isin(take)]
     g = recent.groupby(["JetLearn Deal Source","Country","Pipeline"], dropna=False)["Create Date"].count().reset_index(name="created")
     g = g.groupby(["JetLearn Deal Source","Country","Pipeline"], dropna=False)["created"].mean().reset_index(name="created_ma")
     return g
@@ -687,11 +667,6 @@ def month_str(dt: date)->str:
     return pd.Timestamp(dt).to_period("M").astype(str)
 
 def walk_forward_backtest(df: pd.DataFrame, payment_col: str, lookback_months=6, blend=0.6):
-    """
-    Train on rolling window of lookback_months, predict next month using:
-      predicted_paid = created_next_month * (0.6*logit_rate + 0.4*EB_rate)
-    Returns metrics DataFrame.
-    """
     if payment_col not in df.columns:
         return pd.DataFrame(columns=["test_month","MAE","MAPE","WAPE"])
     tmp = df.copy()
@@ -707,44 +682,40 @@ def walk_forward_backtest(df: pd.DataFrame, payment_col: str, lookback_months=6,
         train_df = tmp[tmp["Create_Month"].isin(train_months)].copy()
         test_df  = tmp[tmp["Create_Month"]==test_month].copy()
 
-        # Cohorts on training
         cohorts = make_cohorts(train_df, payment_col)
         alpha,beta = global_prior(cohorts)
-        # EB map for (source,country)
+
         eb_map = cohorts.groupby(["JetLearn Deal Source","Country"], dropna=False).agg(
             c=("created","sum"), p=("paid","sum")
         ).reset_index()
         eb_map["eb"] = eb_map.apply(lambda r: eb_rate(r["c"], r["p"], alpha, beta, shrink=1.0), axis=1)
 
-        # Logistic on training (source,country)
-        logit = _logit_rates(cohorts)
+        logit = _logit_rates(cohorts)  # may return None; safe
 
-        # next-month created per segment
         created_next = test_df.groupby(["JetLearn Deal Source","Country"], dropna=False)["Create Date"].count().reset_index(name="created")
         if created_next.empty: 
             continue
 
-        # predicted rate per segment
         def seg_rate(row):
             src = row["JetLearn Deal Source"]; ctry = row["Country"]
             eb = eb_map.loc[(eb_map["JetLearn Deal Source"]==src) & (eb_map["Country"]==ctry), "eb"]
-            eb_val = float(eb.iloc[0]) if len(eb)>0 else float((cohorts["paid"].sum()+alpha)/(cohorts["created"].sum()+alpha+beta))
-            p_logit = _predict_rate_from_logit(logit, src, ctry) if logit is not None else None
-            return (blend * (p_logit if p_logit is not None else eb_val)) + ((1-blend) * eb_val)
+            if len(eb)>0:
+                eb_val = float(eb.iloc[0])
+            else:
+                # global fallback
+                eb_val = float((cohorts["paid"].sum()+alpha)/(cohorts["created"].sum()+alpha+beta)) if cohorts["created"].sum()>0 else 0.01
+            p_logit = _predict_rate_from_logit(logit, src, ctry)
+            if p_logit is None:
+                return eb_val
+            return (blend * p_logit) + ((1-blend) * eb_val)
 
         created_next["pred_rate"] = created_next.apply(seg_rate, axis=1).clip(0,1)
         created_next["pred_paid"] = created_next["created"] * created_next["pred_rate"]
 
-        # actual paid in test month
-        paid_mask = test_df[payment_col].notna()
-        actual_paid = int(paid_mask.sum())
-
+        actual_paid = int(test_df[payment_col].notna().sum())
         y_hat = float(created_next["pred_paid"].sum())
         mae = abs(y_hat - actual_paid)
         mape = (mae / actual_paid * 100) if actual_paid>0 else np.nan
-
-        # WAPE over segments (weighted absolute percentage error)
-        # here equal to MAE / total actual (same as MAPE numerator), include guard
         wape = (mae / actual_paid) if actual_paid>0 else np.nan
 
         records.append({"test_month":test_month, "Pred":y_hat, "Actual":actual_paid, "MAE":mae, "MAPE":mape, "WAPE":wape})
@@ -762,16 +733,12 @@ with tab_objects[pred_tab_index]:
 
     cc1, cc2, cc3 = st.columns([2,2,2])
     with cc1:
-        lookback = st.slider("Backtest window (months)", 3, 18, 6, 1,
-                             help="Rolling training window length for walk-forward validation.")
+        lookback = st.slider("Backtest window (months)", 3, 18, 6, 1)
     with cc2:
-        blend = st.slider("Blend weight (Logit vs EB)", 0.0, 1.0, 0.6, 0.05,
-                          help="0 = only Empirical-Bayes, 1 = only Logistic. Default blends both.")
+        blend = st.slider("Blend weight (Logit vs EB)", 0.0, 1.0, 0.6, 0.05)
     with cc3:
-        vol_ma = st.slider("Volume baseline (recent months MA)", 1, 6, 3, 1,
-                           help="Number of recent months to average for creation volume baseline.")
+        vol_ma = st.slider("Volume baseline (recent months MA)", 1, 6, 3, 1)
 
-    # Optional scope filters for prediction (reuse unified_multifilter style)
     st.markdown("#### Scope Filters (optional)")
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -788,7 +755,6 @@ with tab_objects[pred_tab_index]:
     )
     df_scoped = df[scope_mask].copy()
 
-    # Backtest
     with st.spinner("Running walk-forward backtest..."):
         bt = walk_forward_backtest(df_scoped, PAYMENT_COL, lookback_months=lookback, blend=blend)
     if bt.empty:
@@ -813,67 +779,64 @@ with tab_objects[pred_tab_index]:
         st.altair_chart(chart_bt, use_container_width=True)
 
     st.markdown("---")
-    # Forecasts for This month / Next month (+ daily scaling)
     st.subheader("Forecasts")
     today = pd.Timestamp.today().date()
-    this_m = month_str(today)
-    next_m = month_str(today.replace(day=28) + timedelta(days=4))  # safe next month trick
 
-    # Train on recent window for live forecast
-    # Use same components as backtest on the last 'lookback' months
     df_scoped["Create_Month"] = df_scoped["Create Date"].dt.to_period("M").astype(str)
     months_sorted = sorted(df_scoped["Create_Month"].dropna().unique())
     if len(months_sorted) >= lookback:
         train_months = months_sorted[-lookback:]
         train_df = df_scoped[df_scoped["Create_Month"].isin(train_months)].copy()
         cohorts = make_cohorts(train_df, PAYMENT_COL)
-        alpha,beta = global_prior(cohorts)
-        eb_map = cohorts.groupby(["JetLearn Deal Source","Country"], dropna=False).agg(
-            c=("created","sum"), p=("paid","sum")
-        ).reset_index()
-        eb_map["eb"] = eb_map.apply(lambda r: eb_rate(r["c"], r["p"], alpha, beta, shrink=1.0), axis=1)
-        logit = _logit_rates(cohorts)
-
-        # Creation baseline per segment
-        vol_base = recent_creation_baseline(df_scoped, months=vol_ma)
-        if vol_base.empty:
-            st.info("Not enough data to build a volume baseline.")
+        if cohorts.empty:
+            st.info("Not enough training data in scope to forecast.")
         else:
-            # Build segment grid (source x country x pipeline) present in baseline
-            seg = vol_base.copy()
-            # predict rate for each (src,country) and apply to created_ma
-            def rate_for(segrow):
-                src=segrow["JetLearn Deal Source"]; ctry=segrow["Country"]
-                eb = eb_map.loc[(eb_map["JetLearn Deal Source"]==src) & (eb_map["Country"]==ctry), "eb"]
-                eb_val = float(eb.iloc[0]) if len(eb)>0 else float((cohorts["paid"].sum()+alpha)/(cohorts["created"].sum()+alpha+beta))
-                p_logit = _predict_rate_from_logit(logit, src, ctry) if logit is not None else None
-                return (blend * (p_logit if p_logit is not None else eb_val)) + ((1-blend) * eb_val)
+            alpha,beta = global_prior(cohorts)
+            eb_map = cohorts.groupby(["JetLearn Deal Source","Country"], dropna=False).agg(
+                c=("created","sum"), p=("paid","sum")
+            ).reset_index()
+            eb_map["eb"] = eb_map.apply(lambda r: eb_rate(r["c"], r["p"], alpha, beta, shrink=1.0), axis=1)
+            logit = _logit_rates(cohorts)  # may be None — safe
 
-            seg["rate"] = seg.apply(rate_for, axis=1).clip(0,1)
-            seg["pred_paid_month"] = seg["created_ma"] * seg["rate"]
+            vol_base = recent_creation_baseline(df_scoped, months=vol_ma)
+            if vol_base.empty:
+                st.info("Not enough data to build a volume baseline.")
+            else:
+                def rate_for(segrow):
+                    src=segrow["JetLearn Deal Source"]; ctry=segrow["Country"]
+                    eb = eb_map.loc[(eb_map["JetLearn Deal Source"]==src) & (eb_map["Country"]==ctry), "eb"]
+                    if len(eb)>0:
+                        eb_val = float(eb.iloc[0])
+                    else:
+                        eb_val = float((cohorts["paid"].sum()+alpha)/(cohorts["created"].sum()+alpha+beta)) if cohorts["created"].sum()>0 else 0.01
+                    p_logit = _predict_rate_from_logit(logit, src, ctry)
+                    if p_logit is None:
+                        return eb_val
+                    return (blend * p_logit) + ((1-blend) * eb_val)
 
-            # Aggregate options
-            st.markdown("**Monthly forecasts (total)**")
-            tot_this = float(seg["pred_paid_month"].sum())
-            tot_next = float(seg["pred_paid_month"].sum())  # same baseline unless you add growth factors
-            # daily scaling for "Today" / "Tomorrow"
-            md = month_days(today)
-            passed = today.day
-            frac = max(0.0, min(1.0, passed/md))
-            today_to_date = tot_this * frac
-            tomorrow_to_date = tot_this * min(1.0, (passed+1)/md)
+                seg = vol_base.copy()
+                seg["rate"] = seg.apply(rate_for, axis=1).clip(0,1)
+                seg["pred_paid_month"] = seg["created_ma"] * seg["rate"]
 
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Today (to-date est.)", f"{today_to_date:.0f}")
-            c2.metric("Tomorrow (to-date est.)", f"{tomorrow_to_date:.0f}")
-            c3.metric("This month (EOM)", f"{tot_this:.0f}")
-            c4.metric("Next month (EOM)", f"{tot_next:.0f}")
+                tot_this = float(seg["pred_paid_month"].sum())
+                # daily scaling for today/tomorrow
+                md = month_days(today)
+                passed = max(1, today.day)  # guard
+                frac = max(0.0, min(1.0, passed/md))
+                today_to_date = tot_this * frac
+                tomorrow_to_date = tot_this * min(1.0, (passed+1)/md)
 
-            st.markdown("**By JetLearn Deal Source × Country × Pipeline**")
-            st.dataframe(seg.rename(columns={"created_ma":"Created (MA)", "pred_paid_month":"Pred Enrolments"}),
-                         use_container_width=True)
-            st.download_button("Download forecast table", to_csv_bytes(seg),
-                               file_name="forecast_segments.csv", mime="text/csv")
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Today (to-date est.)", f"{today_to_date:.0f}")
+                c2.metric("Tomorrow (to-date est.)", f"{tomorrow_to_date:.0f}")
+                c3.metric("This month (EOM)", f"{tot_this:.0f}")
+                c4.metric("Next month (EOM)", f"{tot_this:.0f}")  # basic, same baseline
+
+                st.markdown("**By JetLearn Deal Source × Country × Pipeline**")
+                st.dataframe(seg.rename(columns={"created_ma":"Created (MA)", "pred_paid_month":"Pred Enrolments"}),
+                             use_container_width=True)
+                st.download_button("Download forecast table", to_csv_bytes(seg),
+                                   file_name="forecast_segments.csv", mime="text/csv")
     else:
         st.info("Not enough months to fit a live forecast. Increase data or reduce lookback.")
 
