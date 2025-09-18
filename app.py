@@ -123,7 +123,7 @@ with c3:
 # Optional path fallbacks
 p1, p2 = st.columns(2)
 with p1:
-    path_hist = st.text_input("…or path to Historical CSV", value="Master_sheet_DB_10percent.csv", key="HIST_PATH")
+    path_hist = st.text_input("…or path to Historical CSV", value="master_DB_JL.csv", key="HIST_PATH")
 with p2:
     path_curr = st.text_input("…or path to Current Month Partial CSV", value="", key="CURR_PATH")
 
