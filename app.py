@@ -734,3 +734,5 @@ with tab_predict:
     dom = pay_profile.reset_index().rename(columns={"day":"Day","prop":"Prop"})
     dom["Forecast"] = (total_forecast * dom["Prop"]).round(0)
     st.dataframe(dom, use_container_width=True)
+uploaded_hist = st.file_uploader("Historical / Modeling CSV", type=["csv"], key="HIST_UP")
+uploaded_curr = st.file_uploader("Current Month Partial CSV (e.g., September)", type=["csv"], key="CURR_UP")
