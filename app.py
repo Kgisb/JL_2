@@ -134,7 +134,7 @@ with ds:
     # second row: optional paths (if you prefer disk paths)
     p1, p2 = st.columns([1, 1])
     with p1:
-        path_hist = st.text_input("…or path to Historical CSV", value="Master_sheet_DB_10percent.csv")
+        path_hist = st.text_input("…or path to Historical CSV", value="master_DB_JL.csv")
     with p2:
         path_curr = st.text_input("…or path to Current Month Partial CSV", value="")
 
