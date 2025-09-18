@@ -127,7 +127,7 @@ with ds:
         exclude_invalid = st.checkbox("Exclude '1.2 Invalid Deal'", value=True)
 
 # Current/partial month dataset for predictability
-ds2 = st.expander("Prediction month data (Partial current month file)", expanded=False)
+ds2 = st.expander("Prediction month data (Partial current month file)", expanded=True)
 with ds2:
     c21, c22 = st.columns([3,2])
     with c21:
