@@ -1,5 +1,5 @@
 # app.py — JetLearn Insights (MTD/Cohort) + Predictivity of Enrollment (independent)
-# Streamlit layout uses use_container_width=True everywhere (compatible with older builds).
+# Uses use_container_width=True everywhere (no width='stretch').
 
 import streamlit as st
 import pandas as pd
@@ -550,7 +550,7 @@ with tab_predict:
         X["y_thismonth"] = ((pay >= this_m0) & (pay < next_m0)).astype(int)
         X["y_nextmonth"] = ((pay >= next_m0) & (pay < _madd(this_m0, 2))).astype(int)
 
-        # Eligibility to score as of date
+        # Eligibility to score as of date (only open deals, created by as_of)
         X["open_as_of"] = pay.isna() | (pay > pd.Timestamp(as_of))
         X["created_by_asof"] = X["Create Date"] <= pd.Timestamp(as_of)
         X["score_mask"] = X["open_as_of"] & X["created_by_asof"]
