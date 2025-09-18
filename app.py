@@ -76,13 +76,11 @@ def last_month_bounds():
     first_prev = last_prev.replace(day=1)
     return first_prev, last_prev
 def quarter_start(y,q): return date(y,3*(q-1)+1,1)
-def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedata(days=1)
-
+def quarter_end(y,q): return date(y,12,31) if q==4 else quarter_start(y,q+1)-timedelta(days=1)
 def last_quarter_bounds():
     t=pd.Timestamp.today().date(); q=(t.month-1)//3+1
     y,lq=(t.year-1,4) if q==1 else (t.year,q-1)
     return quarter_start(y,lq), quarter_end(y,lq)
-
 def this_year_so_far_bounds(): t=pd.Timestamp.today().date(); return date(t.year,1,1),t
 
 def alt_line(df,x,y,color=None,tooltip=None,height=260):
