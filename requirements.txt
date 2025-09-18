@@ -1,5 +1,19 @@
+# requirements.txt
+
+# Core
 streamlit==1.37.1
-pandas==2.2.3
-numpy==2.1.2
-altair==5.4.1
-scikit-learn>=1.6.0
+
+# ===== Python < 3.12 (recommended stack, e.g., 3.11) =====
+numpy==1.26.4; python_version < "3.12"
+pandas==2.2.2; python_version < "3.12"
+scipy==1.11.4; python_version < "3.12"
+altair==5.2.0; python_version < "3.12"
+scikit-learn==1.3.2; python_version < "3.12"
+
+# ===== Python >= 3.12 / 3.13+ (newer wheels) =====
+# (If your deploy environment is locked to 3.12/3.13, these versions will be used.)
+numpy>=2.0.0,<3.0.0; python_version >= "3.12"
+pandas>=2.2.3; python_version >= "3.12"
+scipy>=1.13.0; python_version >= "3.12"
+altair>=5.4.1; python_version >= "3.12"
+scikit-learn>=1.6.0; python_version >= "3.12"
