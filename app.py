@@ -1,5 +1,5 @@
 # app.py — JetLearn Insights (MTD/Cohort) + Predictivity of Enrollment
-# Streamlit APIs use width='stretch' (no use_container_width deprecation).
+# Uses use_container_width=True (compatible with your current Streamlit build).
 
 import streamlit as st
 import pandas as pd
@@ -434,12 +434,12 @@ with tA:
     else:
         for name,frame in tablesA.items():
             st.subheader(name)
-            st.dataframe(frame, width='stretch')
+            st.dataframe(frame, use_container_width=True)
             st.download_button("Download CSV — "+name, to_csv_bytes(frame),
                                file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
     st.markdown("<div class='section-title'>📈 Trends — A</div>", unsafe_allow_html=True)
-    if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], width='stretch')
-    if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], width='stretch')
+    if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
+    if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
     st.caption("**Scenario A** — " + caption_from(metaA))
 
 if show_b:
@@ -462,12 +462,12 @@ if show_b:
         else:
             for name,frame in tablesB.items():
                 st.subheader(name)
-                st.dataframe(frame, width='stretch')
+                st.dataframe(frame, use_container_width=True)
                 st.download_button("Download CSV — "+name, to_csv_bytes(frame),
                                    file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
         st.markdown("<div class='section-title'>📈 Trends — B</div>", unsafe_allow_html=True)
-        if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], width='stretch')
-        if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], width='stretch')
+        if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
+        if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
         st.caption("**Scenario B** — " + caption_from(metaB))
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
@@ -681,7 +681,7 @@ with pe_tab:
         # ---------- (Optional) per-deal table ----------
         with st.expander("See scored open deals (probabilities / proxies)", expanded=False):
             if per_deal is not None and len(per_deal) > 0:
-                st.dataframe(per_deal, width='stretch')
+                st.dataframe(per_deal, use_container_width=True)
                 st.download_button("Download per-deal predictions (CSV)",
                                    per_deal.to_csv(index=False).encode("utf-8"),
                                    file_name="predictivity_open_deals.csv", mime="text/csv")
