@@ -1,5 +1,6 @@
-# app.py — JetLearn Insights + Predictability (ML if sklearn present; EB fallback otherwise)
-# Streamlit API updated to use width='stretch' (no use_container_width).
+# app.py — JetLearn Insights (MTD/Cohort) + Predictability of Enrollment
+# Works on Python 3.11–3.13+. No top-level sklearn imports (safe fallback).
+# Streamlit APIs use width='stretch' (no use_container_width deprecation).
 
 import streamlit as st
 import pandas as pd
@@ -272,8 +273,8 @@ with tab_insights:
             mtd_from=mtd_from, mtd_to=mtd_to, mtd_grain=mtd_grain,
             coh_from=coh_from, coh_to=coh_to, coh_grain=coh_grain,
             split_dims=split_dims, top_ctry=top_ctry, top_src=top_src, top_csl=top_csl, pair=pair,
-            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
-            cty_all=cty_all, cty_sel=cty_sel, csl_all=csl_all, csl_sel=csl_sel
+            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=True, src_sel=src_sel,
+            cty_all=True, cty_sel=cty_sel, csl_all=True, csl_sel=csl_sel
         )
 
     def compute_outputs(meta):
@@ -482,7 +483,7 @@ with tab_insights:
 with tab_pred:
     st.markdown("#### Predict enrollments **Today / Tomorrow / This Month / Next Month**")
 
-    # Try optional ML deps (guarded import so the app never crashes)
+    # Optional ML deps (guarded import so app never crashes)
     SKLEARN_OK = True
     try:
         from sklearn.pipeline import Pipeline
@@ -493,7 +494,7 @@ with tab_pred:
     except Exception:
         SKLEARN_OK = False
 
-    # Expectations
+    # Required / recommended columns
     PE_REQUIRED_BASE = ["Create Date","Country","JetLearn Deal Source"]
     PE_REQUIRED_EXTRA = [
         "Payment Received Date",
@@ -502,9 +503,10 @@ with tab_pred:
         "Last Date of Sales Activity",
         "Last Date of Call Connected",
     ]
-    miss = [c for c in PE_REQUIRED_BASE + PE_REQUIRED_EXTRA if c not in df.columns]
-    if miss:
-        st.markdown(f"<span class='warn'>Missing recommended columns: {miss}. We will proceed with available ones.</span>", unsafe_allow_html=True)
+    missing_cols = [c for c in PE_REQUIRED_BASE if c not in df.columns]
+    if missing_cols:
+        st.error(f"Missing required columns for predictability tab: {missing_cols}")
+        st.stop()
 
     # Parse key dates for this tab
     for c in ["Payment Received Date", "Last Date of Sales Activity", "Last Date of Call Connected"]:
@@ -513,7 +515,7 @@ with tab_pred:
 
     # Controls
     as_of = st.date_input("As-of date", value=pd.Timestamp.today().date(),
-                          help="Training/estimation excludes the entire as-of month to avoid leakage.")
+                          help="Training excludes the entire as-of month to avoid leakage.")
     run_bt = st.checkbox("Backtest on last full month (show accuracy)", value=False)
     run_btn = st.button("Train / Estimate", type="primary")
 
@@ -524,7 +526,7 @@ with tab_pred:
         unsafe_allow_html=True
     )
 
-    # ------------ shared helpers ------------
+    # --------- helpers ----------
     def pe_to_ts_month(d: pd.Series) -> pd.Series:
         return pd.to_datetime(d, errors="coerce", dayfirst=True).dt.to_period("M").to_timestamp()
 
@@ -576,7 +578,7 @@ with tab_pred:
         X["score_mask"] = X["open_as_of"] & X["created_by_asof"]
         return X
 
-    # ------------ ML path ------------
+    # --------- ML path ----------
     def train_predict_ML(X: pd.DataFrame, as_of_: date):
         cutoff = pe_month_start(as_of_)
         train_mask = X["Create_Month"] < cutoff
@@ -640,22 +642,9 @@ with tab_pred:
             "thismonth": int(((pay >= asof_ts.floor("D")) & (pay < next_m0)).sum()),
             "nextmonth": int(((pay >= next_m0) & (pay < next_m1)).sum()),
         }
+        return preds, out, actuals
 
-        # Optional model quality snapshot (deal-level AUC/Brier for "thismonth")
-        auc = np.nan; brier = np.nan
-        mdl = models.get("thismonth", None)
-        if mdl is not None:
-            y = ys["thismonth"]
-            if len(y.dropna().unique())>1:
-                proba = mdl.predict_proba(X.loc[train_mask, feats])[:,1]
-                try: auc = float(roc_auc_score(y, proba))
-                except Exception: pass
-                try: brier = float(brier_score_loss(y, proba))
-                except Exception: pass
-
-        return preds, out, actuals, {"auc":auc, "brier":brier}
-
-    # ------------ EB fallback (no sklearn) ------------
+    # --------- EB fallback (no sklearn) ----------
     def train_predict_EB(X: pd.DataFrame, as_of_: date):
         asof_ts = pd.Timestamp(as_of_)
         this_m0 = pe_month_start(as_of_)
@@ -762,10 +751,13 @@ with tab_pred:
         with st.spinner("Building features and generating predictions…"):
             X = build_feature_frame(df, as_of)
             if SKLEARN_OK:
-                preds, deal_out, actuals, quality = train_predict_ML(X, as_of)
+                try:
+                    preds, deal_out, actuals = train_predict_ML(X, as_of)
+                except Exception as e:
+                    st.warning(f"ML path error ({e}). Falling back to EB…")
+                    preds, deal_out, actuals = train_predict_EB(X, as_of)
             else:
                 preds, deal_out, actuals = train_predict_EB(X, as_of)
-                quality = {"auc": np.nan, "brier": np.nan}
 
             k1,k2,k3,k4 = st.columns(4)
             k1.metric(f"Predicted Today ({pd.Timestamp(as_of):%d %b})", f"{int(round(preds['today'])):,}")
@@ -780,12 +772,6 @@ with tab_pred:
                                    file_name="predictability_open_deals.csv", mime="text/csv")
             else:
                 st.info("No open deals to score for the selected date.")
-
-            # Optional quality snapshot (ML only)
-            if SKLEARN_OK and (pd.notna(quality["auc"]) or pd.notna(quality["brier"])):
-                q1, q2 = st.columns(2)
-                q1.metric("AUC (This Month, deal-level)", f"{quality['auc']:.3f}" if pd.notna(quality['auc']) else "—")
-                q2.metric("Brier Score (This Month, deal-level)", f"{quality['brier']:.3f}" if pd.notna(quality['brier']) else "—")
 
             if run_bt:
                 with st.spinner("Running backtest on last full month…"):
@@ -806,5 +792,5 @@ with tab_pred:
                         ).properties(height=280)
                         st.altair_chart(ch, width='stretch')
 
-    st.caption("Notes: If scikit-learn is unavailable, the tab uses an empirical-Bayes cohort estimator (M0/M1) "
-               "with historical day-of-month allocation for Today/Tomorrow. Current month is excluded from training.")
+    st.caption("Notes: Current month is excluded from training. If scikit-learn is unavailable, "
+               "the tab uses an empirical-Bayes cohort estimator with day-of-month allocation for Today/Tomorrow.")
