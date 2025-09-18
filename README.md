@@ -17,7 +17,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-- Upload your CSV in the sidebar **or** place `Master_sheet_DB_10percent.csv` next to `app.py`.
+- Upload your CSV in the sidebar **or** place `master_DB_JL.csv` next to `app.py`.
 
 ## Data requirements
 Your CSV must include these columns:
