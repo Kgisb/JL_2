@@ -1,4 +1,5 @@
 # app.py — JetLearn Insights (MTD/Cohort) + Predictability (M0 vs Carryover with partial-month extrapolation)
+# Uploaders are ALWAYS visible at the top (no expanders).
 
 import streamlit as st
 import pandas as pd
@@ -115,37 +116,34 @@ def group_label_from_series(s: pd.Series, grain: str):
 with st.container():
     st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights & Predictability</div></div>', unsafe_allow_html=True)
 
-# --------------------- Data Source (shared by both tabs) ---------------------
+# --------------------- Always-visible Uploaders ---------------------
+st.markdown("### Upload data")
+u1, u2, u3 = st.columns([3,3,2])
+with u1:
+    uploaded_hist = st.file_uploader("Historical / Modeling CSV", type=["csv"], key="hist")
+with u2:
+    uploaded_curr = st.file_uploader("Current Month Partial CSV (e.g., September)", type=["csv"], key="curr")
+with u3:
+    exclude_invalid = st.checkbox("Exclude '1.2 Invalid Deal'", value=True)
 
-# -------- Historical dataset
-ds = st.expander("Data source (Historical / Modeling)", expanded=True)
-with ds:
-    c1, c2, c3 = st.columns([3,2,2])
-    with c1:
-        uploaded_hist = st.file_uploader("Upload HISTORICAL CSV (modeling dataset)", type=["csv"], key="hist")
-    with c2:
-        path_hist = st.text_input("…or CSV path (historical)", value="Master_sheet_DB_10percent.csv")
-    with c3:
-        exclude_invalid = st.checkbox("Exclude '1.2 Invalid Deal'", value=True)
-
-# -------- Current/Partial dataset
-ds2 = st.expander("Prediction month data (Partial current month file)", expanded=True)
-with ds2:
-    c21, c22 = st.columns([3,2])
-    with c21:
-        uploaded_curr = st.file_uploader("Upload CURRENT MONTH PARTIAL CSV (e.g., September)", type=["csv"], key="curr")
-    with c22:
-        path_curr = st.text_input("…or CSV path (current month partial)", value="")
+# Optional paths (if you prefer reading from disk)
+p1, p2 = st.columns([1,1])
+with p1:
+    path_hist = st.text_input("…or path to Historical CSV", value="Master_sheet_DB_10percent.csv")
+with p2:
+    path_curr = st.text_input("…or path to Current Month Partial CSV", value="")
 
 # -------- Load Historical --------
 try:
     if uploaded_hist is not None:
         df = robust_read_csv(BytesIO(uploaded_hist.getvalue()))
+        hist_source = "Uploader"
     else:
         df = robust_read_csv(path_hist)
-    st.success("Historical data loaded ✅")
+        hist_source = "Path"
 except Exception as e:
-    st.error(str(e)); st.stop()
+    st.error(f"Failed to load Historical CSV: {e}")
+    st.stop()
 
 df.columns = [c.strip() for c in df.columns]
 missing=[c for c in REQUIRED_COLS if c not in df.columns]
@@ -153,7 +151,7 @@ if missing:
     st.error(f"Missing required columns in historical data: {missing}\nAvailable: {list(df.columns)}")
     st.stop()
 
-if exclude_invalid:
+if exclude_invalid and "Deal Stage" in df.columns:
     df = df[~df["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
 
 df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=True)
@@ -164,21 +162,28 @@ date_like_cols = detect_measure_date_columns(df)
 
 # -------- Load Current/Partial (optional) --------
 df_curr = None
-if uploaded_curr is not None or path_curr.strip():
+if (uploaded_curr is not None) or path_curr.strip():
     try:
         if uploaded_curr is not None:
             df_curr = robust_read_csv(BytesIO(uploaded_curr.getvalue()))
+            curr_source = "Uploader"
         else:
             df_curr = robust_read_csv(path_curr)
+            curr_source = "Path"
         df_curr.columns = [c.strip() for c in df_curr.columns]
         if exclude_invalid and "Deal Stage" in df_curr.columns:
             df_curr = df_curr[~df_curr["Deal Stage"].astype(str).str.strip().eq("1.2 Invalid Deal")].copy()
         if "Create Date" in df_curr.columns:
             df_curr["Create Date"] = pd.to_datetime(df_curr["Create Date"], errors="coerce", dayfirst=True)
             df_curr["Create_Month"] = df_curr["Create Date"].dt.to_period("M").dt.to_timestamp()
-        st.success("Current/partial month data loaded ✅")
+        st.success(f"Current Partial CSV loaded ✅ (via {curr_source}) — rows: {len(df_curr):,}")
     except Exception as e:
         st.warning(f"Could not load current/partial file: {e}. Proceeding without it.")
+else:
+    st.info("Tip: Upload your **Current Month Partial CSV** at the top-right (optional) for better September extrapolation.")
+
+# Quick status banner
+st.caption(f"Historical loaded from **{hist_source}** — rows: {len(df):,} | Current partial: {'yes ('+str(len(df_curr))+' rows)' if df_curr is not None else 'no'}")
 
 # --------------------- Tabs ---------------------
 tab_insights, tab_predict = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predictability (M0 + Carryover)"])
@@ -245,26 +250,39 @@ with tab_insights:
 
     def scenario_controls(name: str, df_local: pd.DataFrame, date_like_cols_local):
         st.markdown(f"**Scenario {name}** <span class='badge'>independent</span>", unsafe_allow_html=True)
-        pipe_all, pipe_sel = unified_multifilter("Pipeline", df_local, "Pipeline", f"{name}_pipe")
-        src_all,  src_sel  = unified_multifilter("Deal Source", df_local, "JetLearn Deal Source", f"{name}_src")
-        cty_all,  cty_sel  = unified_multifilter("Country", df_local, "Country", f"{name}_cty")
-        csl_all,  csl_sel  = unified_multifilter("Counsellor", df_local, "Student/Academic Counsellor", f"{name}_csl")
+        # Guard if columns missing
+        pipe_all = src_all = cty_all = csl_all = True
+        pipe_sel = src_sel = cty_sel = csl_sel = []
+        if "Pipeline" in df_local.columns:
+            pipe_all, pipe_sel = unified_multifilter("Pipeline", df_local, "Pipeline", f"{name}_pipe")
+        if "JetLearn Deal Source" in df_local.columns:
+            src_all,  src_sel  = unified_multifilter("Deal Source", df_local, "JetLearn Deal Source", f"{name}_src")
+        if "Country" in df_local.columns:
+            cty_all,  cty_sel  = unified_multifilter("Country", df_local, "Country", f"{name}_cty")
+        if "Student/Academic Counsellor" in df_local.columns:
+            csl_all,  csl_sel  = unified_multifilter("Counsellor", df_local, "Student/Academic Counsellor", f"{name}_csl")
 
-        mask = (
-            in_filter(df_local["Pipeline"], pipe_all, pipe_sel) &
-            in_filter(df_local["JetLearn Deal Source"], src_all, src_sel) &
-            in_filter(df_local["Country"], cty_all, cty_sel) &
-            in_filter(df_local["Student/Academic Counsellor"], csl_all, csl_sel)
-        ) if all(c in df_local.columns for c in ["Pipeline","JetLearn Deal Source","Country","Student/Academic Counsellor"]) else pd.Series(True, index=df_local.index)
+        mask = pd.Series(True, index=df_local.index)
+        if "Pipeline" in df_local.columns:
+            mask &= in_filter(df_local["Pipeline"], pipe_all, pipe_sel)
+        if "JetLearn Deal Source" in df_local.columns:
+            mask &= in_filter(df_local["JetLearn Deal Source"], src_all, src_sel)
+        if "Country" in df_local.columns:
+            mask &= in_filter(df_local["Country"], cty_all, cty_sel)
+        if "Student/Academic Counsellor" in df_local.columns:
+            mask &= in_filter(df_local["Student/Academic Counsellor"], csl_all, csl_sel)
+
         base = df_local[mask].copy()
 
         st.markdown("##### Measures & Windows")
         mcol1,mcol2 = st.columns([3,2])
         with mcol1:
-            measures = st.multiselect(f"[{name}] Measure date(s)",
-                                      options=date_like_cols_local,
-                                      default=(["Payment Received Date"] if "Payment Received Date" in date_like_cols_local else date_like_cols_local[:1]),
-                                      key=f"{name}_measures")
+            measures = st.multiselect(
+                f"[{name}] Measure date(s)",
+                options=date_like_cols_local,
+                default=(["Payment Received Date"] if "Payment Received Date" in date_like_cols_local else date_like_cols_local[:1]),
+                key=f"{name}_measures"
+            )
         with mcol2:
             mode = st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
 
@@ -542,10 +560,9 @@ with tab_predict:
     st.markdown("### Forecast controls")
     c1, c2, c3 = st.columns(3)
     with c1:
-        # target month defaults to this month
+        # default target = this month
         today = pd.Timestamp.today().normalize()
         cm_default = pd.Timestamp(year=today.year, month=today.month, day=1)
-        # allow choosing from a window around history
         mmin = min(df_pred_base["Create_Month"].dropna().min(), df_pred_base["Payment_Month"].dropna().min())
         mmax = max(df_pred_base["Create_Month"].dropna().max(), df_pred_base["Payment_Month"].dropna().max())
         options = list(pd.date_range(start=(mmin - pd.offsets.MonthBegin(0)), end=(mmax + pd.offsets.MonthBegin(6)), freq="MS"))
@@ -568,7 +585,6 @@ with tab_predict:
     cohort["lag_k"] = ((cohort["PM"].dt.year - cohort["CM"].dt.year) * 12 + (cohort["PM"].dt.month - cohort["CM"].dt.month)).astype(int)
     cohort = cohort[cohort["lag_k"] >= 0]
 
-    epsilon = 1e-6
     paid_by_k = cohort.groupby("lag_k")["Paid"].sum()
     total_creates = creates_by_CM.sum()
     if total_creates <= 0:
@@ -753,8 +769,6 @@ with tab_predict:
     else:
         mp = mp.sort_values("Month")
         months_list = list(pd.to_datetime(mp["Month"]))
-        cbm = creates_by_CM.reindex(pd.to_datetime(sorted(creates_by_CM.index))).fillna(0.0)
-
         recs=[]
         window = st.slider("Backtest training window (months)", 6, max(12, len(months_list)-2), min(12, len(months_list)-2), 1)
         for i in range(window, len(months_list)):
