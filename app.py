@@ -1,5 +1,5 @@
 # app.py — JetLearn Insights (MTD/Cohort) + Predictability (M0 + Carryover)
-# TWO uploaders at the absolute top (no expanders).
+# TWO uploaders at the absolute top (no expanders). No hourly predictability anywhere.
 
 import streamlit as st
 import pandas as pd
@@ -123,7 +123,7 @@ with c3:
 # Optional path fallbacks
 p1, p2 = st.columns(2)
 with p1:
-    path_hist = st.text_input("…or path to Historical CSV", value="master_DB_JL.csv", key="HIST_PATH")
+    path_hist = st.text_input("…or path to Historical CSV", value="Master_sheet_DB_10percent.csv", key="HIST_PATH")
 with p2:
     path_curr = st.text_input("…or path to Current Month Partial CSV", value="", key="CURR_PATH")
 
@@ -360,11 +360,6 @@ with tab_insights:
                     g=g.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                     tables["Top 5 Counsellors — MTD"]=g.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(5)
 
-                if pair and {"Country","JetLearn Deal Source"}.issubset(sub.columns):
-                    both=sub.groupby(["Country","JetLearn Deal Source"], dropna=False)[flags].sum().reset_index()
-                    both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
-                    tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
-
                 trend=sub.copy()
                 trend["Bucket"]=group_label_from_series(trend["Create Date"], mtd_grain)
                 t=trend.groupby("Bucket")[flags].sum().reset_index()
@@ -407,11 +402,6 @@ with tab_insights:
                     g=tmp.groupby("Student/Academic Counsellor", dropna=False)[ch_flags].sum().reset_index()
                     g=g.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                     tables["Top 5 Counsellors — Cohort"]=g.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(5)
-
-                if pair and {"Country","JetLearn Deal Source"}.issubset(base.columns):
-                    both2=tmp.groupby(["Country","JetLearn Deal Source"], dropna=False)[ch_flags].sum().reset_index()
-                    both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
-                    tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
 
                 frames=[]
                 for m in measures:
@@ -529,9 +519,6 @@ with tab_predict:
                 return c
         return None
 
-    def month_start(dt: date) -> pd.Timestamp:
-        return pd.Timestamp(dt).to_period("M").to_timestamp()
-
     def month_days(ts: pd.Timestamp) -> int:
         m0 = ts.to_period("M").to_timestamp()
         m1 = (m0 + pd.offsets.MonthBegin(1))
@@ -561,8 +548,9 @@ with tab_predict:
     with c3:
         lookback_split = st.slider("Split lookback (months)", 3, 12, 6, 1)
 
-    st.caption("This forecast = **M0 (same-month)** + **Carryover (lagged)** into the target month.")
+    st.caption("This forecast = **M0 (same-month)** + **Carryover (lagged)** into the target month. No hourly breakdowns.")
 
+    # Historical cohort mechanics
     hist = df_pred_base.copy()
     hist["CM"] = hist["Create_Month"]
     hist["PM"] = hist["Payment_Month"]
@@ -580,6 +568,7 @@ with tab_predict:
     lag_prob = (paid_by_k / max(total_creates, 1.0)).reindex(range(0, 18), fill_value=0.0).clip(lower=0.0)
     M0_rate = float(lag_prob.get(0, 0.0))
 
+    # Daily (not hourly) create profile for partial-month extrapolation
     def create_day_profile(df_hist: pd.DataFrame, month_of_year: int) -> pd.Series:
         d = df_hist.copy().dropna(subset=["Create Date"])
         d["d"] = d["Create Date"].dt.day
@@ -595,6 +584,7 @@ with tab_predict:
             return pd.Series(1.0/max_days, index=idx, name="prop")
         return (cnt/total).rename("prop")
 
+    # Split helpers (for category split)
     def eb_smooth_props(counts_by_cat: pd.Series, prior_props: pd.Series, prior_strength: float = 5.0):
         counts = counts_by_cat.astype(float)
         total = counts.sum()
@@ -621,13 +611,10 @@ with tab_predict:
         recent_counts = recent.groupby(split_col)["Payment Received Date"].count().sort_values(ascending=False)
         return eb_smooth_props(recent_counts, prior_props, prior_strength=5.0)
 
+    # Partial-month extrapolation (no hourly)
     tm_moy = int(target_month.month)
     create_profile = create_day_profile(df_pred_base, tm_moy)
-    def month_days_for_ts(ts: pd.Timestamp) -> int:
-        m0 = ts.to_period("M").to_timestamp()
-        m1 = (m0 + pd.offsets.MonthBegin(1))
-        return int((m1 - m0).days)
-    days_in_target = month_days_for_ts(target_month)
+    days_in_target = month_days(target_month)
 
     def observed_creates_so_far(df_current: pd.DataFrame, target_month_ts: pd.Timestamp) -> tuple[int,int,float]:
         if df_current is None or "Create Date" not in df_current.columns:
@@ -655,14 +642,14 @@ with tab_predict:
         moy_avg_creates = hist_cm.groupby("moy")["Create Date"].count() / max(hist_cm["Create_Month"].nunique(), 1)
         est_full_creates_tm = float(moy_avg_creates.get(tm_moy, moy_avg_creates.mean() if len(moy_avg_creates) else 0.0))
 
-    M0_rate = float(lag_prob.get(0, 0.0))
     M0_expected = float(est_full_creates_tm * M0_rate)
 
+    # Carryover from prior months
     prior_months = creates_by_CM.index[creates_by_CM.index < target_month]
     carry = 0.0
     for j in prior_months:
         k = (target_month.year - j.year)*12 + (target_month.month - j.month)
-        if k <= 0: 
+        if k <= 0:
             continue
         p = float(lag_prob.get(k, 0.0))
         c_j = float(creates_by_CM.get(j, 0.0))
@@ -670,6 +657,7 @@ with tab_predict:
     Carry_expected = float(carry)
     total_forecast = float(M0_expected + Carry_expected)
 
+    # ---------- KPIs (monthly only) ----------
     k1, k2, k3 = st.columns(3)
     with k1:
         st.markdown(f"<div class='kpi'><div class='label'>M0 (same-month) — {target_month:%b %Y}</div><div class='value'>{int(round(M0_expected)):,}</div></div>", unsafe_allow_html=True)
@@ -678,7 +666,7 @@ with tab_predict:
     with k3:
         st.markdown(f"<div class='kpi'><div class='label'>Total Forecast — {target_month:%b %Y}</div><div class='value'>{int(round(total_forecast)):,}</div></div>", unsafe_allow_html=True)
 
-    # Plot history + forecast point
+    # ---------- Chart: history & implied forecast (monthly only) ----------
     paid_hist = hist.dropna(subset=["Payment Received Date"]).copy()
     monthly_paid = paid_hist["Payment_Month"].value_counts().rename_axis("Month").sort_index().rename("y").reset_index()
     if not monthly_paid.empty:
@@ -693,9 +681,8 @@ with tab_predict:
     else:
         st.info("No historical payments to plot.")
 
-    # Optional split
+    # ---------- Split of forecast (optional, monthly only) ----------
     st.markdown("### Split of forecast (optional)")
-    split_by = split_by  # already set above
     if split_by == "None":
         st.info("No split selected.")
     else:
@@ -713,7 +700,8 @@ with tab_predict:
             st.download_button("Download split CSV", split_table.to_csv(index=False).encode("utf-8"),
                                file_name="forecast_split.csv", mime="text/csv")
 
-    # Day-of-month distribution (payments)
+    # ---------- Day-of-month distribution (still not hourly; remove if you prefer) ----------
+    st.markdown("### Day-of-month distribution (payments)")
     def payment_day_profile(df_paid: pd.DataFrame, target_month_ts: pd.Timestamp):
         dp = df_paid.copy()
         dp["d"] = dp["Payment Received Date"].dt.day
@@ -729,7 +717,6 @@ with tab_predict:
             return pd.Series(1.0/days, index=idx, name="prop")
         return (cnt/total).rename("prop")
 
-    st.markdown("### Day-of-month distribution (payments)")
     pay_profile = payment_day_profile(paid_hist, target_month)
     dom = pay_profile.reset_index().rename(columns={"day":"Day","prop":"Prop"})
     dom["Forecast"] = (total_forecast * dom["Prop"]).round(0)
