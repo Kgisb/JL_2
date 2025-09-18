@@ -1,5 +1,4 @@
-# app.py — JetLearn Insights (MTD/Cohort) ONLY
-# Predictability tab and all ML/stat code removed.
+# app.py — JetLearn Insights (MTD/Cohort) + Predictivity of Enrollment
 # Streamlit APIs use width='stretch' (no use_container_width deprecation).
 
 import streamlit as st
@@ -31,6 +30,8 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
 .popcap { font-size:.78rem; color:#64748b; margin-top:2px; }
+.warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:6px 10px; border-radius:10px; display:inline-block; }
+.ok { background:#ecfeff; border:1px solid #a5f3fc; color:#155e75; padding:6px 10px; border-radius:10px; display:inline-block; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,6 +110,12 @@ def group_label_from_series(s: pd.Series, grain: str):
         return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
+def month_start(d: date) -> pd.Timestamp:
+    return pd.Timestamp(d).to_period("M").to_timestamp()
+
+def month_add(ts: pd.Timestamp, k: int) -> pd.Timestamp:
+    return (ts.to_period("M") + k).to_timestamp()
+
 # --------------------- Header ---------------------
 with st.container():
     st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights</div></div>', unsafe_allow_html=True)
@@ -148,12 +155,13 @@ df["Create_Month"] = df["Create Date"].dt.to_period("M")
 # Coerce all other date-like cols for Insights
 date_like_cols = detect_measure_date_columns(df)
 
-# --------------------- INSIGHTS (single tab UI) ---------------------
+# =========================================================
+# ===============  INSIGHTS (MTD / Cohort)  ===============
+# =========================================================
 if not date_like_cols:
     st.error("No usable date-like columns (other than Create Date) found. Add a column like 'Payment Received Date'.")
     st.stop()
 
-# ---- Compact global multi-filters with search ----
 def summary_label(values, all_flag, max_items=2):
     vals = coerce_list(values)
     if all_flag: return "All"
@@ -229,13 +237,11 @@ def scenario_controls(name: str, df_, date_like_cols_):
     with mcol2:
         mode = st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
 
-    # Prepare month cols for measures
     for m in measures:
         mn = f"{m}_Month"
         if m in base.columns and mn not in base.columns:
             base[mn] = base[m].dt.to_period("M")
 
-    # Windows
     mtd_from = mtd_to = coh_from = coh_to = None
     mtd_grain = coh_grain = "Month"
 
@@ -466,3 +472,218 @@ if show_b:
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 st.caption("Excluded globally: 1.2 Invalid Deal")
+
+# =========================================================
+# =========  🔮 PREDICTIVITY OF ENROLLMENT (INDEPENDENT) ==
+# =========================================================
+pe_tab, = st.tabs(["🔮 Predictivity of Enrollment"])
+
+with pe_tab:
+    st.markdown("### Predictivity of Enrollment (This Month & Next Month)")
+
+    # ---------- Optional ML deps (guarded import) ----------
+    _SK_OK = True
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.ensemble import GradientBoostingClassifier
+    except Exception:
+        _SK_OK = False
+
+    # ---------- Column checks ----------
+    REQ_BASE = ["Create Date", "Country", "JetLearn Deal Source"]
+    MISSING = [c for c in REQ_BASE if c not in df.columns]
+    if MISSING:
+        st.error(f"Predictivity tab needs these columns: {MISSING}")
+        st.stop()
+
+    # Local copy and date parsing
+    _df = df.copy()
+    for c in ["Create Date", "Payment Received Date", "Last Date of Sales Activity", "Last Date of Call Connected"]:
+        if c in _df.columns:
+            _df[c] = pd.to_datetime(_df[c], errors="coerce", dayfirst=True)
+
+    # ---------- Local helpers ----------
+    def _mstart(d):  # start of month
+        return pd.Timestamp(d).to_period("M").to_timestamp()
+    def _madd(ts, k):
+        return (ts.to_period("M") + k).to_timestamp()
+    def _to_month(s):
+        return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.to_period("M").to_timestamp()
+
+    def _build_features(raw: pd.DataFrame, as_of: date) -> pd.DataFrame:
+        X = raw.copy()
+        asof_ts = pd.Timestamp(as_of)
+
+        for c in ["Create Date", "Payment Received Date", "Last Date of Sales Activity", "Last Date of Call Connected"]:
+            if c in X.columns:
+                X[c] = pd.to_datetime(X[c], errors="coerce")
+
+        X["Create_Month"] = _to_month(X["Create Date"])
+
+        for c in ["Number of Sales Activity", "Number of Call Connected"]:
+            if c in X.columns:
+                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).clip(lower=0)
+
+        if "Age" in X.columns:
+            X["Age_num"] = pd.to_numeric(X["Age"], errors="coerce")
+        else:
+            X["Age_num"] = np.nan
+
+        X["age_in_days"] = (asof_ts - X["Create Date"]).dt.days.clip(lower=0)
+
+        X["days_since_last_activity"] = (asof_ts - X["Last Date of Sales Activity"]).dt.days
+        X["days_since_last_call"]     = (asof_ts - X["Last Date of Call Connected"]).dt.days
+        X["days_since_last_activity"] = X["days_since_last_activity"].fillna(999).clip(lower=0, upper=9999)
+        X["days_since_last_call"]     = X["days_since_last_call"].fillna(999).clip(lower=0, upper=9999)
+
+        X["create_dow"] = X["Create Date"].dt.dayofweek
+        X["create_dom"] = X["Create Date"].dt.day
+        X["create_moy"] = X["Create Date"].dt.month
+
+        pay = X["Payment Received Date"]
+        this_m0 = _mstart(as_of)
+        next_m0 = _madd(this_m0, 1)
+        X["y_thismonth"] = ((pay >= this_m0) & (pay < next_m0)).astype(int)
+        X["y_nextmonth"] = ((pay >= next_m0) & (pay < _madd(this_m0, 2))).astype(int)
+
+        X["open_as_of"] = pay.isna() | (pay > pd.Timestamp(as_of))
+        X["created_by_asof"] = X["Create Date"] <= pd.Timestamp(as_of)
+        X["score_mask"] = X["open_as_of"] & X["created_by_asof"]
+        return X
+
+    # ---------- ML path ----------
+    def _predict_ML(X: pd.DataFrame, as_of: date):
+        cutoff = _mstart(as_of)  # exclude current month from training
+        train_mask = X["Create_Month"] < cutoff
+
+        feats_num = ["age_in_days","Age_num","days_since_last_activity","days_since_last_call",
+                     "Number of Sales Activity","Number of Call Connected",
+                     "create_dow","create_dom","create_moy"]
+        feats_num = [c for c in feats_num if c in X.columns]
+        feats_cat = [c for c in ["Country","JetLearn Deal Source"] if c in X.columns]
+        use_cols = feats_num + feats_cat
+
+        def _pipe():
+            steps=[]
+            if feats_num or feats_cat:
+                transf=[]
+                if feats_num: transf.append(("num","passthrough",feats_num))
+                if feats_cat: transf.append(("cat",OneHotEncoder(handle_unknown="ignore"),feats_cat))
+                pre = ColumnTransformer(transf)
+                steps.append(("pre", pre))
+            steps.append(("clf", GradientBoostingClassifier(random_state=42)))
+            return Pipeline(steps)
+
+        ys = {
+            "thismonth": X.loc[train_mask, "y_thismonth"],
+            "nextmonth": X.loc[train_mask, "y_nextmonth"],
+        }
+        models={}
+        for k, y in ys.items():
+            if len(y.dropna().unique()) < 2 or y.sum() == 0:
+                models[k] = None
+                continue
+            m = _pipe()
+            m.fit(X.loc[train_mask, use_cols], y)
+            models[k] = m
+
+        idx = X.index[X["score_mask"]]
+        totals = {"thismonth": 0.0, "nextmonth": 0.0}
+        if len(idx) > 0:
+            Xs = X.loc[idx, use_cols]
+            for k, m in models.items():
+                if m is None:
+                    totals[k] = 0.0
+                else:
+                    totals[k] = float(np.sum(m.predict_proba(Xs)[:,1]))
+
+        out = pd.DataFrame({"Deal Index": idx})
+        if len(idx) > 0:
+            for k, m in models.items():
+                out[f"p_{k}"] = (m.predict_proba(X.loc[idx, use_cols])[:,1] if m is not None else np.zeros(len(idx)))
+            if "Country" in X.columns: out["Country"] = X.loc[idx,"Country"].astype(str)
+            if "JetLearn Deal Source" in X.columns: out["JetLearn Deal Source"] = X.loc[idx,"JetLearn Deal Source"].astype(str)
+        return totals, out
+
+    # ---------- EB fallback ----------
+    def _predict_EB(X: pd.DataFrame, as_of: date):
+        this_m0 = _mstart(as_of)
+        prev_m0 = _madd(this_m0, -1)
+        next_m0 = _madd(this_m0, 1)
+
+        H = X[X["Create_Month"] < this_m0].copy()
+        grp = ["JetLearn Deal Source","Country"]
+        for g in grp:
+            if g not in H.columns: H[g] = ""
+
+        H["PaymentMonth"] = X.loc[H.index, "Payment Received Date"].dt.to_period("M").to_timestamp()
+        codeC = H["Create_Month"].dt.year*12 + H["Create_Month"].dt.month
+        codeP = H["PaymentMonth"].dt.year*12 + H["PaymentMonth"].dt.month
+        H["Lag"] = codeP - codeC
+
+        r0 = H[H["Lag"]==0].groupby(grp)["Lag"].count().rename("succ0")
+        r1 = H[H["Lag"]==1].groupby(grp)["Lag"].count().rename("succ1")
+        trials = H.groupby(grp)["Create Date"].count().rename("trials")
+        base = pd.concat([r0,r1,trials], axis=1).fillna(0.0)
+
+        g_trials = trials.sum()
+        g_r0 = (r0.sum()/g_trials) if g_trials else 0.0
+        g_r1 = (r1.sum()/g_trials) if g_trials else 0.0
+        prior_strength = 25.0
+        base["r0"] = (base["succ0"] + prior_strength*g_r0) / (base["trials"] + prior_strength)
+        base["r1"] = (base["succ1"] + prior_strength*g_r1) / (base["trials"] + prior_strength)
+
+        score_mask = (X["Payment Received Date"].isna() | (X["Payment Received Date"] > pd.Timestamp(as_of))) & (X["Create Date"] <= pd.Timestamp(as_of))
+        S = X.loc[score_mask].copy()
+        S["CM"] = _to_month(S["Create Date"])
+
+        cur_cre = S[S["CM"] == this_m0].groupby(grp)["Create Date"].count().rename("C_cur")
+        prev_cre = S[S["CM"] == prev_m0].groupby(grp)["Create Date"].count().rename("C_prev")
+        both = pd.concat([base[["r0","r1"]], cur_cre, prev_cre], axis=1).fillna(0.0)
+
+        this_pred = float((both["r0"]*both["C_cur"] + both["r1"]*both["C_prev"]).sum())
+        next_pred = float((both["r1"]*both["C_cur"]).sum())
+
+        out = S.reset_index(drop=True)
+        out = out[[c for c in ["JetLearn Deal Source","Country"] if c in out.columns]]
+        out = out.merge(both.reset_index()[grp+["r0","r1"]], on=grp, how="left").fillna(0.0)
+        out = out.rename(columns={"r0":"p_thismonth_proxy","r1":"p_nextmonth_proxy"})
+        return {"thismonth": this_pred, "nextmonth": next_pred}, out
+
+    # ---------- Controls ----------
+    as_of = st.date_input("As-of date", value=pd.Timestamp.today().date(),
+                          help="Training excludes the current month to avoid leakage. Predictions are for THIS and NEXT month.")
+    run = st.button("Run Predictivity", type="primary")
+
+    st.caption(("Using **ML model** (Gradient Boosting) if available; otherwise **cohort EB** fallback.")
+               if _SK_OK else
+               "scikit-learn not found — using **cohort EB** fallback.")
+
+    if run:
+        with st.spinner("Training / Estimating…"):
+            X = _build_features(_df, as_of)
+            if _SK_OK:
+                try:
+                    totals, per_deal = _predict_ML(X, as_of)
+                except Exception as e:
+                    st.warning(f"ML path error ({e}). Falling back to EB…")
+                    totals, per_deal = _predict_EB(X, as_of)
+            else:
+                totals, per_deal = _predict_EB(X, as_of)
+
+        # ---------- KPIs ----------
+        k1, k2 = st.columns(2)
+        k1.metric(f"Predicted This Month ({_mstart(as_of):%b %Y})", f"{int(round(totals['thismonth'])):,}")
+        k2.metric(f"Predicted Next Month ({_madd(_mstart(as_of),1):%b %Y})", f"{int(round(totals['nextmonth'])):,}")
+
+        # ---------- (Optional) per-deal table ----------
+        with st.expander("See scored open deals (probabilities / proxies)", expanded=False):
+            if per_deal is not None and len(per_deal) > 0:
+                st.dataframe(per_deal, width='stretch')
+                st.download_button("Download per-deal predictions (CSV)",
+                                   per_deal.to_csv(index=False).encode("utf-8"),
+                                   file_name="predictivity_open_deals.csv", mime="text/csv")
+            else:
+                st.info("No open deals to score for the selected date.")
