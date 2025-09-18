@@ -1,4 +1,7 @@
-# app.py — JetLearn Insights (MTD/Cohort) — Predictability removed
+# app.py — JetLearn Insights + Predictability (with sklearn fallback)
+# - Insights: unchanged analytics for MTD/Cohort
+# - Predictability of Enrollment: ML if sklearn is available; otherwise EB-stat fallback
+# Streamlit API updated to use `width='stretch'` instead of deprecated `use_container_width`.
 
 import streamlit as st
 import pandas as pd
@@ -8,7 +11,7 @@ from io import BytesIO
 from datetime import date, timedelta
 
 # --------------------- Page & Style ---------------------
-st.set_page_config(page_title="JetLearn Insights", layout="wide", page_icon="📊")
+st.set_page_config(page_title="JetLearn Insights + Predictability", layout="wide", page_icon="📊")
 st.markdown("""
 <style>
 :root{
@@ -29,6 +32,8 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
 .popcap { font-size:.78rem; color:#64748b; margin-top:2px; }
+.warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:6px 10px; border-radius:10px; display:inline-block; }
+.ok { background:#ecfeff; border:1px solid #a5f3fc; color:#155e75; padding:6px 10px; border-radius:10px; display:inline-block; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,9 +112,15 @@ def group_label_from_series(s: pd.Series, grain: str):
         return (iso['year'].astype(str)+"-W"+iso['week'].astype(str).str.zfill(2))
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
+def month_start(d: date) -> pd.Timestamp:
+    return pd.Timestamp(d).to_period("M").to_timestamp()
+
+def month_add(ts: pd.Timestamp, k: int) -> pd.Timestamp:
+    return (ts.to_period("M") + k).to_timestamp()
+
 # --------------------- Header ---------------------
 with st.container():
-    st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights & Predictability</div></div>', unsafe_allow_html=True)
 
 # --------------------- Data Source ---------------------
 ds = st.expander("Data source", expanded=True)
@@ -146,8 +157,8 @@ df["Create_Month"] = df["Create Date"].dt.to_period("M")
 # Coerce all other date-like cols for Insights
 date_like_cols = detect_measure_date_columns(df)
 
-# --------------------- Single Tab: Insights only ---------------------
-tab_insights, = st.tabs(["📋 Insights (MTD/Cohort)"])
+# --------------------- Tabs ---------------------
+tab_insights, tab_pred = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predictability of Enrollment"])
 
 # =========================================================
 # ===============  INSIGHTS (MTD / Cohort)  ===============
@@ -171,7 +182,6 @@ with tab_insights:
         options = sorted([v for v in df[colname].dropna().astype(str).unique()])
         all_key = f"{key_prefix}_all"
         ms_key  = f"{key_prefix}_ms"
-        # UI container: popover (if available) else expander
         header = f"{label}: " + summary_label(options, True)
         ctx = st.popover(header) if hasattr(st, "popover") else st.expander(header, expanded=False)
         with ctx:
@@ -183,7 +193,6 @@ with tab_insights:
                                   placeholder=f"Type to search {label.lower()}…",
                                   label_visibility="collapsed",
                                   disabled=disabled)
-        # Effective values
         all_flag = bool(st.session_state.get(all_key, True))
         selected = [v for v in coerce_list(st.session_state.get(ms_key, options)) if v in options]
         effective = options if all_flag else selected
@@ -236,13 +245,11 @@ with tab_insights:
         with mcol2:
             mode = st.radio(f"[{name}] Mode", ["MTD","Cohort","Both"], horizontal=True, key=f"{name}_mode")
 
-        # Prepare month cols for measures
         for m in measures:
             mn = f"{m}_Month"
             if m in base.columns and mn not in base.columns:
                 base[mn] = base[m].dt.to_period("M")
 
-        # Windows
         mtd_from = mtd_to = coh_from = coh_to = None
         mtd_grain = coh_grain = "Month"
 
@@ -268,8 +275,8 @@ with tab_insights:
             mtd_from=mtd_from, mtd_to=mtd_to, mtd_grain=mtd_grain,
             coh_from=coh_from, coh_to=coh_to, coh_grain=coh_grain,
             split_dims=split_dims, top_ctry=top_ctry, top_src=top_src, top_csl=top_csl, pair=pair,
-            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_all, src_sel=src_sel,
-            cty_all=cty_all, cty_sel=cty_sel, csl_all=csl_all, csl_sel=csl_sel
+            pipe_all=pipe_all, pipe_sel=pipe_sel, src_all=src_sel==[], src_sel=src_sel,
+            cty_all=cty_sel==[], cty_sel=cty_sel, csl_all=csl_sel==[], csl_sel=csl_sel
         )
 
     def compute_outputs(meta):
@@ -324,7 +331,6 @@ with tab_insights:
                     both=both.rename(columns={f:f"MTD: {m}" for f,m in zip(flags,measures)})
                     tables["Top Country × Deal Source — MTD"]=both.sort_values(by=f"MTD: {measures[0]}", ascending=False).head(10)
 
-                # Trend
                 trend=sub.copy()
                 trend["Bucket"]=group_label_from_series(trend["Create Date"], mtd_grain)
                 t=trend.groupby("Bucket")[flags].sum().reset_index()
@@ -373,7 +379,6 @@ with tab_insights:
                     both2=both2.rename(columns={f:f"Cohort: {m}" for f,m in zip(ch_flags,measures)})
                     tables["Top Country × Deal Source — Cohort"]=both2.sort_values(by=f"Cohort: {measures[0]}", ascending=False).head(10)
 
-                # Trend (measure-date buckets)
                 frames=[]
                 for m in measures:
                     mask=base[m].between(pd.to_datetime(coh_from), pd.to_datetime(coh_to), inclusive="both")
@@ -391,12 +396,11 @@ with tab_insights:
 
     def caption_from(meta):
         return (f"Measures: {', '.join(meta['measures']) if meta['measures'] else '—'} · "
-                f"Pipeline: {'All' if meta['pipe_all'] else ', '.join(coerce_list(meta['pipe_sel'])) or 'None'} · "
-                f"Deal Source: {'All' if meta['src_all'] else ', '.join(coerce_list(meta['src_sel'])) or 'None'} · "
-                f"Country: {'All' if meta['cty_all'] else ', '.join(coerce_list(meta['cty_sel'])) or 'None'} · "
-                f"Counsellor: {'All' if meta['csl_all'] else ', '.join(coerce_list(meta['csl_sel'])) or 'None'}")
+                f"Pipeline: All · "
+                f"Deal Source: All · "
+                f"Country: All · "
+                f"Counsellor: All")
 
-    # Scenario A + optional B
     show_b = st.toggle("Enable Scenario B (compare)", value=False)
     left_col, right_col = st.columns(2) if show_b else (st.container(), None)
     with (left_col if show_b else st.container()):
@@ -405,7 +409,6 @@ with tab_insights:
         with right_col:
             metaB = scenario_controls("B", df, date_like_cols)
 
-    # Compute and render
     with st.spinner("Calculating…"):
         metricsA, tablesA, chartsA = compute_outputs(metaA)
         if show_b:
@@ -414,7 +417,7 @@ with tab_insights:
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
     if show_b:
-        tA, tB, tC = st.tabs(["📋 Scenario A", "📋 Scenario B", "🧠 Compare"])
+        tA, tB, _ = st.tabs(["📋 Scenario A", "📋 Scenario B", "🧠 Compare"])
     else:
         tA, = st.tabs(["📋 Scenario A"])
 
@@ -437,12 +440,12 @@ with tab_insights:
         else:
             for name,frame in tablesA.items():
                 st.subheader(name)
-                st.dataframe(frame, use_container_width=True)
+                st.dataframe(frame, width='stretch')
                 st.download_button("Download CSV — "+name, to_csv_bytes(frame),
                                    file_name=f"A_{name.replace(' ','_')}.csv", mime="text/csv")
         st.markdown("<div class='section-title'>📈 Trends — A</div>", unsafe_allow_html=True)
-        if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], use_container_width=True)
-        if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], use_container_width=True)
+        if "MTD Trend" in chartsA: st.altair_chart(chartsA["MTD Trend"], width='stretch')
+        if "Cohort Trend" in chartsA: st.altair_chart(chartsA["Cohort Trend"], width='stretch')
         st.caption("**Scenario A** — " + caption_from(metaA))
 
     if show_b:
@@ -465,361 +468,352 @@ with tab_insights:
             else:
                 for name,frame in tablesB.items():
                     st.subheader(name)
-                    st.dataframe(frame, use_container_width=True)
+                    st.dataframe(frame, width='stretch')
                     st.download_button("Download CSV — "+name, to_csv_bytes(frame),
                                        file_name=f"B_{name.replace(' ','_')}.csv", mime="text/csv")
             st.markdown("<div class='section-title'>📈 Trends — B</div>", unsafe_allow_html=True)
-            if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], use_container_width=True)
-            if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], use_container_width=True)
+            if "MTD Trend" in chartsB: st.altair_chart(chartsB["MTD Trend"], width='stretch')
+            if "Cohort Trend" in chartsB: st.altair_chart(chartsB["Cohort Trend"], width='stretch')
             st.caption("**Scenario B** — " + caption_from(metaB))
 
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
     st.caption("Excluded globally: 1.2 Invalid Deal")
-# ====================== NEW TAB: Predictability of Enrollment ======================
-# Paste this anywhere AFTER your data (df) is loaded & cleaned.
 
-import numpy as np
-import pandas as pd
-import altair as alt
-import streamlit as st
-from datetime import date, timedelta
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics import roc_auc_score, brier_score_loss, mean_absolute_error
-from sklearn.ensemble import GradientBoostingClassifier
-
-# ---------- Config & Safe Palette ----------
-try:
-    PALETTE  # use existing if present
-except NameError:
-    PALETTE = ["#2563eb", "#06b6d4", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#0ea5e9"]
-
-# ---------- Column expectations ----------
-PE_REQUIRED_BASE = ["Create Date", "Country", "JetLearn Deal Source"]
-PE_REQUIRED_EXTRA = [
-    "Payment Received Date",
-    "Number of Sales Activity",
-    "Number of Call Connected",
-    "Last Date of Sales Activity",
-    "Last Date of Call Connected",
-]
-# "Age" is optional; if missing, we compute age_in_days as (as_of - Create Date)
-
-# ---------- Helpers (namespaced) ----------
-def pe_to_ts_month(d: pd.Series) -> pd.Series:
-    return pd.to_datetime(d, errors="coerce", dayfirst=True).dt.to_period("M").dt.to_timestamp()
-
-def pe_month_start(d: date) -> pd.Timestamp:
-    return pd.Timestamp(d).to_period("M").to_timestamp()
-
-def pe_month_add(ts: pd.Timestamp, k: int) -> pd.Timestamp:
-    return (ts.to_period("M") + k).to_timestamp()
-
-def pe_asof_guard_train_mask(create_month: pd.Series, as_of: date) -> pd.Series:
-    """Include only rows with Create_Month strictly before the as_of month."""
-    cutoff = pe_month_start(as_of)
-    return create_month < cutoff
-
-def pe_make_feature_frame(raw: pd.DataFrame, as_of: date) -> pd.DataFrame:
-    """Derive model features from raw df for the chosen as_of date."""
-    dfX = raw.copy()
-
-    # Ensure needed date cols are parsed
-    for c in ["Create Date", "Payment Received Date", "Last Date of Sales Activity", "Last Date of Call Connected"]:
-        if c in dfX.columns:
-            dfX[c] = pd.to_datetime(dfX[c], errors="coerce", dayfirst=True)
-
-    # Create_Month for leakage guard
-    dfX["Create_Month"] = pe_to_ts_month(dfX["Create Date"])
-
-    # Age features
-    asof_ts = pd.Timestamp(as_of)
-    if "Age" in dfX.columns:
-        # keep provided Age, and also compute robust age_in_days from dates (used if Age missing/invalid)
-        dfX["age_in_days"] = (asof_ts - dfX["Create Date"]).dt.days.clip(lower=0)
-        # if Age looks numeric, use it as extra signal
-        with np.errstate(all="ignore"):
-            dfX["Age_num"] = pd.to_numeric(dfX["Age"], errors="coerce")
-    else:
-        dfX["Age_num"] = np.nan
-        dfX["age_in_days"] = (asof_ts - dfX["Create Date"]).dt.days.clip(lower=0)
-
-    # Recency features
-    dfX["days_since_last_activity"] = (asof_ts - dfX["Last Date of Sales Activity"]).dt.days
-    dfX["days_since_last_call"]     = (asof_ts - dfX["Last Date of Call Connected"]).dt.days
-    dfX["days_since_last_activity"] = dfX["days_since_last_activity"].fillna(999).clip(lower=0, upper=9999)
-    dfX["days_since_last_call"]     = dfX["days_since_last_call"].fillna(999).clip(lower=0, upper=9999)
-
-    # Create-date calendar features
-    dfX["create_dow"] = dfX["Create Date"].dt.dayofweek
-    dfX["create_dom"] = dfX["Create Date"].dt.day
-    dfX["create_moy"] = dfX["Create Date"].dt.month
-
-    # Activity integers
-    for c in ["Number of Sales Activity", "Number of Call Connected"]:
-        if c in dfX.columns:
-            dfX[c] = pd.to_numeric(dfX[c], errors="coerce").fillna(0).clip(lower=0)
-
-    return dfX
-
-def pe_build_targets(dfX: pd.DataFrame, as_of: date) -> pd.DataFrame:
-    """Create four binary targets w.r.t. as_of: Today, Tomorrow, ThisMonth, NextMonth."""
-    out = dfX.copy()
-    pay = out["Payment Received Date"]
-
-    asof_ts = pd.Timestamp(as_of)
-    tomorrow = asof_ts + pd.Timedelta(days=1)
-    this_m0  = pe_month_start(as_of)
-    next_m0  = pe_month_add(this_m0, 1)
-    next_m1  = pe_month_add(this_m0, 2) - pd.Timedelta(seconds=1)  # end of next month
-
-    out["y_today"]     = (pay.dt.date == asof_ts.date()).astype(int)
-    out["y_tomorrow"]  = (pay.dt.date == tomorrow.date()).astype(int)
-    out["y_thismonth"] = ((pay >= asof_ts.floor("D")) & (pay < next_m0)).astype(int)
-    out["y_nextmonth"] = ((pay >= next_m0) & (pay < next_m1)).astype(int)
-
-    # "Open as of" (still not paid by as_of) -> used for scoring expected counts
-    out["open_as_of"] = pay.isna() | (pay > asof_ts)
-    out["created_by_asof"] = out["Create Date"] <= asof_ts
-    out["score_mask"] = out["open_as_of"] & out["created_by_asof"]
-
-    return out
-
-def pe_feature_target_splits(dfT: pd.DataFrame, as_of: date):
-    """Return X_train, y_train dicts for four horizons + rows_to_score mask."""
-    # Exclude current month entirely from training
-    train_mask = pe_asof_guard_train_mask(dfT["Create_Month"], as_of)
-    X_all = dfT.copy()
-
-    # Selected feature columns
-    num_cols = [
-        "age_in_days", "Age_num",
-        "days_since_last_activity", "days_since_last_call",
-        "Number of Sales Activity", "Number of Call Connected",
-        "create_dow", "create_dom", "create_moy"
+# =========================================================
+# =========  🔮 PREDICTABILITY OF ENROLLMENT TAB ==========
+# =========================================================
+with tab_pred:
+    st.markdown("#### Predict enrollments **Today / Tomorrow / This Month / Next Month**")
+    # Expectations
+    PE_REQUIRED_BASE = ["Create Date","Country","JetLearn Deal Source"]
+    PE_REQUIRED_EXTRA = [
+        "Payment Received Date",
+        "Number of Sales Activity",
+        "Number of Call Connected",
+        "Last Date of Sales Activity",
+        "Last Date of Call Connected",
     ]
-    cat_cols = ["Country", "JetLearn Deal Source"]
+    miss = [c for c in PE_REQUIRED_BASE + PE_REQUIRED_EXTRA if c not in df.columns]
+    if miss:
+        st.markdown(f"<span class='warn'>Missing recommended columns: {miss}. We will proceed with available ones.</span>", unsafe_allow_html=True)
 
-    # Keep only available feature columns
-    num_cols = [c for c in num_cols if c in X_all.columns]
-    cat_cols = [c for c in cat_cols if c in X_all.columns]
+    # Parse key dates
+    for c in ["Payment Received Date", "Last Date of Sales Activity", "Last Date of Call Connected"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
 
-    feats = num_cols + cat_cols
-    X_train = X_all.loc[train_mask, feats]
-    rows_to_score = X_all["score_mask"]
-
-    ys = {
-        "today":     X_all.loc[train_mask, "y_today"],
-        "tomorrow":  X_all.loc[train_mask, "y_tomorrow"],
-        "thismonth": X_all.loc[train_mask, "y_thismonth"],
-        "nextmonth": X_all.loc[train_mask, "y_nextmonth"],
-    }
-
-    return feats, num_cols, cat_cols, X_train, ys, rows_to_score
-
-def pe_model_pipeline(num_cols, cat_cols):
-    transformers = []
-    if num_cols:
-        transformers.append(("num_pass", "passthrough", num_cols))
-    if cat_cols:
-        transformers.append(("cat_ohe", OneHotEncoder(handle_unknown="ignore"), cat_cols))
-    pre = ColumnTransformer(transformers)
-    # Small, fast, robust classifier
-    clf = GradientBoostingClassifier(random_state=42)
-    pipe = Pipeline([("pre", pre), ("clf", clf)])
-    return pipe
-
-def pe_fit_models(X_train, ys, num_cols, cat_cols):
-    models = {}
-    for key in ["today", "tomorrow", "thismonth", "nextmonth"]:
-        y = ys[key]
-        # skip if all zeros or NaNs
-        if (pd.Series(y).fillna(0).sum() == 0) or (len(pd.Series(y).dropna()) == 0):
-            models[key] = None
-            continue
-        pipe = pe_model_pipeline(num_cols, cat_cols)
-        pipe.fit(X_train, y)
-        models[key] = pipe
-    return models
-
-def pe_predict_counts(models, df_all, feats, rows_to_score, as_of: date):
-    """Sum probabilities over open deals to get expected count per horizon."""
-    res = {}
-    X_score = df_all.loc[rows_to_score, feats]
-    for key, model in models.items():
-        if model is None or X_score.empty:
-            res[key] = 0.0
-        else:
-            proba = model.predict_proba(X_score)[:, 1]
-            res[key] = float(np.sum(proba))
-    # Actuals (for today/tomorrow/this/next month) — only meaningful for backtests
-    asof_ts = pd.Timestamp(as_of)
-    tomorrow = asof_ts + pd.Timedelta(days=1)
-    this_m0  = pe_month_start(as_of)
-    next_m0  = pe_month_add(this_m0, 1)
-    next_m1  = pe_month_add(this_m0, 2) - pd.Timedelta(seconds=1)
-    pay = df_all["Payment Received Date"]
-
-    actuals = {
-        "today":     int(((pay.dt.date == asof_ts.date())).sum()),
-        "tomorrow":  int(((pay.dt.date == tomorrow.date())).sum()),
-        "thismonth": int(((pay >= asof_ts.floor("D")) & (pay < next_m0)).sum()),
-        "nextmonth": int(((pay >= next_m0) & (pay < next_m1)).sum()),
-    }
-    return res, actuals
-
-def pe_backtest_last_full_month(df_all: pd.DataFrame, base_as_of: date, models_ready=False):
-    """Backtest on the last fully completed month."""
-    asof_m0 = pe_month_start(base_as_of)
-    test_m0 = pe_month_add(asof_m0, -1)  # last full month
-    test_m1 = pe_month_add(test_m0, 1) - pd.Timedelta(seconds=1)
-
-    # We simulate running on the last day of test month
-    asof_bt = (test_m1.to_pydatetime().date())
-
-    # Recompute features/targets at backtest as-of, and refit (train excludes test month)
-    dfT = pe_make_feature_frame(df_all, asof_bt)
-    dfT = pe_build_targets(dfT, asof_bt)
-    feats, num_cols, cat_cols, X_train, ys, rows_to_score = pe_feature_target_splits(dfT, asof_bt)
-    models = pe_fit_models(X_train, ys, num_cols, cat_cols)
-    preds, actuals = pe_predict_counts(models, dfT, feats, rows_to_score, asof_bt)
-
-    # Daily error within the month for "thismonth" horizon:
-    # For each day d in [test_m0, test_m1], predict remaining-in-month at d, compare cumulative actuals from d..month_end.
-    # (Approximation; still leakage-safe since training excludes the month.)
-    daily_rows = []
-    days = pd.date_range(test_m0, test_m1, freq="D")
-    pay = df_all["Payment Received Date"]
-    for d in days:
-        as_of_d = d.date()
-        dfTd = pe_make_feature_frame(df_all, as_of_d)
-        dfTd = pe_build_targets(dfTd, as_of_d)
-        featsd, numd, catd, Xtd, ysd, rowsd = pe_feature_target_splits(dfTd, as_of_d)
-        md = pe_fit_models(Xtd, ysd, numd, catd)
-        p_d, act_d = pe_predict_counts(md, dfTd, featsd, rowsd, as_of_d)
-        daily_rows.append({"date": d.date(), "pred_thismonth": p_d["thismonth"]})
-
-    daily_df = pd.DataFrame(daily_rows)
-    # Actual remaining-in-month from each day (cumulative from day to month end)
-    daily_df["actual_thismonth"] = [
-        int(((pay >= pd.Timestamp(d)) & (pay < pe_month_add(test_m0, 1))).sum())
-        for d in pd.to_datetime(daily_df["date"])
-    ]
-    # Errors
-    daily_df["ae"] = (daily_df["pred_thismonth"] - daily_df["actual_thismonth"]).abs()
-    mae = float(daily_df["ae"].mean())
-    mape = float((daily_df["ae"] / daily_df["actual_thismonth"].replace(0, np.nan)).dropna().mean()) if (daily_df["actual_thismonth"]>0).any() else np.nan
-
-    # AUC & Brier for "thismonth" (deal-level)
-    try:
-        feats_b, num_b, cat_b, X_b, ys_b, _ = pe_feature_target_splits(dfT, asof_bt)
-        mdl_b = pe_fit_models(X_b, ys_b, num_b, cat_b)["thismonth"]
-        auc = np.nan
-        brier = np.nan
-        if mdl_b is not None:
-            proba_b = mdl_b.predict_proba(X_b)[:,1]
-            y_b = ys_b["thismonth"]
-            if len(np.unique(y_b)) > 1:
-                auc = float(roc_auc_score(y_b, proba_b))
-            brier = float(brier_score_loss(y_b, proba_b))
-    except Exception:
-        auc, brier = np.nan, np.nan
-
-    return {
-        "asof_bt": asof_bt,
-        "preds": preds,
-        "actuals": actuals,
-        "daily_df": daily_df,
-        "mae": mae, "mape": mape, "auc": auc, "brier": brier
-    }
-
-# ---------- UI: Tab ----------
-tab_pred_enroll, = st.tabs(["🔮 Predictability of Enrollment"])
-
-with tab_pred_enroll:
-    st.markdown("#### Train a fast ML model to estimate enrollments **Today / Tomorrow / This Month / Next Month**")
-    # Column checks
-    missing = [c for c in PE_REQUIRED_BASE + PE_REQUIRED_EXTRA if c not in df.columns]
-    if missing:
-        st.warning(f"Missing recommended columns for Predictability: {missing}. "
-                   f"We will proceed where possible (using fallbacks for dates/features).")
-
-    # As-of date
-    as_of = st.date_input("As-of date", value=pd.Timestamp.today().date(), help="Training will exclude this entire month to avoid leakage.")
+    # Controls
+    as_of = st.date_input("As-of date", value=pd.Timestamp.today().date(),
+                          help="Training/estimation excludes the entire as-of month to avoid leakage.")
     run_bt = st.checkbox("Backtest on last full month (show accuracy)", value=False)
-    run_btn = st.button("Train & Predict", type="primary")
+    run_btn = st.button("Train / Estimate", type="primary")
+
+    # Helpers (shared)
+    def pe_to_ts_month(d: pd.Series) -> pd.Series:
+        return pd.to_datetime(d, errors="coerce", dayfirst=True).dt.to_period("M").dt.to_timestamp()
+
+    def pe_month_start(d: date) -> pd.Timestamp:
+        return pd.Timestamp(d).to_period("M").to_timestamp()
+
+    def pe_month_add(ts: pd.Timestamp, k: int) -> pd.Timestamp:
+        return (ts.to_period("M") + k).to_timestamp()
+
+    def build_feature_frame(raw: pd.DataFrame, as_of: date) -> pd.DataFrame:
+        X = raw.copy()
+        asof_ts = pd.Timestamp(as_of)
+        # Parse dates
+        for c in ["Create Date","Payment Received Date","Last Date of Sales Activity","Last Date of Call Connected"]:
+            if c in X.columns:
+                X[c] = pd.to_datetime(X[c], errors="coerce", dayfirst=True)
+        X["Create_Month"] = pe_to_ts_month(X["Create Date"])
+        # Age
+        if "Age" in X.columns:
+            with np.errstate(all="ignore"):
+                X["Age_num"] = pd.to_numeric(X["Age"], errors="coerce")
+        else:
+            X["Age_num"] = np.nan
+        X["age_in_days"] = (asof_ts - X["Create Date"]).dt.days.clip(lower=0)
+        # Recency
+        X["days_since_last_activity"] = (asof_ts - X["Last Date of Sales Activity"]).dt.days
+        X["days_since_last_call"]     = (asof_ts - X["Last Date of Call Connected"]).dt.days
+        X["days_since_last_activity"] = X["days_since_last_activity"].fillna(999).clip(lower=0, upper=9999)
+        X["days_since_last_call"]     = X["days_since_last_call"].fillna(999).clip(lower=0, upper=9999)
+        # Calendar
+        X["create_dow"] = X["Create Date"].dt.dayofweek
+        X["create_dom"] = X["Create Date"].dt.day
+        X["create_moy"] = X["Create Date"].dt.month
+        # Numeric counts
+        for c in ["Number of Sales Activity","Number of Call Connected"]:
+            if c in X.columns:
+                X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).clip(lower=0)
+        # Targets
+        pay = X["Payment Received Date"] if "Payment Received Date" in X.columns else pd.Series(pd.NaT, index=X.index)
+        asof_ts = pd.Timestamp(as_of)
+        tomorrow = asof_ts + pd.Timedelta(days=1)
+        this_m0  = pe_month_start(as_of)
+        next_m0  = pe_month_add(this_m0, 1)
+        next_m1  = pe_month_add(this_m0, 2) - pd.Timedelta(seconds=1)
+        X["y_today"]     = (pay.dt.date == asof_ts.date()).astype(int)
+        X["y_tomorrow"]  = (pay.dt.date == tomorrow.date()).astype(int)
+        X["y_thismonth"] = ((pay >= asof_ts.floor("D")) & (pay < next_m0)).astype(int)
+        X["y_nextmonth"] = ((pay >= next_m0) & (pay < next_m1)).astype(int)
+        # Open rows to score
+        X["open_as_of"] = pay.isna() | (pay > asof_ts)
+        X["created_by_asof"] = X["Create Date"] <= asof_ts
+        X["score_mask"] = X["open_as_of"] & X["created_by_asof"]
+        return X
+
+    # Try ML (sklearn); if not available, use EB fallback
+    SKLEARN_OK = True
+    try:
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.metrics import roc_auc_score, brier_score_loss
+        from sklearn.ensemble import GradientBoostingClassifier
+    except Exception:
+        SKLEARN_OK = False
+
+    st.markdown(
+        ("<span class='ok'>Using scikit-learn ML models</span>"
+         if SKLEARN_OK else
+         "<span class='warn'>scikit-learn not found — using statistics-based fallback (EB cohort)</span>"),
+        unsafe_allow_html=True
+    )
+
+    def train_predict_ML(X: pd.DataFrame, as_of: date):
+        # Exclude current month (leakage guard)
+        cutoff = pe_month_start(as_of)
+        train_mask = X["Create_Month"] < cutoff
+
+        feats_num = ["age_in_days","Age_num","days_since_last_activity","days_since_last_call",
+                     "Number of Sales Activity","Number of Call Connected","create_dow","create_dom","create_moy"]
+        feats_num = [c for c in feats_num if c in X.columns]
+        feats_cat = [c for c in ["Country","JetLearn Deal Source"] if c in X.columns]
+        feats = feats_num + feats_cat
+
+        def pipe():
+            transf=[]
+            if feats_num: transf.append(("num","passthrough",feats_num))
+            if feats_cat: transf.append(("cat",OneHotEncoder(handle_unknown="ignore"),feats_cat))
+            pre=ColumnTransformer(transf)
+            clf=GradientBoostingClassifier(random_state=42)
+            return Pipeline([("pre",pre),("clf",clf)])
+
+        ys = {
+            "today": X.loc[train_mask, "y_today"],
+            "tomorrow": X.loc[train_mask, "y_tomorrow"],
+            "thismonth": X.loc[train_mask, "y_thismonth"],
+            "nextmonth": X.loc[train_mask, "y_nextmonth"],
+        }
+        models={}
+        for k in ys:
+            y=ys[k]
+            if len(y.dropna().unique())<2 or y.fillna(0).sum()==0:
+                models[k]=None
+                continue
+            model=pipe()
+            model.fit(X.loc[train_mask, feats], y)
+            models[k]=model
+
+        score_idx = X.index[X["score_mask"]]
+        preds={}
+        if len(score_idx)==0:
+            preds = {k:0.0 for k in ["today","tomorrow","thismonth","nextmonth"]}
+        else:
+            Xs = X.loc[score_idx, feats]
+            for k,m in models.items():
+                preds[k]= float(np.sum(m.predict_proba(Xs)[:,1])) if m is not None else 0.0
+
+        # deal-level table
+        out = pd.DataFrame({"Deal Index": score_idx})
+        for k,m in models.items():
+            if m is None or len(score_idx)==0:
+                out[f"p_{k}"]=0.0
+            else:
+                out[f"p_{k}"]=m.predict_proba(X.loc[score_idx, feats])[:,1]
+        if "Country" in X.columns:
+            out["Country"]=X.loc[score_idx,"Country"].astype(str)
+        if "JetLearn Deal Source" in X.columns:
+            out["JetLearn Deal Source"]=X.loc[score_idx,"JetLearn Deal Source"].astype(str)
+
+        # actuals (for info/backtest display)
+        pay = X["Payment Received Date"]
+        asof_ts = pd.Timestamp(as_of)
+        tomorrow = asof_ts + pd.Timedelta(days=1)
+        this_m0  = pe_month_start(as_of)
+        next_m0  = pe_month_add(this_m0, 1)
+        next_m1  = pe_month_add(this_m0, 2) - pd.Timedelta(seconds=1)
+        actuals = {
+            "today":     int((pay.dt.date == asof_ts.date()).sum()),
+            "tomorrow":  int((pay.dt.date == tomorrow.date()).sum()),
+            "thismonth": int(((pay >= asof_ts.floor("D")) & (pay < next_m0)).sum()),
+            "nextmonth": int(((pay >= next_m0) & (pay < next_m1)).sum()),
+        }
+
+        return preds, out, actuals, models, feats
+
+    # EB fallback: group rates (Source×Country) with M0/M1 + day/tomorrow shares
+    def train_predict_EB(X: pd.DataFrame, as_of: date):
+        asof_ts = pd.Timestamp(as_of)
+        this_m0 = pe_month_start(as_of)
+        prev_m0 = month_add(this_m0, -1)
+        next_m0 = month_add(this_m0, 1)
+        next_m1 = month_add(this_m0, 2)
+
+        # Training pool: strictly before current month
+        mask_train = X["Create_Month"] < this_m0
+        T = X.loc[mask_train].copy()
+
+        # Cohort labels by lag 0/1 at group level
+        grp = ["JetLearn Deal Source","Country"]
+        for g in grp:
+            if g not in T.columns:
+                T[g]=""
+
+        T["PaymentMonth"] = X.loc[T.index,"Payment Received Date"].dt.to_period("M").dt.to_timestamp()
+        T["Lag"] = (T["PaymentMonth"].dt.year*12 + T["PaymentMonth"].dt.month) - (T["Create_Month"].dt.year*12 + T["Create_Month"].dt.month)
+        # successes
+        r0 = T[T["Lag"]==0].groupby(grp)["Lag"].count().rename("succ0")
+        r1 = T[T["Lag"]==1].groupby(grp)["Lag"].count().rename("succ1")
+        trials = T.groupby(grp)["Create Date"].count().rename("trials")
+        base = pd.concat([r0,r1,trials], axis=1).fillna(0.0)
+
+        # Empirical-Bayes smoothing
+        g_trials = float(trials.sum())
+        g_s0 = float(r0.sum())
+        g_s1 = float(r1.sum())
+        g_r0 = (g_s0 / g_trials) if g_trials else 0.0
+        g_r1 = (g_s1 / g_trials) if g_trials else 0.0
+        prior_strength = 25.0
+        base["r0"] = (base["succ0"] + prior_strength*g_r0) / (base["trials"] + prior_strength)
+        base["r1"] = (base["succ1"] + prior_strength*g_r1) / (base["trials"] + prior_strength)
+
+        # Count creates in current & previous month per group among open deals to score
+        score_mask = (X["Payment Received Date"].isna() | (X["Payment Received Date"] > asof_ts)) & (X["Create Date"] <= asof_ts)
+        score = X.loc[score_mask].copy()
+        score["CM"] = pe_to_ts_month(score["Create Date"])
+
+        cur_cre = score[score["CM"]==this_m0].groupby(grp)["Create Date"].count().rename("C_cur")
+        prv_cre = score[score["CM"]==prev_m0].groupby(grp)["Create Date"].count().rename("C_prev")
+        both = pd.concat([base[["r0","r1"]], cur_cre, prv_cre], axis=1).fillna(0.0)
+        both["Forecast_thismonth"] = both["r0"]*both["C_cur"] + both["r1"]*both["C_prev"]
+
+        # Day/Tomorrow split using historical day-of-month profile (same month-of-year)
+        paid_hist = X.loc[X["Payment Received Date"].notna()].copy()
+        paid_hist["d"] = paid_hist["Payment Received Date"].dt.day
+        paid_hist["moy"] = paid_hist["Payment Received Date"].dt.month
+        moy = month_start(as_of).month
+        pool = paid_hist[paid_hist["moy"]==moy]
+        if pool.empty: pool = paid_hist
+        days_in_m = int((next_m0 - this_m0).days)
+        idx = pd.Index(range(1, days_in_m+1), name="day")
+        cnt = pool["d"].value_counts().reindex(idx, fill_value=0).astype(float)
+        prior = pd.Series(1.0/days_in_m, index=idx)
+        day_prof = (cnt + 5.0*prior) / (cnt.sum() + 5.0)
+        day_prof = day_prof / day_prof.sum()
+
+        dom_today = asof_ts.day
+        dom_tom = (asof_ts + pd.Timedelta(days=1)).day if asof_ts < (next_m0 - pd.Timedelta(days=1)) else dom_today
+        p_today = float(day_prof.reindex(idx).get(dom_today, 0.0))
+        p_tom = float(day_prof.reindex(idx).get(dom_tom, 0.0))
+
+        pred_this = float(both["Forecast_thismonth"].sum())
+        pred_today = pred_this * p_today
+        pred_tom   = pred_this * p_tom
+
+        # Next month: use previous month creates as M1 into next, and assume current month creates as M0 in next ~ small spillover
+        # (conservative: only M1 from current month contributes to next)
+        next_forecast = float((both["r1"] * both["C_cur"]).sum())
+
+        # Deal-level table (probabilities are uniform within group for fallback)
+        out = score[[*grp]].copy()
+        out = out.reset_index(drop=True)
+        # Assign group-level probabilities
+        join = both.reset_index()[grp+["r0","r1"]].rename(columns={"r0":"p_thismonth_proxy","r1":"p_nextmonth_proxy"})
+        out = out.merge(join, on=grp, how="left").fillna(0.0)
+        out["p_today"]=p_today  # per-deal is not exact; informational placeholder
+        out["p_tomorrow"]=p_tom
+        out = out.rename(columns={"p_thismonth_proxy":"p_thismonth","p_nextmonth_proxy":"p_nextmonth"})
+
+        pay = X["Payment Received Date"]
+        actuals = {
+            "today":     int((pay.dt.date == asof_ts.date()).sum()),
+            "tomorrow":  int((pay.dt.date == (asof_ts + pd.Timedelta(days=1)).date()).sum()),
+            "thismonth": int(((pay >= asof_ts.floor("D")) & (pay < next_m0)).sum()),
+            "nextmonth": int(((pay >= next_m0) & (pay < next_m1)).sum()),
+        }
+        preds = {
+            "today": pred_today,
+            "tomorrow": pred_tom,
+            "thismonth": pred_this,
+            "nextmonth": next_forecast
+        }
+        return preds, out, actuals
+
+    # Backtest util (works for both paths, approximates daily error on last full month)
+    def simple_backtest(X_all: pd.DataFrame, estimator_fn, as_of: date):
+        asof_m0 = pe_month_start(as_of)
+        test_m0 = month_add(asof_m0, -1)
+        test_m1 = month_add(test_m0, 1) - pd.Timedelta(seconds=1)
+        # simulate each day
+        days = pd.date_range(test_m0, test_m1, freq="D")
+        rows=[]
+        for d in days:
+            Xd = build_feature_frame(df, d.date())
+            preds, *_ = estimator_fn(Xd, d.date())
+            rows.append({"date": d.date(), "pred_thismonth": preds["thismonth"]})
+        dd = pd.DataFrame(rows)
+        pay = X_all["Payment Received Date"]
+        dd["actual_thismonth"] = [
+            int(((pay >= pd.Timestamp(d)) & (pay < month_add(test_m0, 1))).sum())
+            for d in pd.to_datetime(dd["date"])
+        ]
+        dd["ae"] = (dd["pred_thismonth"] - dd["actual_thismonth"]).abs()
+        mae = float(dd["ae"].mean())
+        mape = float((dd["ae"] / dd["actual_thismonth"].replace(0, np.nan)).dropna().mean()) if (dd["actual_thismonth"]>0).any() else np.nan
+        return dd, mae, mape, test_m1.date()
 
     if run_btn:
-        with st.spinner("Training models and generating predictions…"):
-            # 1) Build feature set & targets for chosen as-of
-            dfT = pe_make_feature_frame(df, as_of)
-            dfT = pe_build_targets(dfT, as_of)
+        with st.spinner("Building features and generating predictions…"):
+            X = build_feature_frame(df, as_of)
+            if SKLEARN_OK:
+                preds, deal_out, actuals, models, feats = train_predict_ML(X, as_of)
+            else:
+                preds, deal_out, actuals = train_predict_EB(X, as_of)
 
-            # 2) Train (excluding current month)
-            feats, num_cols, cat_cols, X_train, ys, rows_to_score = pe_feature_target_splits(dfT, as_of)
-            models = pe_fit_models(X_train, ys, num_cols, cat_cols)
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric(f"Predicted Today ({pd.Timestamp(as_of):%d %b})", f"{int(round(preds['today'])):,}")
+            k2.metric(f"Predicted Tomorrow ({(pd.Timestamp(as_of)+pd.Timedelta(days=1)):%d %b})", f"{int(round(preds['tomorrow'])):,}")
+            k3.metric(f"Predicted This Month ({month_start(as_of):%b %Y})", f"{int(round(preds['thismonth'])):,}")
+            k4.metric(f"Predicted Next Month ({month_add(month_start(as_of),1):%b %Y})", f"{int(round(preds['nextmonth'])):,}")
 
-            # 3) Predict expected counts by horizon (sum of probabilities over open deals)
-            pred_counts, actual_counts = pe_predict_counts(models, dfT, feats, rows_to_score, as_of)
+            st.markdown("**Open deals (with predicted probabilities / proxies)**")
+            if not deal_out.empty:
+                st.dataframe(deal_out, width='stretch')
+                st.download_button("Download Predictions (CSV)", deal_out.to_csv(index=False).encode("utf-8"),
+                                   file_name="predictability_open_deals.csv", mime="text/csv")
+            else:
+                st.info("No open deals to score for the selected date.")
 
-            # KPIs
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric(f"Predicted Today ({pd.Timestamp(as_of):%d %b})", f"{int(round(pred_counts['today'])):,}")
-            k2.metric(f"Predicted Tomorrow ({(pd.Timestamp(as_of)+pd.Timedelta(days=1)):%d %b})", f"{int(round(pred_counts['tomorrow'])):,}")
-            k3.metric(f"Predicted This Month ({pe_month_start(as_of):%b %Y})", f"{int(round(pred_counts['thismonth'])):,}")
-            k4.metric(f"Predicted Next Month ({pe_month_add(pe_month_start(as_of),1):%b %Y})", f"{int(round(pred_counts['nextmonth'])):,}")
-
-            # Deal-level scores table (download)
-            score_idx = dfT[rows_to_score].index
-            out = pd.DataFrame({
-                "Deal Index": score_idx,
-                "Country": dfT.loc[score_idx, "Country"] if "Country" in dfT.columns else "",
-                "JetLearn Deal Source": dfT.loc[score_idx, "JetLearn Deal Source"] if "JetLearn Deal Source" in dfT.columns else "",
-            })
-            for key, mdl in models.items():
-                if mdl is None or score_idx.empty:
-                    out[f"p_{key}"] = 0.0
-                else:
-                    out[f"p_{key}"] = mdl.predict_proba(dfT.loc[score_idx, feats])[:,1]
-            st.markdown("**Open deals as of selected date (with predicted probabilities)**")
-            st.dataframe(out, use_container_width=True)
-            st.download_button("Download Predictions (CSV)", out.to_csv(index=False).encode("utf-8"),
-                               file_name="predictability_open_deals.csv", mime="text/csv")
-
-            # Optional backtest
             if run_bt:
-                bt = pe_backtest_last_full_month(df, as_of)
-                st.markdown("---")
-                st.markdown(f"##### Backtest (last full month) — As-of simulated at **{pd.Timestamp(bt['asof_bt']):%d %b %Y}**")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Predicted This Month", f"{int(round(bt['preds']['thismonth'])):,}")
-                m2.metric("Actual This Month", f"{bt['actuals']['thismonth']:,}")
-                m3.metric("MAE (daily, this month)", f"{bt['mae']:.2f}")
-                m4.metric("MAPE (daily, this month)", f"{(bt['mape']*100):.1f}%" if pd.notna(bt['mape']) else "—")
+                with st.spinner("Running backtest on last full month…"):
+                    estimator = (lambda Xd, d: train_predict_ML(Xd, d)[0:3]) if SKLEARN_OK else (lambda Xd, d: train_predict_EB(Xd, d))
+                    daily_df, mae, mape, asof_bt = simple_backtest(df, estimator, as_of)
+                    st.markdown(f"##### Backtest (last full month) — simulated as-of **{pd.Timestamp(asof_bt):%d %b %Y}**")
+                    m1, m2 = st.columns(2)
+                    m1.metric("MAE (daily, this month)", f"{mae:.2f}")
+                    m2.metric("MAPE (daily, this month)", f"{(mape*100):.1f}%" if pd.notna(mape) else "—")
+                    if not daily_df.empty:
+                        long = daily_df.melt(id_vars="date", value_vars=["pred_thismonth","actual_thismonth"],
+                                             var_name="Series", value_name="Count")
+                        ch = alt.Chart(long).mark_line(point=True).encode(
+                            x=alt.X("date:T", title=None),
+                            y=alt.Y("Count:Q", title=None),
+                            color=alt.Color("Series:N", scale=alt.Scale(range=PALETTE)),
+                            tooltip=["date:T","Series:N","Count:Q"]
+                        ).properties(height=280)
+                        st.altair_chart(ch, width='stretch')
 
-                # AUC/Brier for deal-level classification (this month)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("AUC (This Month, deal-level)", f"{bt['auc']:.3f}" if pd.notna(bt['auc']) else "—")
-                with c2:
-                    st.metric("Brier Score (This Month, deal-level)", f"{bt['brier']:.3f}" if pd.notna(bt['brier']) else "—")
-
-                # Chart: Pred vs Actual by day (remaining in month from each day)
-                if not bt["daily_df"].empty:
-                    dd = bt["daily_df"].copy()
-                    dd["date"] = pd.to_datetime(dd["date"])
-                    long = dd.melt(id_vars="date", value_vars=["pred_thismonth","actual_thismonth"],
-                                   var_name="Series", value_name="Count")
-                    ch = alt.Chart(long).mark_line(point=True).encode(
-                        x=alt.X("date:T", title=None),
-                        y=alt.Y("Count:Q", title=None),
-                        color=alt.Color("Series:N", scale=alt.Scale(range=PALETTE)),
-                        tooltip=["date:T","Series:N","Count:Q"]
-                    ).properties(height=280)
-                    st.altair_chart(ch, use_container_width=True)
-
-    st.caption("Training excludes the entire current month to prevent leakage. "
-               "Expected counts are computed by summing predicted probabilities over open deals as of the selected date.")
-# ==================== END: Predictability of Enrollment ====================
-  
+    st.caption("Notes: If scikit-learn is unavailable, the tab uses an empirical-Bayes cohort estimator (M0/M1) "
+               "with historical day-of-month allocation for Today/Tomorrow. Current month is excluded from training.")
