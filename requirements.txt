@@ -2,11 +2,6 @@
 
 # Core
 streamlit==1.37.1
-
-
-
-# ===== Python >= 3.12 / 3.13+ (newer wheels) =====
-# (If your deploy environment is locked to 3.12/3.13, these versions will be used.)
 numpy>=2.0.0,<3.0.0; python_version >= "3.12"
 pandas>=2.2.3; python_version >= "3.12"
 scipy>=1.13.0; python_version >= "3.12"
