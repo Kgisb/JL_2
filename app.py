@@ -1,5 +1,5 @@
-# app.py — JetLearn Insights (MTD/Cohort) + Predictability (M0 vs Carryover)
-# BOTH uploaders are inside the SAME "Data source" box.
+# app.py — JetLearn Insights (MTD/Cohort) + Predictability (M0 + Carryover)
+# TWO uploaders at the absolute top (no expanders).
 
 import streamlit as st
 import pandas as pd
@@ -30,6 +30,7 @@ html, body, [class*="css"] { font-family: ui-sans-serif,-apple-system,"Segoe UI"
 hr.soft { border:0; height:1px; background:var(--border); margin:.6rem 0 1rem; }
 .badge { display:inline-block; padding:2px 8px; font-size:.72rem; border-radius:999px; border:1px solid var(--border); background:#fff; }
 .popcap { font-size:.78rem; color:var(--muted); margin-top:2px; }
+.warn { padding:8px 10px; border-left:4px solid #ef4444; background:#fff5f5; border-radius:8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,7 +50,6 @@ def robust_read_csv(file_or_path):
     raise RuntimeError("Could not read the CSV with tried encodings.")
 
 def detect_measure_date_columns(df: pd.DataFrame):
-    """Find all date-like columns except Create Date; coerce to datetime."""
     date_like=[]
     for col in df.columns:
         if col == "Create Date": continue
@@ -108,37 +108,26 @@ def group_label_from_series(s: pd.Series, grain: str):
     return pd.to_datetime(s).dt.to_period("M").astype(str)
 
 # --------------------- Header ---------------------
-with st.container():
-    st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights & Predictability</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="head"><div class="title">📊 JetLearn — Insights & Predictability</div></div>', unsafe_allow_html=True)
 
-# --------------------- Data source (both files in one place) ---------------------
-ds = st.expander("Data source", expanded=True)
-with ds:
-    # top row: two uploaders + checkbox
-    c1, c2, c3 = st.columns([3, 3, 2])
-    with c1:
-        uploaded_hist = st.file_uploader(
-            "Upload HISTORICAL / MODELING CSV",
-            type=["csv"],
-            key="hist"
-        )
-    with c2:
-        uploaded_curr = st.file_uploader(
-            "Upload CURRENT MONTH PARTIAL CSV (e.g., September)",
-            type=["csv"],
-            key="curr"
-        )
-    with c3:
-        exclude_invalid = st.checkbox("Exclude '1.2 Invalid Deal'", value=True)
+# --------------------- ALWAYS-VISIBLE TWO UPLOADERS ---------------------
+st.markdown("<div class='warn'><b>Upload both files below:</b> Left = Historical/Modeling CSV • Right = Current Month Partial CSV (e.g., September).</div>", unsafe_allow_html=True)
+c1, c2, c3 = st.columns([3,3,2])
+with c1:
+    uploaded_hist = st.file_uploader("Historical / Modeling CSV", type=["csv"], key="HIST_UP")
+with c2:
+    uploaded_curr = st.file_uploader("Current Month Partial CSV (e.g., September)", type=["csv"], key="CURR_UP")
+with c3:
+    exclude_invalid = st.checkbox("Exclude '1.2 Invalid Deal'", value=True)
 
-    # second row: optional paths (if you prefer disk paths)
-    p1, p2 = st.columns([1, 1])
-    with p1:
-        path_hist = st.text_input("…or path to Historical CSV", value="master_DB_JL.csv")
-    with p2:
-        path_curr = st.text_input("…or path to Current Month Partial CSV", value="")
+# Optional path fallbacks
+p1, p2 = st.columns(2)
+with p1:
+    path_hist = st.text_input("…or path to Historical CSV", value="Master_sheet_DB_10percent.csv", key="HIST_PATH")
+with p2:
+    path_curr = st.text_input("…or path to Current Month Partial CSV", value="", key="CURR_PATH")
 
-# ---------- Load historical ----------
+# --------------------- Load Historical ---------------------
 try:
     if uploaded_hist is not None:
         df = robust_read_csv(BytesIO(uploaded_hist.getvalue()))
@@ -146,12 +135,10 @@ try:
     else:
         df = robust_read_csv(path_hist)
         hist_source = "Path"
-    st.success("Data loaded ✅")
 except Exception as e:
     st.error(f"Failed to load Historical CSV: {e}")
     st.stop()
 
-# basic cleaning
 df.columns = [c.strip() for c in df.columns]
 missing=[c for c in REQUIRED_COLS if c not in df.columns]
 if missing:
@@ -165,23 +152,9 @@ df["Create Date"] = pd.to_datetime(df["Create Date"], errors="coerce", dayfirst=
 df["Create_Month"] = df["Create Date"].dt.to_period("M").dt.to_timestamp()
 
 # Coerce other date-like cols for Insights
-def detect_measure_date_columns(df_local):
-    date_like=[]
-    for col in df_local.columns:
-        if col == "Create Date": continue
-        cl = col.lower()
-        if any(k in cl for k in ["date","time","timestamp"]):
-            parsed = pd.to_datetime(df_local[col], errors="coerce", dayfirst=True)
-            if parsed.notna().sum()>0:
-                df_local[col] = parsed
-                date_like.append(col)
-    if "Payment Received Date" in date_like:
-        date_like = ["Payment Received Date"] + [c for c in date_like if c!="Payment Received Date"]
-    return date_like
-
 date_like_cols = detect_measure_date_columns(df)
 
-# ---------- Load current/partial (optional) ----------
+# --------------------- Load Current/Partial (optional) ---------------------
 df_curr = None
 if (uploaded_curr is not None) or path_curr.strip():
     try:
@@ -199,14 +172,13 @@ if (uploaded_curr is not None) or path_curr.strip():
             df_curr["Create Date"] = pd.to_datetime(df_curr["Create Date"], errors="coerce", dayfirst=True)
             df_curr["Create_Month"] = df_curr["Create Date"].dt.to_period("M").dt.to_timestamp()
 
-        st.info(f"Current month partial loaded ({curr_source}) — rows: {len(df_curr):,}")
+        st.success(f"Current partial CSV loaded ✅ (via {curr_source}) — rows: {len(df_curr):,}")
     except Exception as e:
         st.warning(f"Could not load current/partial file: {e}. Proceeding without it.")
 else:
-    st.caption("Tip: add your September partial CSV in the SAME 'Data source' box (right-hand uploader).")
+    st.info("Tip: add your **Current Month Partial CSV** in the right uploader above for better partial-month extrapolation.")
 
-# Quick status banner
-st.caption(f"Historical loaded via **{hist_source}** — rows: {len(df):,} | Current partial: {'yes ('+str(len(df_curr))+' rows)' if df_curr is not None else 'no'}")
+st.caption(f"Historical via **{hist_source}** — rows: {len(df):,} | Current partial: {'yes ('+str(len(df_curr))+' rows)' if df_curr is not None else 'no'}")
 
 # --------------------- Tabs ---------------------
 tab_insights, tab_predict = st.tabs(["📋 Insights (MTD/Cohort)", "🔮 Predictability (M0 + Carryover)"])
@@ -546,7 +518,6 @@ with tab_insights:
 # =========================================================
 with tab_predict:
 
-    # ---- Detect payment column ----
     def detect_payment_col(cols):
         for c in cols:
             cl=c.lower()
@@ -575,7 +546,6 @@ with tab_predict:
     df_pred_base["Payment Received Date"] = pd.to_datetime(df_pred_base[PAY_COL], errors="coerce", dayfirst=True)
     df_pred_base["Payment_Month"] = df_pred_base["Payment Received Date"].dt.to_period("M").dt.to_timestamp()
 
-    # ---- Controls ----
     st.markdown("### Forecast controls")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -593,7 +563,6 @@ with tab_predict:
 
     st.caption("This forecast = **M0 (same-month)** + **Carryover (lagged)** into the target month.")
 
-    # ---------- Build cohort matrix (historical) ----------
     hist = df_pred_base.copy()
     hist["CM"] = hist["Create_Month"]
     hist["PM"] = hist["Payment_Month"]
@@ -611,10 +580,8 @@ with tab_predict:
     lag_prob = (paid_by_k / max(total_creates, 1.0)).reindex(range(0, 18), fill_value=0.0).clip(lower=0.0)
     M0_rate = float(lag_prob.get(0, 0.0))
 
-    # ---------- Create day-of-month profile (for extrapolating creates) ----------
     def create_day_profile(df_hist: pd.DataFrame, month_of_year: int) -> pd.Series:
-        d = df_hist.copy()
-        d = d.dropna(subset=["Create Date"])
+        d = df_hist.copy().dropna(subset=["Create Date"])
         d["d"] = d["Create Date"].dt.day
         d["moy"] = d["Create Date"].dt.month
         pool = d[d["moy"]==month_of_year]
@@ -654,13 +621,15 @@ with tab_predict:
         recent_counts = recent.groupby(split_col)["Payment Received Date"].count().sort_values(ascending=False)
         return eb_smooth_props(recent_counts, prior_props, prior_strength=5.0)
 
-    # ---------- Compute forecast components ----------
     tm_moy = int(target_month.month)
     create_profile = create_day_profile(df_pred_base, tm_moy)
-    days_in_target = month_days(target_month)
+    def month_days_for_ts(ts: pd.Timestamp) -> int:
+        m0 = ts.to_period("M").to_timestamp()
+        m1 = (m0 + pd.offsets.MonthBegin(1))
+        return int((m1 - m0).days)
+    days_in_target = month_days_for_ts(target_month)
 
     def observed_creates_so_far(df_current: pd.DataFrame, target_month_ts: pd.Timestamp) -> tuple[int,int,float]:
-        """Returns (obs_creates, last_day_observed, cumulative_prop_through_last_day)."""
         if df_current is None or "Create Date" not in df_current.columns:
             return 0, 0, 0.0
         cur = df_current.copy()
@@ -681,28 +650,26 @@ with tab_predict:
     if obs_creates>0:
         est_full_creates_tm = obs_creates / max(cum_prop, 1e-6)
     else:
-        hist_cm = df_pred_base[df_pred_base["Create_Month"].notna()]
+        hist_cm = df_pred_base[df_pred_base["Create_Month"].notna()].copy()
         hist_cm["moy"] = hist_cm["Create_Month"].dt.month
         moy_avg_creates = hist_cm.groupby("moy")["Create Date"].count() / max(hist_cm["Create_Month"].nunique(), 1)
         est_full_creates_tm = float(moy_avg_creates.get(tm_moy, moy_avg_creates.mean() if len(moy_avg_creates) else 0.0))
 
+    M0_rate = float(lag_prob.get(0, 0.0))
     M0_expected = float(est_full_creates_tm * M0_rate)
 
-    # Carryover from prior months
     prior_months = creates_by_CM.index[creates_by_CM.index < target_month]
     carry = 0.0
     for j in prior_months:
         k = (target_month.year - j.year)*12 + (target_month.month - j.month)
-        if k <= 0:
+        if k <= 0: 
             continue
         p = float(lag_prob.get(k, 0.0))
         c_j = float(creates_by_CM.get(j, 0.0))
         carry += c_j * p
     Carry_expected = float(carry)
-
     total_forecast = float(M0_expected + Carry_expected)
 
-    # ---------- KPIs ----------
     k1, k2, k3 = st.columns(3)
     with k1:
         st.markdown(f"<div class='kpi'><div class='label'>M0 (same-month) — {target_month:%b %Y}</div><div class='value'>{int(round(M0_expected)):,}</div></div>", unsafe_allow_html=True)
@@ -711,7 +678,7 @@ with tab_predict:
     with k3:
         st.markdown(f"<div class='kpi'><div class='label'>Total Forecast — {target_month:%b %Y}</div><div class='value'>{int(round(total_forecast)):,}</div></div>", unsafe_allow_html=True)
 
-    # ---------- Chart: history & implied forecast ----------
+    # Plot history + forecast point
     paid_hist = hist.dropna(subset=["Payment Received Date"]).copy()
     monthly_paid = paid_hist["Payment_Month"].value_counts().rename_axis("Month").sort_index().rename("y").reset_index()
     if not monthly_paid.empty:
@@ -726,8 +693,9 @@ with tab_predict:
     else:
         st.info("No historical payments to plot.")
 
-    # ---------- Split of forecast ----------
+    # Optional split
     st.markdown("### Split of forecast (optional)")
+    split_by = split_by  # already set above
     if split_by == "None":
         st.info("No split selected.")
     else:
@@ -744,15 +712,8 @@ with tab_predict:
             st.dataframe(split_table.sort_values("Forecast", ascending=False), use_container_width=True)
             st.download_button("Download split CSV", split_table.to_csv(index=False).encode("utf-8"),
                                file_name="forecast_split.csv", mime="text/csv")
-            ch = alt.Chart(split_table).mark_bar().encode(
-                x=alt.X(f"{split_by}:N", title=None),
-                y=alt.Y("Forecast:Q", title=None),
-                tooltip=[split_by,"Forecast","Prop"]
-            )
-            st.altair_chart(ch, use_container_width=True)
 
-    # ---------- Day-of-month distribution for target month ----------
-    st.markdown("### Day-of-month distribution (payments)")
+    # Day-of-month distribution (payments)
     def payment_day_profile(df_paid: pd.DataFrame, target_month_ts: pd.Timestamp):
         dp = df_paid.copy()
         dp["d"] = dp["Payment Received Date"].dt.day
@@ -768,81 +729,8 @@ with tab_predict:
             return pd.Series(1.0/days, index=idx, name="prop")
         return (cnt/total).rename("prop")
 
+    st.markdown("### Day-of-month distribution (payments)")
     pay_profile = payment_day_profile(paid_hist, target_month)
     dom = pay_profile.reset_index().rename(columns={"day":"Day","prop":"Prop"})
     dom["Forecast"] = (total_forecast * dom["Prop"]).round(0)
     st.dataframe(dom, use_container_width=True)
-    ch2 = alt.Chart(dom).mark_bar().encode(
-        x=alt.X("Day:O", title=None), y=alt.Y("Forecast:Q", title=None),
-        tooltip=["Day","Forecast","Prop"]
-    )
-    st.altair_chart(ch2, use_container_width=True)
-
-    # ---------- Quick backtest (walk-forward on payments) ----------
-    st.markdown("### Backtest (walk-forward, payments landing per month)")
-    mp = monthly_paid.copy()
-    if mp.empty or len(mp) < 8:
-        st.info("Not enough months to backtest.")
-    else:
-        mp = mp.sort_values("Month")
-        months_list = list(pd.to_datetime(mp["Month"]))
-        recs=[]
-        window = st.slider("Backtest training window (months)", 6, max(12, len(months_list)-2), min(12, len(months_list)-2), 1)
-        for i in range(window, len(months_list)):
-            T = months_list[i]  # predict this month
-            hist_cut = hist[(hist["PM"] < T) | (hist["PM"].isna())]
-            creates_cut = hist_cut.groupby("CM")["Create Date"].count().rename("Creates_CM")
-            cohort_cut = hist_cut.dropna(subset=["PM"]).groupby(["CM","PM"])["Payment Received Date"].count().rename("Paid").reset_index()
-            cohort_cut["lag_k"] = ((cohort_cut["PM"].dt.year - cohort_cut["CM"].dt.year)*12 + (cohort_cut["PM"].dt.month - cohort_cut["CM"].dt.month)).astype(int)
-            cohort_cut = cohort_cut[cohort_cut["lag_k"]>=0]
-
-            total_creates_cut = creates_cut.sum()
-            if total_creates_cut <= 0:
-                continue
-            paid_by_k_cut = cohort_cut.groupby("lag_k")["Paid"].sum()
-            lag_prob_cut = (paid_by_k_cut / max(total_creates_cut,1.0)).reindex(range(0,18), fill_value=0.0).clip(lower=0.0)
-            M0_cut = float(lag_prob_cut.get(0,0.0))
-
-            moy_T = T.month
-            hist_cm_cut = hist_cut[hist_cut["CM"].notna()].copy()
-            hist_cm_cut["moy"] = hist_cm_cut["CM"].dt.month
-            if hist_cm_cut["CM"].nunique() > 0:
-                moy_avg_creates_cut = hist_cm_cut.groupby("moy")["Create Date"].count() / max(hist_cm_cut["CM"].nunique(),1)
-                est_creates_T = float(moy_avg_creates_cut.get(moy_T, moy_avg_creates_cut.mean() if len(moy_avg_creates_cut) else 0.0))
-            else:
-                est_creates_T = 0.0
-
-            M0_pred = est_creates_T * M0_cut
-
-            prior_js = creates_cut.index[creates_cut.index < T]
-            carry_pred = 0.0
-            for j in prior_js:
-                k = (T.year - j.year)*12 + (T.month - j.month)
-                if k<=0: continue
-                p = float(lag_prob_cut.get(k,0.0))
-                c_j = float(creates_cut.get(j,0.0))
-                carry_pred += c_j * p
-
-            pred_total = float(M0_pred + carry_pred)
-            actual_row = mp[mp["Month"]==T]
-            if actual_row.empty:
-                continue
-            actual = float(actual_row["y"].values[0])
-            mae = abs(pred_total - actual)
-            mape = (mae / actual * 100) if actual>0 else np.nan
-            recs.append({"Month":T, "Pred":pred_total, "Actual":actual, "MAE":mae, "MAPE":mape})
-
-        bt = pd.DataFrame(recs)
-        if not bt.empty:
-            c1,c2 = st.columns(2)
-            c1.metric("Avg MAE", f"{bt['MAE'].mean():.1f}")
-            c2.metric("Avg MAPE", f"{bt['MAPE'].dropna().mean():.1f}%")
-            bt_plot = bt.assign(M=bt["Month"].dt.strftime("%Y-%m"))
-            line_bt = alt.layer(
-                alt_line(bt_plot, "M:O", "Actual:Q").encode(color=alt.value("#10b981")),
-                alt_line(bt_plot, "M:O", "Pred:Q").encode(color=alt.value("#ef4444")),
-            ).resolve_scale(y='shared')
-            st.altair_chart(line_bt, use_container_width=True)
-            st.dataframe(bt.assign(Month=bt["Month"].dt.strftime("%Y-%m")).drop(columns=["Month"]), use_container_width=True)
-        else:
-            st.info("Backtest window too small after filtering or insufficient data variety. Adjust the slider.")
